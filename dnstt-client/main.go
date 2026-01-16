@@ -120,10 +120,220 @@ func sampleUTLSDistribution(spec string) (*utls.ClientHelloID, error) {
 	return ids[sampleWeighted(weights)], nil
 }
 
-func handle(local *net.TCPConn, sess *smux.Session, conv uint32) error {
-	stream, err := sess.OpenStream()
+// sessionManager manages the KCP connection, Noise channel, and smux session,
+// and can recreate them if they become closed.
+type sessionManager struct {
+	pubkey     []byte
+	domain     dns.Name
+	remoteAddr net.Addr
+	pconn      net.PacketConn
+	mtu        int
+
+	mu   sync.RWMutex
+	conn *kcp.UDPSession
+	rw   io.ReadWriteCloser
+	sess *smux.Session
+	conv uint32
+}
+
+// newSessionManager creates a new session manager.
+func newSessionManager(pubkey []byte, domain dns.Name, remoteAddr net.Addr, pconn net.PacketConn, mtu int) *sessionManager {
+	return &sessionManager{
+		pubkey:     pubkey,
+		domain:     domain,
+		remoteAddr: remoteAddr,
+		pconn:      pconn,
+		mtu:        mtu,
+	}
+}
+
+// closeSessionLocked closes the current session if it exists.
+// Caller must hold sm.mu write lock.
+func (sm *sessionManager) closeSessionLocked() {
+	if sm.sess != nil {
+		sm.sess.Close()
+		sm.sess = nil
+	}
+	if sm.rw != nil {
+		sm.rw.Close()
+		sm.rw = nil
+	}
+	if sm.conn != nil {
+		conv := sm.conv
+		log.Printf("end session %08x", conv)
+		sm.conn.Close()
+		sm.conn = nil
+	}
+	sm.conv = 0
+}
+
+// createSession creates a new KCP connection, Noise channel, and smux session.
+// Caller must NOT hold sm.mu lock.
+func (sm *sessionManager) createSession() error {
+	sm.mu.Lock()
+	// Close existing session if any
+	sm.closeSessionLocked()
+
+	// Open a KCP conn on the PacketConn.
+	// We do this outside the lock to avoid holding it during I/O operations.
+	sm.mu.Unlock()
+
+	conn, err := kcp.NewConn2(sm.remoteAddr, nil, 0, 0, sm.pconn)
 	if err != nil {
-		return fmt.Errorf("session %08x opening stream: %v", conv, err)
+		return fmt.Errorf("opening KCP conn: %v", err)
+	}
+	conv := conn.GetConv()
+	log.Printf("begin session %08x", conv)
+
+	// Permit coalescing the payloads of consecutive sends.
+	conn.SetStreamMode(true)
+	// Disable the dynamic congestion window (limit only by the maximum of
+	// local and remote static windows).
+	conn.SetNoDelay(
+		0, // default nodelay
+		0, // default interval
+		0, // default resend
+		1, // nc=1 => congestion window off
+	)
+	conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
+	if rc := conn.SetMtu(sm.mtu); !rc {
+		conn.Close()
+		panic(rc)
+	}
+
+	// Put a Noise channel on top of the KCP conn.
+	rw, err := noise.NewClient(conn, sm.pubkey)
+	if err != nil {
+		conn.Close()
+		return err
+	}
+
+	// Start a smux session on the Noise channel.
+	smuxConfig := smux.DefaultConfig()
+	smuxConfig.Version = 2
+	smuxConfig.KeepAliveTimeout = idleTimeout
+	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024 // default is 65536
+	sess, err := smux.Client(rw, smuxConfig)
+	if err != nil {
+		rw.Close()
+		conn.Close()
+		return fmt.Errorf("opening smux session: %v", err)
+	}
+
+	// Lock again to update the session
+	sm.mu.Lock()
+	sm.conn = conn
+	sm.rw = rw
+	sm.sess = sess
+	sm.conv = conv
+	sm.mu.Unlock()
+
+	return nil
+}
+
+// closeSession closes the current session if it exists.
+func (sm *sessionManager) closeSession() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.closeSessionLocked()
+}
+
+// getSession returns the current session, creating one if needed.
+func (sm *sessionManager) getSession() (*smux.Session, uint32, error) {
+	sm.mu.RLock()
+	sess := sm.sess
+	conv := sm.conv
+	sm.mu.RUnlock()
+
+	if sess != nil {
+		return sess, conv, nil
+	}
+
+	// Need to create a new session. Upgrade to write lock.
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	// Double-check after acquiring write lock
+	if sm.sess != nil {
+		return sm.sess, sm.conv, nil
+	}
+
+	// Create new session
+	err := sm.createSession()
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return sm.sess, sm.conv, nil
+}
+
+// openStream opens a new stream, recreating the session if necessary.
+func (sm *sessionManager) openStream() (*smux.Stream, uint32, error) {
+	// Try to get existing session
+	sess, conv, err := sm.getSession()
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// Try to open a stream
+	stream, err := sess.OpenStream()
+	if err == nil {
+		return stream, conv, nil
+	}
+
+	// If opening stream failed, the session might be closed.
+	// Check if it's a closed pipe error or similar.
+	errStr := err.Error()
+	isClosedError := errors.Is(err, io.ErrClosedPipe) ||
+		strings.Contains(errStr, "closed pipe") ||
+		strings.Contains(errStr, "broken pipe") ||
+		strings.Contains(errStr, "use of closed network connection") ||
+		err == io.EOF
+
+	if isClosedError {
+		log.Printf("session %08x appears closed, recreating: %v", conv, err)
+
+		// Use write lock to serialize session recreation attempts
+		sm.mu.Lock()
+		// Double-check: another goroutine might have already recreated the session
+		if sm.sess != nil && sm.sess != sess {
+			// Session was recreated by another goroutine
+			sess = sm.sess
+			conv = sm.conv
+			sm.mu.Unlock()
+		} else {
+			// We need to recreate
+			sm.closeSessionLocked()
+			sm.mu.Unlock()
+
+			// Create a new session (this acquires its own lock)
+			err = sm.createSession()
+			if err != nil {
+				return nil, 0, fmt.Errorf("recreating session: %v", err)
+			}
+
+			// Get the new session
+			sm.mu.RLock()
+			sess = sm.sess
+			conv = sm.conv
+			sm.mu.RUnlock()
+		}
+
+		// Try again with the (possibly new) session
+		stream, err = sess.OpenStream()
+		if err != nil {
+			return nil, 0, fmt.Errorf("session %08x opening stream after recreate: %v", conv, err)
+		}
+		return stream, conv, nil
+	}
+
+	return nil, 0, fmt.Errorf("session %08x opening stream: %v", conv, err)
+}
+
+func handle(local *net.TCPConn, sm *sessionManager) error {
+	stream, conv, err := sm.openStream()
+	if err != nil {
+		return fmt.Errorf("opening stream: %v", err)
 	}
 	defer func() {
 		log.Printf("end stream %08x:%d", conv, stream.ID())
@@ -178,47 +388,15 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 	}
 	log.Printf("effective MTU %d", mtu)
 
-	// Open a KCP conn on the PacketConn.
-	conn, err := kcp.NewConn2(remoteAddr, nil, 0, 0, pconn)
-	if err != nil {
-		return fmt.Errorf("opening KCP conn: %v", err)
-	}
-	defer func() {
-		log.Printf("end session %08x", conn.GetConv())
-		conn.Close()
-	}()
-	log.Printf("begin session %08x", conn.GetConv())
-	// Permit coalescing the payloads of consecutive sends.
-	conn.SetStreamMode(true)
-	// Disable the dynamic congestion window (limit only by the maximum of
-	// local and remote static windows).
-	conn.SetNoDelay(
-		0, // default nodelay
-		0, // default interval
-		0, // default resend
-		1, // nc=1 => congestion window off
-	)
-	conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
-	if rc := conn.SetMtu(mtu); !rc {
-		panic(rc)
-	}
+	// Create session manager
+	sm := newSessionManager(pubkey, domain, remoteAddr, pconn, mtu)
+	defer sm.closeSession()
 
-	// Put a Noise channel on top of the KCP conn.
-	rw, err := noise.NewClient(conn, pubkey)
+	// Create initial session
+	err = sm.createSession()
 	if err != nil {
 		return err
 	}
-
-	// Start a smux session on the Noise channel.
-	smuxConfig := smux.DefaultConfig()
-	smuxConfig.Version = 2
-	smuxConfig.KeepAliveTimeout = idleTimeout
-	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024 // default is 65536
-	sess, err := smux.Client(rw, smuxConfig)
-	if err != nil {
-		return fmt.Errorf("opening smux session: %v", err)
-	}
-	defer sess.Close()
 
 	for {
 		local, err := ln.Accept()
@@ -230,7 +408,7 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 		}
 		go func() {
 			defer local.Close()
-			err := handle(local.(*net.TCPConn), sess, conn.GetConv())
+			err := handle(local.(*net.TCPConn), sm)
 			if err != nil {
 				log.Printf("handle: %v", err)
 			}
