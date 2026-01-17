@@ -251,12 +251,15 @@ func (sm *sessionManager) getSession() (*smux.Session, uint32, error) {
 
 	// Need to create a new session. Upgrade to write lock.
 	sm.mu.Lock()
-	defer sm.mu.Unlock()
 
 	// Double-check after acquiring write lock
 	if sm.sess != nil {
-		return sm.sess, sm.conv, nil
+		sess = sm.sess
+		conv = sm.conv
+		sm.mu.Unlock()
+		return sess, conv, nil
 	}
+	sm.mu.Unlock()
 
 	// Create new session
 	err := sm.createSession()
@@ -264,7 +267,11 @@ func (sm *sessionManager) getSession() (*smux.Session, uint32, error) {
 		return nil, 0, err
 	}
 
-	return sm.sess, sm.conv, nil
+	sm.mu.RLock()
+	sess = sm.sess
+	conv = sm.conv
+	sm.mu.RUnlock()
+	return sess, conv, nil
 }
 
 // openStream opens a new stream, recreating the session if necessary.
