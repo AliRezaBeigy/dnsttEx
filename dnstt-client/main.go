@@ -137,13 +137,22 @@ type sessionManager struct {
 	conv     uint32
 }
 
+// noClosePacketConn prevents session teardown from closing a shared PacketConn.
+type noClosePacketConn struct {
+	net.PacketConn
+}
+
+func (c *noClosePacketConn) Close() error {
+	return nil
+}
+
 // newSessionManager creates a new session manager.
 func newSessionManager(pubkey []byte, domain dns.Name, remoteAddr net.Addr, pconn net.PacketConn, mtu int) *sessionManager {
 	return &sessionManager{
 		pubkey:     pubkey,
 		domain:     domain,
 		remoteAddr: remoteAddr,
-		pconn:      pconn,
+		pconn:      &noClosePacketConn{PacketConn: pconn},
 		mtu:        mtu,
 	}
 }
