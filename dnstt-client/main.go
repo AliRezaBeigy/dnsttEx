@@ -127,6 +127,12 @@ type smuxSession interface {
 	Close() error
 }
 
+type sessionState struct {
+	count    int
+	draining bool
+	conv     uint32
+}
+
 type sessionManager struct {
 	pubkey     []byte
 	domain     dns.Name
@@ -137,7 +143,8 @@ type sessionManager struct {
 	mu       sync.RWMutex
 	createMu sync.Mutex
 	// createSessionFn overrides session creation in tests.
-	createSessionFn func() error
+	createSessionFn func(closeExisting bool) error
+	sessions        map[smuxSession]*sessionState
 	conn            *kcp.UDPSession
 	rw              io.ReadWriteCloser
 	sess            smuxSession
@@ -169,6 +176,9 @@ func newSessionManager(pubkey []byte, domain dns.Name, remoteAddr net.Addr, pcon
 func (sm *sessionManager) closeSessionLocked() {
 	if sm.sess != nil {
 		sm.sess.Close()
+		if sm.sessions != nil {
+			delete(sm.sessions, sm.sess)
+		}
 		sm.sess = nil
 	}
 	if sm.rw != nil {
@@ -187,17 +197,22 @@ func (sm *sessionManager) closeSessionLocked() {
 // createSession creates a new KCP connection, Noise channel, and smux session.
 // Caller must NOT hold sm.mu lock.
 func (sm *sessionManager) createSession() error {
+	return sm.createSessionWithClose(true, nil)
+}
+
+func (sm *sessionManager) createSessionWithClose(closeExisting bool, expectedSess smuxSession) error {
 	if sm.createSessionFn != nil {
-		return sm.createSessionFn()
+		return sm.createSessionFn(closeExisting)
 	}
 
-	sm.mu.Lock()
-	// Close existing session if any
-	sm.closeSessionLocked()
-
-	// Open a KCP conn on the PacketConn.
-	// We do this outside the lock to avoid holding it during I/O operations.
-	sm.mu.Unlock()
+	if closeExisting {
+		sm.mu.Lock()
+		// Close existing session if any.
+		if expectedSess == nil || sm.sess == expectedSess {
+			sm.closeSessionLocked()
+		}
+		sm.mu.Unlock()
+	}
 
 	conn, err := kcp.NewConn2(sm.remoteAddr, nil, 0, 0, sm.pconn)
 	if err != nil {
@@ -243,6 +258,10 @@ func (sm *sessionManager) createSession() error {
 
 	// Lock again to update the session
 	sm.mu.Lock()
+	if sm.sessions == nil {
+		sm.sessions = make(map[smuxSession]*sessionState)
+	}
+	sm.sessions[sess] = &sessionState{conv: conv}
 	sm.conn = conn
 	sm.rw = rw
 	sm.sess = sess
@@ -252,11 +271,139 @@ func (sm *sessionManager) createSession() error {
 	return nil
 }
 
+func (sm *sessionManager) ensureSessionStateLocked(sess smuxSession, conv uint32) *sessionState {
+	if sm.sessions == nil {
+		sm.sessions = make(map[smuxSession]*sessionState)
+	}
+	state, ok := sm.sessions[sess]
+	if !ok {
+		state = &sessionState{conv: conv}
+		sm.sessions[sess] = state
+	} else if state.conv == 0 && conv != 0 {
+		state.conv = conv
+	}
+	return state
+}
+
+func (sm *sessionManager) markSessionDraining(sess smuxSession, conv uint32) (smuxSession, uint32) {
+	if sess == nil {
+		return nil, 0
+	}
+	var closeSess smuxSession
+	var closeConv uint32
+	sm.mu.Lock()
+	state := sm.ensureSessionStateLocked(sess, conv)
+	state.draining = true
+	if state.count == 0 {
+		delete(sm.sessions, sess)
+		closeSess = sess
+		closeConv = state.conv
+	}
+	sm.mu.Unlock()
+	return closeSess, closeConv
+}
+
+func (sm *sessionManager) trackStream(sess smuxSession, conv uint32) func() {
+	sm.mu.Lock()
+	state := sm.ensureSessionStateLocked(sess, conv)
+	state.count++
+	sm.mu.Unlock()
+	return func() {
+		sm.releaseStream(sess)
+	}
+}
+
+func (sm *sessionManager) releaseStream(sess smuxSession) {
+	var closeSess smuxSession
+	var closeConv uint32
+	sm.mu.Lock()
+	state, ok := sm.sessions[sess]
+	if !ok {
+		sm.mu.Unlock()
+		return
+	}
+	if state.count > 0 {
+		state.count--
+	}
+	if state.draining && state.count == 0 {
+		delete(sm.sessions, sess)
+		closeSess = sess
+		closeConv = state.conv
+	}
+	sm.mu.Unlock()
+	if closeSess != nil {
+		log.Printf("end session %08x", closeConv)
+		closeSess.Close()
+	}
+}
+
+func (sm *sessionManager) recreateSession(sess smuxSession, conv uint32, closeExisting bool) (smuxSession, uint32, error) {
+	sm.createMu.Lock()
+	defer sm.createMu.Unlock()
+
+	var closeSess smuxSession
+	var closeConv uint32
+	if !closeExisting {
+		closeSess, closeConv = sm.markSessionDraining(sess, conv)
+	}
+
+	// Double-check: another goroutine might have already recreated the session.
+	sm.mu.RLock()
+	if sm.sess != nil && sm.sess != sess {
+		sess = sm.sess
+		conv = sm.conv
+		sm.mu.RUnlock()
+		if closeSess != nil {
+			log.Printf("end session %08x", closeConv)
+			closeSess.Close()
+		}
+		return sess, conv, nil
+	}
+	sm.mu.RUnlock()
+
+	err := sm.createSessionWithClose(closeExisting, sess)
+	if err != nil {
+		if closeSess != nil {
+			log.Printf("end session %08x", closeConv)
+			closeSess.Close()
+		}
+		return nil, 0, err
+	}
+
+	sm.mu.RLock()
+	sess = sm.sess
+	conv = sm.conv
+	sm.mu.RUnlock()
+	if closeSess != nil {
+		log.Printf("end session %08x", closeConv)
+		closeSess.Close()
+	}
+	return sess, conv, nil
+}
+
 // closeSession closes the current session if it exists.
 func (sm *sessionManager) closeSession() {
 	sm.mu.Lock()
-	defer sm.mu.Unlock()
-	sm.closeSessionLocked()
+	sessions := sm.sessions
+	fallbackSess := sm.sess
+	fallbackConv := sm.conv
+	sm.sessions = nil
+	sm.conn = nil
+	sm.rw = nil
+	sm.sess = nil
+	sm.conv = 0
+	sm.mu.Unlock()
+
+	if sessions == nil && fallbackSess != nil {
+		log.Printf("end session %08x", fallbackConv)
+		fallbackSess.Close()
+		return
+	}
+
+	for sess, state := range sessions {
+		log.Printf("end session %08x", state.conv)
+		sess.Close()
+	}
 }
 
 // getSession returns the current session, creating one if needed.
@@ -297,23 +444,39 @@ func (sm *sessionManager) getSession() (smuxSession, uint32, error) {
 }
 
 // openStream opens a new stream, recreating the session if necessary.
-func (sm *sessionManager) openStream() (*smux.Stream, uint32, error) {
+func (sm *sessionManager) openStream() (*smux.Stream, uint32, func(), error) {
 	// Try to get existing session
 	sess, conv, err := sm.getSession()
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 
 	// Try to open a stream
 	stream, err := sess.OpenStream()
 	if err == nil {
-		return stream, conv, nil
+		release := sm.trackStream(sess, conv)
+		return stream, conv, release, nil
+	}
+
+	if errors.Is(err, smux.ErrGoAway) {
+		log.Printf("session %08x goaway, starting new session for new streams: %v", conv, err)
+
+		sess, conv, err = sm.recreateSession(sess, conv, false)
+		if err != nil {
+			return nil, 0, nil, fmt.Errorf("recreating session after goaway: %v", err)
+		}
+
+		stream, err = sess.OpenStream()
+		if err != nil {
+			return nil, 0, nil, fmt.Errorf("session %08x opening stream after goaway: %v", conv, err)
+		}
+		release := sm.trackStream(sess, conv)
+		return stream, conv, release, nil
 	}
 
 	// If opening stream failed, the session might be closed.
 	// Check if it's a closed pipe error or similar.
-	isClosedError := errors.Is(err, smux.ErrGoAway) ||
-		errors.Is(err, io.ErrClosedPipe) ||
+	isClosedError := errors.Is(err, io.ErrClosedPipe) ||
 		errors.Is(err, net.ErrClosed) ||
 		errors.Is(err, os.ErrClosed) ||
 		errors.Is(err, io.EOF)
@@ -328,53 +491,29 @@ func (sm *sessionManager) openStream() (*smux.Stream, uint32, error) {
 	if isClosedError {
 		log.Printf("session %08x appears closed, recreating: %v", conv, err)
 
-		// Serialize recreation attempts to avoid leaked sessions.
-		sm.createMu.Lock()
-		// Double-check: another goroutine might have already recreated the session
-		sm.mu.RLock()
-		if sm.sess != nil && sm.sess != sess {
-			sess = sm.sess
-			conv = sm.conv
-			sm.mu.RUnlock()
-		} else {
-			sm.mu.RUnlock()
-			sm.mu.Lock()
-			if sm.sess == sess {
-				sm.closeSessionLocked()
-			}
-			sm.mu.Unlock()
-
-			// Create a new session (this acquires its own lock)
-			err = sm.createSession()
-			if err != nil {
-				sm.createMu.Unlock()
-				return nil, 0, fmt.Errorf("recreating session: %v", err)
-			}
-
-			// Get the new session
-			sm.mu.RLock()
-			sess = sm.sess
-			conv = sm.conv
-			sm.mu.RUnlock()
+		sess, conv, err = sm.recreateSession(sess, conv, true)
+		if err != nil {
+			return nil, 0, nil, fmt.Errorf("recreating session: %v", err)
 		}
-		sm.createMu.Unlock()
 
 		// Try again with the (possibly new) session
 		stream, err = sess.OpenStream()
 		if err != nil {
-			return nil, 0, fmt.Errorf("session %08x opening stream after recreate: %v", conv, err)
+			return nil, 0, nil, fmt.Errorf("session %08x opening stream after recreate: %v", conv, err)
 		}
-		return stream, conv, nil
+		release := sm.trackStream(sess, conv)
+		return stream, conv, release, nil
 	}
 
-	return nil, 0, fmt.Errorf("session %08x opening stream: %v", conv, err)
+	return nil, 0, nil, fmt.Errorf("session %08x opening stream: %v", conv, err)
 }
 
 func handle(local *net.TCPConn, sm *sessionManager) error {
-	stream, conv, err := sm.openStream()
+	stream, conv, release, err := sm.openStream()
 	if err != nil {
 		return fmt.Errorf("opening stream: %v", err)
 	}
+	defer release()
 	defer func() {
 		log.Printf("end stream %08x:%d", conv, stream.ID())
 		stream.Close()

@@ -33,7 +33,10 @@ func TestGetSessionSerializesCreate(t *testing.T) {
 	release := make(chan struct{})
 	var startOnce sync.Once
 
-	sm.createSessionFn = func() error {
+	sm.createSessionFn = func(closeExisting bool) error {
+		if !closeExisting {
+			t.Fatal("expected closeExisting true for getSession")
+		}
 		atomic.AddInt32(&createCalls, 1)
 		startOnce.Do(func() { close(started) })
 		<-release
@@ -84,7 +87,10 @@ func TestOpenStreamRecreatesOnGoAway(t *testing.T) {
 	sm.conv = 1
 
 	var createCalls int32
-	sm.createSessionFn = func() error {
+	sm.createSessionFn = func(closeExisting bool) error {
+		if closeExisting {
+			t.Fatal("expected closeExisting false for goaway")
+		}
 		atomic.AddInt32(&createCalls, 1)
 		sm.mu.Lock()
 		sm.sess = &stubSession{openErr: errors.New("still closed")}
@@ -93,7 +99,7 @@ func TestOpenStreamRecreatesOnGoAway(t *testing.T) {
 		return nil
 	}
 
-	_, _, err := sm.openStream()
+	_, _, _, err := sm.openStream()
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -112,7 +118,10 @@ func TestOpenStreamRecreateSerializes(t *testing.T) {
 	release := make(chan struct{})
 	var startOnce sync.Once
 
-	sm.createSessionFn = func() error {
+	sm.createSessionFn = func(closeExisting bool) error {
+		if !closeExisting {
+			t.Fatal("expected closeExisting true for closed pipe")
+		}
 		atomic.AddInt32(&createCalls, 1)
 		startOnce.Do(func() { close(started) })
 		<-release
@@ -131,7 +140,7 @@ func TestOpenStreamRecreateSerializes(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, _, err := sm.openStream()
+			_, _, _, err := sm.openStream()
 			errs <- err
 		}()
 	}
