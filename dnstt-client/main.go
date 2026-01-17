@@ -301,12 +301,18 @@ func (sm *sessionManager) openStream() (*smux.Stream, uint32, error) {
 
 	// If opening stream failed, the session might be closed.
 	// Check if it's a closed pipe error or similar.
-	errStr := err.Error()
-	isClosedError := errors.Is(err, io.ErrClosedPipe) ||
-		strings.Contains(errStr, "closed pipe") ||
-		strings.Contains(errStr, "broken pipe") ||
-		strings.Contains(errStr, "use of closed network connection") ||
-		err == io.EOF
+	isClosedError := errors.Is(err, smux.ErrGoAway) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, os.ErrClosed) ||
+		errors.Is(err, io.EOF)
+	if !isClosedError {
+		// Fallback to string matching for errors that don't wrap the sentinels.
+		errStr := err.Error()
+		isClosedError = strings.Contains(errStr, "closed pipe") ||
+			strings.Contains(errStr, "broken pipe") ||
+			strings.Contains(errStr, "use of closed network connection")
+	}
 
 	if isClosedError {
 		log.Printf("session %08x appears closed, recreating: %v", conv, err)
