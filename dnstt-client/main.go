@@ -129,11 +129,12 @@ type sessionManager struct {
 	pconn      net.PacketConn
 	mtu        int
 
-	mu   sync.RWMutex
-	conn *kcp.UDPSession
-	rw   io.ReadWriteCloser
-	sess *smux.Session
-	conv uint32
+	mu       sync.RWMutex
+	createMu sync.Mutex
+	conn     *kcp.UDPSession
+	rw       io.ReadWriteCloser
+	sess     *smux.Session
+	conv     uint32
 }
 
 // newSessionManager creates a new session manager.
@@ -249,17 +250,18 @@ func (sm *sessionManager) getSession() (*smux.Session, uint32, error) {
 		return sess, conv, nil
 	}
 
-	// Need to create a new session. Upgrade to write lock.
-	sm.mu.Lock()
+	// Serialize session creation attempts.
+	sm.createMu.Lock()
+	defer sm.createMu.Unlock()
 
-	// Double-check after acquiring write lock
-	if sm.sess != nil {
-		sess = sm.sess
-		conv = sm.conv
-		sm.mu.Unlock()
+	// Double-check after waiting for the creator.
+	sm.mu.RLock()
+	sess = sm.sess
+	conv = sm.conv
+	sm.mu.RUnlock()
+	if sess != nil {
 		return sess, conv, nil
 	}
-	sm.mu.Unlock()
 
 	// Create new session
 	err := sm.createSession()
@@ -300,22 +302,26 @@ func (sm *sessionManager) openStream() (*smux.Stream, uint32, error) {
 	if isClosedError {
 		log.Printf("session %08x appears closed, recreating: %v", conv, err)
 
-		// Use write lock to serialize session recreation attempts
-		sm.mu.Lock()
+		// Serialize recreation attempts to avoid leaked sessions.
+		sm.createMu.Lock()
 		// Double-check: another goroutine might have already recreated the session
+		sm.mu.RLock()
 		if sm.sess != nil && sm.sess != sess {
-			// Session was recreated by another goroutine
 			sess = sm.sess
 			conv = sm.conv
-			sm.mu.Unlock()
+			sm.mu.RUnlock()
 		} else {
-			// We need to recreate
-			sm.closeSessionLocked()
+			sm.mu.RUnlock()
+			sm.mu.Lock()
+			if sm.sess == sess {
+				sm.closeSessionLocked()
+			}
 			sm.mu.Unlock()
 
 			// Create a new session (this acquires its own lock)
 			err = sm.createSession()
 			if err != nil {
+				sm.createMu.Unlock()
 				return nil, 0, fmt.Errorf("recreating session: %v", err)
 			}
 
@@ -325,6 +331,7 @@ func (sm *sessionManager) openStream() (*smux.Stream, uint32, error) {
 			conv = sm.conv
 			sm.mu.RUnlock()
 		}
+		sm.createMu.Unlock()
 
 		// Try again with the (possibly new) session
 		stream, err = sess.OpenStream()
