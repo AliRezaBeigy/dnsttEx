@@ -122,6 +122,11 @@ func sampleUTLSDistribution(spec string) (*utls.ClientHelloID, error) {
 
 // sessionManager manages the KCP connection, Noise channel, and smux session,
 // and can recreate them if they become closed.
+type smuxSession interface {
+	OpenStream() (*smux.Stream, error)
+	Close() error
+}
+
 type sessionManager struct {
 	pubkey     []byte
 	domain     dns.Name
@@ -131,10 +136,12 @@ type sessionManager struct {
 
 	mu       sync.RWMutex
 	createMu sync.Mutex
-	conn     *kcp.UDPSession
-	rw       io.ReadWriteCloser
-	sess     *smux.Session
-	conv     uint32
+	// createSessionFn overrides session creation in tests.
+	createSessionFn func() error
+	conn            *kcp.UDPSession
+	rw              io.ReadWriteCloser
+	sess            smuxSession
+	conv            uint32
 }
 
 // noClosePacketConn prevents session teardown from closing a shared PacketConn.
@@ -180,6 +187,10 @@ func (sm *sessionManager) closeSessionLocked() {
 // createSession creates a new KCP connection, Noise channel, and smux session.
 // Caller must NOT hold sm.mu lock.
 func (sm *sessionManager) createSession() error {
+	if sm.createSessionFn != nil {
+		return sm.createSessionFn()
+	}
+
 	sm.mu.Lock()
 	// Close existing session if any
 	sm.closeSessionLocked()
@@ -249,7 +260,7 @@ func (sm *sessionManager) closeSession() {
 }
 
 // getSession returns the current session, creating one if needed.
-func (sm *sessionManager) getSession() (*smux.Session, uint32, error) {
+func (sm *sessionManager) getSession() (smuxSession, uint32, error) {
 	sm.mu.RLock()
 	sess := sm.sess
 	conv := sm.conv
