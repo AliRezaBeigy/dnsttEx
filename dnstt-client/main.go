@@ -65,26 +65,6 @@ import (
 // smux streams will be closed after this much time without receiving data.
 const idleTimeout = 2 * time.Minute
 
-// dnsNameCapacity returns the number of bytes remaining for encoded data after
-// including domain in a DNS name.
-func dnsNameCapacity(domain dns.Name) int {
-	// Names must be 255 octets or shorter in total length.
-	// https://tools.ietf.org/html/rfc1035#section-2.3.4
-	capacity := 255
-	// Subtract the length of the null terminator.
-	capacity -= 1
-	for _, label := range domain {
-		// Subtract the length of the label and the length octet.
-		capacity -= len(label) + 1
-	}
-	// Each label may be up to 63 bytes long and requires 64 bytes to
-	// encode.
-	capacity = capacity * 63 / 64
-	// Base32 expands every 5 bytes to 8.
-	capacity = capacity * 5 / 8
-	return capacity
-}
-
 // readKeyFromFile reads a key from a named file.
 func readKeyFromFile(filename string) ([]byte, error) {
 	f, err := os.Open(filename)
@@ -374,10 +354,7 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 	}
 	defer ln.Close()
 
-	mtu := dnsNameCapacity(domain) - 8 - 1 - numPadding - 1 // clientid + padding length prefix + padding + data length prefix
-	if mtu < 80 {
-		return fmt.Errorf("domain %s leaves only %d bytes for payload", domain, mtu)
-	}
+	mtu := maxPacketSize // EDNS option carries binary packets; 223 is max for 1-byte length prefix
 	log.Printf("effective MTU %d", mtu)
 
 	// Create session manager

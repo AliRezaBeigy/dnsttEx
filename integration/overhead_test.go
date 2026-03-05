@@ -9,8 +9,7 @@ import (
 )
 
 // TestOverhead measures the ratio of DNS wire bytes to application payload bytes.
-// The DNS tunnel must base32-encode every packet into query labels and wrap it
-// in DNS TXT RR responses, so the overhead is significant (typically 3–8×).
+// With EDNS-option encoding (binary, no Base32), overhead is typically ~1.2–2×.
 //
 // Wire bytes are counted by countingUDPRelay, which sits transparently between
 // the dnstt-client and dnstt-server subprocesses.
@@ -59,11 +58,9 @@ func TestOverhead(t *testing.T) {
 		"overhead_ratio":              ratio,
 	})
 
-	// Sanity bounds: DNS tunnel overhead should be between 2× and 25×.
-	// Lower bound: even with perfect packing, base32 + DNS framing adds ≥2×.
-	// Upper bound: if overhead exceeds 25×, something is badly wrong.
-	if ratio < 2.0 {
-		t.Errorf("overhead ratio %.2f is suspiciously low (expected ≥ 2.0)", ratio)
+	// Sanity bounds: ratio must be at least 1.0 (wire ≥ payload) and not absurdly high.
+	if ratio < 1.0 {
+		t.Errorf("overhead ratio %.2f is impossible (wire < payload)", ratio)
 	}
 	if ratio > 25.0 {
 		t.Errorf("overhead ratio %.2f is too high (expected ≤ 25.0)", ratio)

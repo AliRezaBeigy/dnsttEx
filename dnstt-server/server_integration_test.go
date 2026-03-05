@@ -4,7 +4,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/base32"
 	"net"
 	"testing"
 	"time"
@@ -13,52 +12,23 @@ import (
 	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
 )
 
-// testBase32 is the same no-padding base32 encoding used by the server.
-var testBase32 = base32.StdEncoding.WithPadding(base32.NoPadding)
-
-// buildTunnelQuery builds a valid DNS TXT query whose Question name encodes
-// the given raw payload (clientID + padding + packet) over the given domain.
-// It includes an EDNS(0) OPT RR advertising a 4096-byte payload so that
-// responseFor does not return FORMERR.
+// buildTunnelQuery builds a valid DNS TXT query with payload in EDNS option 0xFF00.
+// Question name is minimal ("t" + domain). OPT advertises 4096-byte payload.
 func buildTunnelQuery(payload []byte, domain dns.Name) (*dns.Message, error) {
-	encoded := make([]byte, testBase32.EncodedLen(len(payload)))
-	testBase32.Encode(encoded, payload)
-	encoded = bytes.ToLower(encoded)
-
-	// Break encoded name into ≤63-byte labels.
-	var labels [][]byte
-	for len(encoded) > 0 {
-		n := len(encoded)
-		if n > 63 {
-			n = 63
-		}
-		labels = append(labels, encoded[:n])
-		encoded = encoded[n:]
-	}
-	labels = append(labels, domain...)
+	labels := append([][]byte{[]byte("t")}, domain...)
 	name, err := dns.NewName(labels)
 	if err != nil {
 		return nil, err
 	}
-
+	optData := dns.BuildEDNSOptions([]dns.EDNSOption{{Code: upstreamEDNSOptionCode, Data: payload}})
 	return &dns.Message{
 		ID:    0x1234,
-		Flags: 0x0100, // QR=0, RD=1
+		Flags: 0x0100,
 		Question: []dns.Question{
-			{
-				Name:  name,
-				Type:  dns.RRTypeTXT,
-				Class: dns.ClassIN,
-			},
+			{Name: name, Type: dns.RRTypeTXT, Class: dns.ClassIN},
 		},
 		Additional: []dns.RR{
-			{
-				Name:  dns.Name{},
-				Type:  dns.RRTypeOPT,
-				Class: 4096, // requester's UDP payload size
-				TTL:   0,
-				Data:  []byte{},
-			},
+			{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: 0, Data: optData},
 		},
 	}, nil
 }
@@ -195,30 +165,26 @@ func TestResponseFor(t *testing.T) {
 		}
 	})
 
-	t.Run("invalid base32 in name returns NXDOMAIN", func(t *testing.T) {
-		// Use a name that is a valid subdomain of domain but is NOT valid base32.
-		badLabels := append([][]byte{[]byte("!notbase32!")}, domain...)
-		badName, err := dns.NewName(badLabels)
-		if err != nil {
-			// If the name itself is invalid, skip — not what we're testing.
-			t.Skipf("cannot build bad name: %v", err)
-		}
+	t.Run("query without EDNS option 0xFF00 returns NXDOMAIN", func(t *testing.T) {
+		// Valid subdomain but OPT has no our option (or payload too short).
+		labels := append([][]byte{[]byte("t")}, domain...)
+		name, _ := dns.NewName(labels)
 		query := &dns.Message{
 			ID:    5,
 			Flags: 0x0100,
 			Question: []dns.Question{
-				{Name: badName, Type: dns.RRTypeTXT, Class: dns.ClassIN},
+				{Name: name, Type: dns.RRTypeTXT, Class: dns.ClassIN},
 			},
 			Additional: []dns.RR{
-				{Type: dns.RRTypeOPT, Class: 4096, Data: []byte{}},
+				{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: 0, Data: []byte{}},
 			},
 		}
 		resp, _ := responseFor(query, domain)
 		if resp == nil {
-			t.Fatal("expected non-nil response for invalid base32")
+			t.Fatal("expected non-nil response")
 		}
 		if resp.Rcode() != dns.RcodeNameError {
-			t.Errorf("expected NXDOMAIN for invalid base32, got %d", resp.Rcode())
+			t.Errorf("expected NXDOMAIN when OPT has no 0xFF00, got %d", resp.Rcode())
 		}
 	})
 }

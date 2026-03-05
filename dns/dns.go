@@ -573,3 +573,60 @@ func EncodeRDataTXT(p []byte) []byte {
 	buf.Write(p)
 	return buf.Bytes()
 }
+
+// EDNSOption represents a single EDNS option (CODE + DATA).
+// https://tools.ietf.org/html/rfc6891#section-6.1.2
+type EDNSOption struct {
+	Code uint16
+	Data []byte
+}
+
+// ParseEDNSOptions parses OPT RR RDATA into a list of options.
+// Returns nil, nil for empty RDATA.
+func ParseEDNSOptions(data []byte) ([]EDNSOption, error) {
+	var opts []EDNSOption
+	r := bytes.NewReader(data)
+	for r.Len() >= 4 {
+		var code, length uint16
+		if err := binary.Read(r, binary.BigEndian, &code); err != nil {
+			return nil, err
+		}
+		if err := binary.Read(r, binary.BigEndian, &length); err != nil {
+			return nil, err
+		}
+		if int(length) > r.Len() {
+			return nil, io.ErrUnexpectedEOF
+		}
+		payload := make([]byte, length)
+		if _, err := io.ReadFull(r, payload); err != nil {
+			return nil, err
+		}
+		opts = append(opts, EDNSOption{Code: code, Data: payload})
+	}
+	if r.Len() != 0 {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return opts, nil
+}
+
+// BuildEDNSOptions builds OPT RR RDATA from a list of options.
+func BuildEDNSOptions(opts []EDNSOption) []byte {
+	var buf bytes.Buffer
+	for _, o := range opts {
+		binary.Write(&buf, binary.BigEndian, o.Code)
+		length := uint16(len(o.Data))
+		binary.Write(&buf, binary.BigEndian, length)
+		buf.Write(o.Data)
+	}
+	return buf.Bytes()
+}
+
+// FindEDNSOption returns the data of the first option with the given code, or nil.
+func FindEDNSOption(opts []EDNSOption, code uint16) []byte {
+	for i := range opts {
+		if opts[i].Code == code {
+			return opts[i].Data
+		}
+	}
+	return nil
+}

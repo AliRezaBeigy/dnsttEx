@@ -40,7 +40,7 @@ func TestSessionManagerNoDeadlock(t *testing.T) {
 		t.Fatalf("GeneratePrivkey: %v", err)
 	}
 	pubkey := noise.PubkeyFromPrivkey(privkey)
-	mtu := dnsNameCapacity(domain) - 8 - 1 - numPadding - 1
+	mtu := maxPacketSize
 	sm := newSessionManager(pubkey, domain, turbotunnel.DummyAddr{}, dnsConn, mtu)
 
 	const goroutines = 4
@@ -89,7 +89,7 @@ func TestSessionManagerCloseSession(t *testing.T) {
 	domain, _ := dns.ParseName("t.test.invalid")
 	privkey, _ := noise.GeneratePrivkey()
 	pubkey := noise.PubkeyFromPrivkey(privkey)
-	mtu := dnsNameCapacity(domain) - 8 - 1 - numPadding - 1
+	mtu := maxPacketSize
 	sm := newSessionManager(pubkey, domain, turbotunnel.DummyAddr{}, pconn, mtu)
 
 	// closeSession on a manager with no session should not panic.
@@ -249,7 +249,7 @@ func TestOpenStreamRecreatesSession(t *testing.T) {
 	domain, _ := dns.ParseName("t.test.invalid")
 	privkey, _ := noise.GeneratePrivkey()
 	pubkey := noise.PubkeyFromPrivkey(privkey)
-	mtu := dnsNameCapacity(domain) - 8 - 1 - numPadding - 1
+	mtu := maxPacketSize
 
 	remoteAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:1")
 	dnsConn := NewDNSPacketConn(pconn, remoteAddr, domain)
