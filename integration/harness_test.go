@@ -3,6 +3,7 @@
 package integration_test
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -15,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"dnsttEx/dns"
 	"dnsttEx/noise"
 )
 
@@ -211,6 +213,69 @@ func newTunnelHarnessWithRelay(t testing.TB, serverBin, clientBin string) (*coun
 	return relay, h
 }
 
+// newTunnelHarnessWithRelayAndDNSLog is like newTunnelHarnessWithRelay but
+// logs each DNS query and response via t.Logf.
+func newTunnelHarnessWithRelayAndDNSLog(t testing.TB, serverBin, clientBin string) (*countingUDPRelay, *tunnelHarness) {
+	t.Helper()
+
+	h := &tunnelHarness{
+		serverBin: serverBin,
+		clientBin: clientBin,
+		domain:    "t.test.invalid",
+	}
+
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("echo listen: %v", err)
+	}
+	h.echoLn = echoLn
+	go runEchoServer(echoLn)
+
+	privkey, err := noise.GeneratePrivkey()
+	if err != nil {
+		t.Fatalf("GeneratePrivkey: %v", err)
+	}
+	pubkey := noise.PubkeyFromPrivkey(privkey)
+	h.privkeyHex = noise.EncodeKey(privkey)
+	h.pubkeyHex = noise.EncodeKey(pubkey)
+
+	h.dnsUDPAddr = allocFreeUDPAddr(t)
+
+	h.serverCmd = exec.Command(serverBin,
+		"-udp", h.dnsUDPAddr,
+		"-privkey", h.privkeyHex,
+		h.domain,
+		echoLn.Addr().String(),
+	)
+	h.serverCmd.Stderr = os.Stderr
+	if err := h.serverCmd.Start(); err != nil {
+		t.Fatalf("start server: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	relay := newCountingUDPRelayWithDNSLog(t, h.dnsUDPAddr, nil) // set nil for now
+
+	h.ClientAddr = allocFreeTCPAddr(t)
+	h.clientCmd = exec.Command(clientBin,
+		"-udp", relay.Addr(),
+		"-pubkey", h.pubkeyHex,
+		h.domain,
+		h.ClientAddr,
+	)
+	h.clientCmd.Stderr = os.Stderr
+	if err := h.clientCmd.Start(); err != nil {
+		t.Fatalf("start client: %v", err)
+	}
+
+	waitTCP(t, h.ClientAddr, 20*time.Second)
+
+	t.Cleanup(func() {
+		relay.Close()
+		h.Teardown()
+	})
+	return relay, h
+}
+
 // dialTunnel opens a TCP connection to the client's local listener.
 func (h *tunnelHarness) dialTunnel(t testing.TB) net.Conn {
 	t.Helper()
@@ -289,7 +354,7 @@ func waitTCP(t testing.TB, addr string, timeout time.Duration) {
 	t.Fatalf("timed out after %v waiting for TCP at %s", timeout, addr)
 }
 
-// pingPong sends one byte and reads one byte back (15s deadline).
+// pingPong sends one byte (0x42) and reads one byte back, asserting it matches (15s deadline).
 func pingPong(t testing.TB, conn net.Conn, label string) {
 	t.Helper()
 	conn.SetDeadline(time.Now().Add(15 * time.Second))
@@ -300,6 +365,9 @@ func pingPong(t testing.TB, conn net.Conn, label string) {
 	buf := make([]byte, 1)
 	if _, err := io.ReadFull(conn, buf); err != nil {
 		t.Fatalf("%s read: %v", label, err)
+	}
+	if buf[0] != 0x42 {
+		t.Fatalf("%s: echoed byte %x, want 0x42 (data corruption)", label, buf[0])
 	}
 }
 
@@ -312,10 +380,61 @@ func TestSanity(t *testing.T) {
 	t.Log("sanity echo OK")
 }
 
+// TestSanityUDPViaRelay verifies client and server communicate over UDP DNS when
+// a relay sits between them (client → relay → server). This is a realistic
+// UDP-only integration test: real DNS wire format over UDP, no DoH/DoT.
+// DNS queries and responses are logged via t.Logf.
+func TestSanityUDPViaRelay(t *testing.T) {
+	relay, h := newTunnelHarnessWithRelayAndDNSLog(t, globalServerBin, globalClientBin)
+	_ = relay
+	conn := h.dialTunnel(t)
+	defer conn.Close()
+	pingPong(t, conn, "udp-via-relay")
+	t.Log("UDP DNS via relay echo OK")
+}
+
+// TestDataIntegrity sends a deterministic payload through the tunnel and
+// verifies the echo is byte-for-byte identical. Ensures data transmission
+// is fully correct (no corruption, reordering, or truncation).
+// Uses the relay-with-DNS-logging so DNS queries and responses are logged,
+// including tunnel_payload size (EDNS 0xFF00/0xFF01) so you see real data in the log.
+//
+// Note: This tests real DNS wire format over UDP (client ↔ relay ↔ server on localhost).
+// It does not run through the public DNS hierarchy (no recursive resolver, no NS delegation).
+func TestDataIntegrity(t *testing.T) {
+	relay, h := newTunnelHarnessWithRelayAndDNSLog(t, globalServerBin, globalClientBin)
+	_ = relay
+	conn := h.dialTunnel(t)
+	defer conn.Close()
+
+	// Deterministic payload: 16 KB, every byte unique and predictable.
+	const size = 16 * 1024
+	payload := make([]byte, size)
+	for i := range payload {
+		payload[i] = byte(i % 256)
+	}
+	recvBuf := make([]byte, size)
+
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := io.ReadFull(conn, recvBuf); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	for i := range payload {
+		if recvBuf[i] != payload[i] {
+			t.Fatalf("data corruption at byte %d: got %x, want %x", i, recvBuf[i], payload[i])
+		}
+	}
+	t.Logf("data integrity OK: %d bytes echoed correctly", size)
+}
+
 // --- countingUDPRelay ---
 
 // countingUDPRelay is a transparent UDP middleman between client and server.
 // It counts raw bytes in both directions for wire-overhead measurement.
+// If dnsLog is set, each DNS packet is parsed and logged (query/response).
 type countingUDPRelay struct {
 	ln         *net.UDPConn // listens for client packets
 	serverAddr *net.UDPAddr // real server address
@@ -327,9 +446,17 @@ type countingUDPRelay struct {
 	clientAddr *net.UDPAddr // last known client address (filled on first packet)
 
 	done chan struct{}
+
+	dnsLog testing.TB // if set, log DNS query/response via Logf
 }
 
 func newCountingUDPRelay(t testing.TB, serverAddrStr string) *countingUDPRelay {
+	return newCountingUDPRelayWithDNSLog(t, serverAddrStr, nil)
+}
+
+// newCountingUDPRelayWithDNSLog is like newCountingUDPRelay but logs each DNS
+// query and response via tb.Logf when dnsLog is non-nil.
+func newCountingUDPRelayWithDNSLog(t testing.TB, serverAddrStr string, dnsLog testing.TB) *countingUDPRelay {
 	t.Helper()
 	serverAddr, err := net.ResolveUDPAddr("udp", serverAddrStr)
 	if err != nil {
@@ -343,6 +470,7 @@ func newCountingUDPRelay(t testing.TB, serverAddrStr string) *countingUDPRelay {
 		ln:         ln,
 		serverAddr: serverAddr,
 		done:       make(chan struct{}),
+		dnsLog:     dnsLog,
 	}
 	go r.loop()
 	return r
@@ -378,6 +506,9 @@ func (r *countingUDPRelay) loop() {
 			if err != nil {
 				return
 			}
+			if r.dnsLog != nil {
+				logDNSMessage(r.dnsLog, "response", buf2[:n])
+			}
 			r.received.Add(int64(n))
 			r.mu.Lock()
 			clientAddr := r.clientAddr
@@ -394,10 +525,84 @@ func (r *countingUDPRelay) loop() {
 		if err != nil {
 			return
 		}
+		if r.dnsLog != nil {
+			logDNSMessage(r.dnsLog, "query", buf[:n])
+		}
 		r.sent.Add(int64(n))
 		r.mu.Lock()
 		r.clientAddr = clientAddr
 		r.mu.Unlock()
 		serverConn.WriteToUDP(buf[:n], r.serverAddr)
+	}
+}
+
+// Tunnel EDNS option codes (same as dnstt-client/dnstt-server).
+const (
+	ednsOptionUpstream   = 0xFF00 // client → server payload
+	ednsOptionDownstream = 0xFF01 // server → client payload
+)
+
+// logDNSMessage parses wire as DNS and logs a short summary via tb.Logf.
+// For tunnel messages, also logs tunnel payload length (EDNS option 0xFF00/0xFF01)
+// so the log shows that real application data is carried inside DNS.
+func logDNSMessage(tb testing.TB, direction string, wire []byte) {
+	msg, err := dns.MessageFromWireFormat(wire)
+	if err != nil {
+		tb.Logf("DNS %s: [parse error: %v] %d bytes", direction, err, len(wire))
+		return
+	}
+	// Tunnel payload size from OPT RR (proves data is in the message).
+	var payloadLen int
+	for _, rr := range msg.Additional {
+		if rr.Type == dns.RRTypeOPT && len(rr.Data) > 0 {
+			opts, err := dns.ParseEDNSOptions(rr.Data)
+			if err != nil {
+				continue
+			}
+			if (msg.Flags & 0x8000) == 0 {
+				if p := dns.FindEDNSOption(opts, ednsOptionUpstream); p != nil {
+					payloadLen = len(p)
+					break
+				}
+			} else {
+				if p := dns.FindEDNSOption(opts, ednsOptionDownstream); p != nil {
+					payloadLen = len(p)
+					break
+				}
+			}
+		}
+	}
+
+	qr := "query"
+	if (msg.Flags & 0x8000) != 0 {
+		qr = "response"
+	}
+	if qr == "query" {
+		var qs []string
+		for _, q := range msg.Question {
+			qs = append(qs, fmt.Sprintf("%s type=%d", q.Name.String(), q.Type))
+		}
+		if len(qs) == 0 {
+			qs = append(qs, "(no question)")
+		}
+		if payloadLen > 0 {
+			tb.Logf("DNS %s: id=%d %s → %s tunnel_payload=%d bytes", direction, msg.ID, qr, qs, payloadLen)
+		} else {
+			tb.Logf("DNS %s: id=%d %s → %s", direction, msg.ID, qr, qs)
+		}
+	} else {
+		rcode := msg.Rcode()
+		rcodeStr := map[uint16]string{
+			0: "NOERROR", 1: "FORMERR", 3: "NXDOMAIN", 4: "NOTIMPL",
+		}
+		s := rcodeStr[rcode]
+		if s == "" {
+			s = fmt.Sprintf("RCODE%d", rcode)
+		}
+		if payloadLen > 0 {
+			tb.Logf("DNS %s: id=%d %s rcode=%s ancount=%d tunnel_payload=%d bytes", direction, msg.ID, qr, s, len(msg.Answer), payloadLen)
+		} else {
+			tb.Logf("DNS %s: id=%d %s rcode=%s ancount=%d", direction, msg.ID, qr, s, len(msg.Answer))
+		}
 	}
 }

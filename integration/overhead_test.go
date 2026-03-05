@@ -3,13 +3,14 @@
 package integration_test
 
 import (
+	"bytes"
 	"io"
 	"testing"
 	"time"
 )
 
 // TestOverhead measures the ratio of DNS wire bytes to application payload bytes.
-// With EDNS-option encoding (binary, no Base32), overhead is typically ~1.2–2×.
+// Name-based uses Base32 (8/5 expansion), case-insensitive decode for QNAME randomization; overhead ~3×.
 //
 // Wire bytes are counted by countingUDPRelay, which sits transparently between
 // the dnstt-client and dnstt-server subprocesses.
@@ -24,6 +25,9 @@ func TestOverhead(t *testing.T) {
 
 	const payloadBytes = 64 * 1024 // 64 KB per direction
 	payload := make([]byte, payloadBytes)
+	for i := range payload {
+		payload[i] = byte(i % 256)
+	}
 	recvBuf := make([]byte, payloadBytes)
 
 	conn.SetDeadline(time.Now().Add(120 * time.Second))
@@ -32,6 +36,9 @@ func TestOverhead(t *testing.T) {
 	}
 	if _, err := io.ReadFull(conn, recvBuf); err != nil {
 		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(payload, recvBuf) {
+		t.Fatal("echoed data does not match sent data (corruption or truncation)")
 	}
 
 	// Wait for KCP ACK packets to clear before snapshotting counters.

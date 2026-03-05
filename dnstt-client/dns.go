@@ -3,57 +3,50 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/base32"
 	"encoding/binary"
+	"encoding/hex"
 	"io"
 	"log"
 	"net"
+	"os"
+	"strconv"
 	"time"
 
 	"dnsttEx/dns"
 	"dnsttEx/turbotunnel"
 )
 
-	// EDNS option codes for tunnel payload (RFC 6891 private use).
-	const (
-	upstreamEDNSOptionCode   = 0xFF00 // client -> server payload
-	downstreamEDNSOptionCode = 0xFF01 // server -> client payload
-	)
-
-	const (
-	// How many bytes of random padding to insert into data-carrying queries.
-	numPadding = 0
-	// In an otherwise empty polling query, insert random padding to reduce cache hits.
-	numPaddingForPoll = 8
-
-	// sendLoop has a poll timer that automatically sends an empty polling
-	// query when a certain amount of time has elapsed without a send. The
-	// poll timer is initially set to initPollDelay. It increases by a
-	// factor of pollDelayMultiplier every time the poll timer expires, up
-	// to a maximum of maxPollDelay. The poll timer is reset to
-	// initPollDelay whenever an a send occurs that is not the result of the
-	// poll timer expiring.
-	initPollDelay       = 500 * time.Millisecond
-	maxPollDelay        = 2 * time.Second // was 10s; cap at 2s to limit stall on unstable DNS
-	pollDelayMultiplier = 2.0
-
-	// A limit on the number of empty poll requests we may send in a burst
-	// as a result of receiving data.
-	pollLimit = 16
-
-	// Max raw payload bytes in one upstream EDNS option (ClientID + padding + packets).
-	maxPayloadPerQuery = 512
-	// Max bytes in a single tunnel packet (1-byte length prefix, values < 0xe0 are length).
-	maxPacketSize = 223
+// EDNS option codes (used when resolver forwards them; name-based is fallback for 8.8.8.8 etc).
+const (
+	upstreamEDNSOptionCode   = 0xFF00
+	downstreamEDNSOptionCode = 0xFF01
 )
 
-// DNSPacketConn provides a packet-sending and -receiving interface over various
-// forms of DNS. Upstream payload is carried in an EDNS option (binary, no encoding
-// expansion); downstream payload is in the response EDNS option.
-//
-// DNSPacketConn does not handle the mechanics of actually sending and receiving
-// encoded DNS messages. That is rather the responsibility of some other
-// net.PacketConn such as net.UDPConn, HTTPPacketConn, or TLSPacketConn, one of
-// which must be provided to NewDNSPacketConn.
+const (
+	numPadding        = 0
+	numPaddingForPoll = 8
+
+	initPollDelay       = 50 * time.Millisecond
+	maxPollDelay        = 500 * time.Millisecond
+	pollDelayMultiplier = 2.0
+	pollLimit           = 16
+
+	maxPacketSize = 223 // max packet size (1-byte length prefix)
+
+	// RFC 1035 max is 63; 57 leaves more room in 253-octet name.
+	maxLabelLen = 57
+	// Consecutive send errors before we back off poll rate (resolver rate limiting).
+	rateLimitBackoffThreshold  = 3
+	rateLimitBackoffMultiplier = 2.0
+)
+
+// Base32 (uppercase, no padding): case-insensitive decode on server handles QNAME case randomization.
+var base32Encoding = base32.StdEncoding.WithPadding(base32.NoPadding)
+
+// DNSPacketConn sends and receives tunnel payload over DNS. Upstream is Base32 in the
+// question name (uppercase); server decodes case-insensitively for QNAME randomization.
+// No EDNS for payload. Downstream from TXT Answer first, then EDNS 0xFF01 if present.
 //
 // We don't have a need to match up a query and a response by ID. Queries and
 // responses are vehicles for carrying data and for our purposes don't need to
@@ -99,8 +92,8 @@ func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name) 
 	return c
 }
 
-// dnsResponsePayload extracts the downstream payload from the response EDNS option.
-// It returns nil if the message is not a valid NOERROR response or if our option is absent.
+// dnsResponsePayload extracts downstream payload. Prefers TXT Answer (works with
+// all resolvers); falls back to EDNS option 0xFF01 if present.
 func dnsResponsePayload(resp *dns.Message, domain dns.Name) []byte {
 	if resp.Flags&0x8000 != 0x8000 || resp.Flags&0x000f != dns.RcodeNoError {
 		return nil
@@ -111,6 +104,16 @@ func dnsResponsePayload(resp *dns.Message, domain dns.Name) []byte {
 	if _, ok := resp.Question[0].Name.TrimSuffix(domain); !ok {
 		return nil
 	}
+	// Prefer TXT Answer so 8.8.8.8 and other public resolvers work (they don't strip TXT).
+	if len(resp.Answer) == 1 {
+		answer := resp.Answer[0]
+		if _, ok := answer.Name.TrimSuffix(domain); ok && answer.Type == dns.RRTypeTXT {
+			if p, err := dns.DecodeRDataTXT(answer.Data); err == nil {
+				return p
+			}
+		}
+	}
+	// Fallback: EDNS option (when resolver forwards it).
 	for _, rr := range resp.Additional {
 		if rr.Type != dns.RRTypeOPT {
 			continue
@@ -201,13 +204,18 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 		// Pull out the packets contained in the payload.
 		r := bytes.NewReader(payload)
 		any := false
+		nPackets := 0
 		for {
 			p, err := nextPacket(r)
 			if err != nil {
 				break
 			}
 			any = true
+			nPackets++
 			c.QueuePacketConn.QueueIncoming(p, addr)
+		}
+		if os.Getenv("DNSTT_DEBUG") != "" && len(payload) > 0 {
+			log.Printf("[client] received payload %d bytes (%d packets)", len(payload), nPackets)
 		}
 
 		// If the payload contained one or more packets, permit sendLoop
@@ -223,7 +231,30 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 	}
 }
 
-// buildUpstreamPayload builds the raw option payload: ClientID(8) + padding byte + padding bytes + [1-byte len + packet]*.
+func nameCapacity(domain dns.Name) int {
+	capacity := 255 - 1
+	for _, label := range domain {
+		capacity -= len(label) + 1
+	}
+	capacity = capacity * maxLabelLen / (maxLabelLen + 1) // each label: 1 byte length + maxLabelLen
+	capacity = capacity * 5 / 8                           // Base32 expansion
+	return capacity
+}
+
+func chunks(p []byte, n int) [][]byte {
+	var out [][]byte
+	for len(p) > 0 {
+		sz := len(p)
+		if sz > n {
+			sz = n
+		}
+		out = append(out, p[:sz])
+		p = p[sz:]
+	}
+	return out
+}
+
+// buildUpstreamPayload builds raw payload: ClientID(8) + padding byte + padding bytes + [1-byte len + packet]*.
 func (c *DNSPacketConn) buildUpstreamPayload(packets [][]byte) []byte {
 	var buf bytes.Buffer
 	buf.Write(c.clientID[:])
@@ -235,7 +266,7 @@ func (c *DNSPacketConn) buildUpstreamPayload(packets [][]byte) []byte {
 	io.CopyN(&buf, rand.Reader, int64(nPad))
 	for _, p := range packets {
 		if len(p) >= 224 {
-			continue // skip invalid
+			continue
 		}
 		buf.WriteByte(byte(len(p)))
 		buf.Write(p)
@@ -243,12 +274,25 @@ func (c *DNSPacketConn) buildUpstreamPayload(packets [][]byte) []byte {
 	return buf.Bytes()
 }
 
-// send sends one or more packets in a single DNS query using an EDNS option (binary, no encoding expansion).
+// send encodes payload in the question name (Base32, uppercase) for public resolvers; no EDNS.
 func (c *DNSPacketConn) send(transport net.PacketConn, packets [][]byte, addr net.Addr) error {
-	payload := c.buildUpstreamPayload(packets)
-	optData := dns.BuildEDNSOptions([]dns.EDNSOption{{Code: upstreamEDNSOptionCode, Data: payload}})
-	// Minimal question name: one label "t" then domain (so server recognizes as tunnel).
-	labels := append([][]byte{[]byte("t")}, c.domain...)
+	capacity := nameCapacity(c.domain)
+	decoded := c.buildUpstreamPayload(packets)
+	for len(decoded) > capacity && len(packets) > 1 {
+		// Stash last packet and try again with fewer.
+		c.QueuePacketConn.Stash(packets[len(packets)-1], addr)
+		packets = packets[:len(packets)-1]
+		decoded = c.buildUpstreamPayload(packets)
+	}
+	if len(decoded) > capacity && len(packets) == 1 {
+		c.QueuePacketConn.Stash(packets[0], addr)
+		decoded = c.buildUpstreamPayload(nil)
+	}
+	encoded := make([]byte, base32Encoding.EncodedLen(len(decoded)))
+	base32Encoding.Encode(encoded, decoded)
+	encoded = bytes.ToUpper(encoded) // uppercase so server can normalize for case randomization
+	labels := chunks(encoded, maxLabelLen)
+	labels = append(labels, c.domain...)
 	name, err := dns.NewName(labels)
 	if err != nil {
 		return err
@@ -262,24 +306,50 @@ func (c *DNSPacketConn) send(transport net.PacketConn, packets [][]byte, addr ne
 			{Name: name, Type: dns.RRTypeTXT, Class: dns.ClassIN},
 		},
 		Additional: []dns.RR{
-			{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: 0, Data: optData},
+			{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: 0, Data: []byte{}},
 		},
 	}
 	buf, err := query.WireFormat()
 	if err != nil {
 		return err
 	}
+	if os.Getenv("DNSTT_DEBUG") != "" {
+		if len(packets) > 0 {
+			log.Printf("[client] send name payload %d bytes (%d packets)", len(decoded), len(packets))
+		}
+		hexLen := 64
+		if len(buf) < hexLen {
+			hexLen = len(buf)
+		}
+		log.Printf("[client] send to %s wire=%d id=%d hex=%s", addr, len(buf), query.ID, hex.EncodeToString(buf[:hexLen]))
+	}
 	_, err = transport.WriteTo(buf, addr)
 	return err
 }
 
-// sendLoop takes packets from the outgoing queue, batches them up to maxPayloadPerQuery,
-// and sends them in one query per batch. Also sends empty polling queries when idle.
+// sendLoop batches packets into the question name (limited by nameCapacity). Also sends polling queries when idle.
+// Poll timing can be overridden with DNSTT_POLL_INIT_MS and DNSTT_POLL_MAX_MS (e.g. 500/2000 for conservative resolvers).
 func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error {
-	pollDelay := initPollDelay
+	initPoll, maxPoll := initPollDelay, maxPollDelay
+	if s := os.Getenv("DNSTT_POLL_INIT_MS"); s != "" {
+		if ms, err := strconv.Atoi(s); err == nil && ms > 0 {
+			initPoll = time.Duration(ms) * time.Millisecond
+		}
+	}
+	if s := os.Getenv("DNSTT_POLL_MAX_MS"); s != "" {
+		if ms, err := strconv.Atoi(s); err == nil && ms > 0 {
+			maxPoll = time.Duration(ms) * time.Millisecond
+		}
+	}
+	pollDelay := initPoll
 	pollTimer := time.NewTimer(pollDelay)
-	overhead := 8 + 1 + numPadding // ClientID + padding byte + padding bytes for data query
-	payloadLimit := maxPayloadPerQuery - overhead
+	capacity := nameCapacity(c.domain)
+	overhead := 8 + 1 + numPadding
+	payloadLimit := capacity - overhead
+	if payloadLimit < 0 {
+		payloadLimit = 0
+	}
+	var sendFailures int
 	for {
 		var packets [][]byte
 		outgoing := c.QueuePacketConn.OutgoingQueue(addr)
@@ -305,7 +375,10 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 		}
 
 		if len(packets) > 0 {
-			select { case <-c.pollChan: default: }
+			select {
+			case <-c.pollChan:
+			default:
+			}
 			used := 0
 			for _, p := range packets {
 				used += 1 + len(p)
@@ -335,19 +408,34 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 
 		if pollTimerExpired {
 			pollDelay = time.Duration(float64(pollDelay) * pollDelayMultiplier)
-			if pollDelay > maxPollDelay {
-				pollDelay = maxPollDelay
+			if pollDelay > maxPoll {
+				pollDelay = maxPoll
 			}
 		} else {
 			if !pollTimer.Stop() {
 				<-pollTimer.C
 			}
-			pollDelay = initPollDelay
+			pollDelay = initPoll
 		}
 		pollTimer.Reset(pollDelay)
 
 		if err := c.send(transport, packets, addr); err != nil {
-			log.Printf("send: %v", err)
+			sendFailures++
+			if sendFailures >= rateLimitBackoffThreshold {
+				pollDelay = time.Duration(float64(pollDelay) * rateLimitBackoffMultiplier)
+				if pollDelay > maxPoll {
+					pollDelay = maxPoll
+				}
+				sendFailures = 0
+				log.Printf("send failed %d times: %v; backing off poll to %v", rateLimitBackoffThreshold, err, pollDelay)
+			} else {
+				log.Printf("send: %v", err)
+			}
+		} else {
+			sendFailures = 0
+			if pollDelay > initPoll {
+				pollDelay = initPoll
+			}
 		}
 	}
 }

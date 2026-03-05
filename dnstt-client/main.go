@@ -354,7 +354,17 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 	}
 	defer ln.Close()
 
-	mtu := maxPacketSize // EDNS option carries binary packets; 223 is max for 1-byte length prefix
+	// KCP segment must fit in one DNS name: decoded = clientID(8) + paddingByte(1) + padding(numPadding) + length(1) + payload.
+	capacity := nameCapacity(domain)
+	overhead := 8 + 1 + numPadding + 1
+	maxPayloadInName := capacity - overhead
+	if maxPayloadInName < 1 {
+		return fmt.Errorf("domain %s leaves no room for payload (capacity %d)", domain, capacity)
+	}
+	mtu := maxPacketSize
+	if maxPayloadInName < mtu {
+		mtu = maxPayloadInName
+	}
 	log.Printf("effective MTU %d", mtu)
 
 	// Create session manager

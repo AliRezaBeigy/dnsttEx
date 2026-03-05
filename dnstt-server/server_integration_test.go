@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base32"
 	"net"
 	"testing"
 	"time"
@@ -185,6 +186,88 @@ func TestResponseFor(t *testing.T) {
 		}
 		if resp.Rcode() != dns.RcodeNameError {
 			t.Errorf("expected NXDOMAIN when OPT has no 0xFF00, got %d", resp.Rcode())
+		}
+	})
+
+	t.Run("name-based query (Base32 in name, no OPT payload) returns NoError and payload", func(t *testing.T) {
+		// Simulates public resolvers: payload only in question name. Uppercase Base32; server normalizes for case randomization.
+		clientID := turbotunnel.NewClientID()
+		rawPayload := append(clientID[:], 0xe0) // 8 + 1 byte
+		b32 := base32.StdEncoding.WithPadding(base32.NoPadding)
+		enc := make([]byte, b32.EncodedLen(len(rawPayload)))
+		b32.Encode(enc, rawPayload)
+		enc = bytes.ToUpper(enc)
+		var labels [][]byte
+		for len(enc) > 0 {
+			n := 63
+			if n > len(enc) {
+				n = len(enc)
+			}
+			labels = append(labels, enc[:n])
+			enc = enc[n:]
+		}
+		labels = append(labels, domain...)
+		name, err := dns.NewName(labels)
+		if err != nil {
+			t.Fatalf("NewName: %v", err)
+		}
+		query := &dns.Message{
+			ID:    0x5678,
+			Flags: 0x0100,
+			Question: []dns.Question{
+				{Name: name, Type: dns.RRTypeTXT, Class: dns.ClassIN},
+			},
+			Additional: []dns.RR{
+				{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: 0, Data: []byte{}},
+			},
+		}
+		resp, payload := responseFor(query, domain)
+		if resp == nil {
+			t.Fatal("responseFor returned nil response")
+		}
+		if resp.Rcode() != dns.RcodeNoError {
+			t.Fatalf("expected RcodeNoError for name-based query, got %d", resp.Rcode())
+		}
+		if !bytes.Equal(payload[:8], clientID[:]) {
+			t.Errorf("payload prefix = %x, want %x", payload[:8], clientID[:])
+		}
+	})
+
+	t.Run("name-based with lowercase subdomain (QNAME case randomization) still decodes", func(t *testing.T) {
+		// Resolvers may lowercase or randomize case; server normalizes to uppercase before Base32 decode.
+		clientID := turbotunnel.NewClientID()
+		rawPayload := append(clientID[:], 0xe0)
+		b32 := base32.StdEncoding.WithPadding(base32.NoPadding)
+		enc := make([]byte, b32.EncodedLen(len(rawPayload)))
+		b32.Encode(enc, rawPayload)
+		enc = bytes.ToLower(enc) // simulate resolver sending lowercase
+		var labels [][]byte
+		for len(enc) > 0 {
+			n := 63
+			if n > len(enc) {
+				n = len(enc)
+			}
+			labels = append(labels, enc[:n])
+			enc = enc[n:]
+		}
+		labels = append(labels, domain...)
+		name, _ := dns.NewName(labels)
+		query := &dns.Message{
+			ID:    0x9999,
+			Flags: 0x0100,
+			Question: []dns.Question{
+				{Name: name, Type: dns.RRTypeTXT, Class: dns.ClassIN},
+			},
+			Additional: []dns.RR{
+				{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: 0, Data: []byte{}},
+			},
+		}
+		resp, payload := responseFor(query, domain)
+		if resp == nil || resp.Rcode() != dns.RcodeNoError {
+			t.Fatalf("expected NoError when subdomain is lowercase (case randomization), got rcode %d", resp.Rcode())
+		}
+		if !bytes.Equal(payload[:8], clientID[:]) {
+			t.Errorf("payload prefix = %x, want %x", payload[:8], clientID[:])
 		}
 	})
 }

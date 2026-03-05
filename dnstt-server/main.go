@@ -50,7 +50,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base32"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -116,6 +118,8 @@ var (
 	// of 1232. Cloudflare's was 1452, and Google's was 4096.
 	maxUDPPayload = 1280 - 40 - 8
 )
+
+var base32Encoding = base32.StdEncoding.WithPadding(base32.NoPadding)
 
 // generateKeypair generates a private key and the corresponding public key. If
 // privkeyFilename and pubkeyFilename are respectively empty, it prints the
@@ -449,7 +453,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 	// all that comes before the domain if it does. If it does not, we will
 	// return RcodeNameError below, but prefer to return RcodeFormatError
 	// for payload size if that applies as well.
-	_, ok := question.Name.TrimSuffix(domain)
+	prefix, ok := question.Name.TrimSuffix(domain)
 	if !ok {
 		// Not a name we are authoritative for.
 		resp.Flags |= dns.RcodeNameError
@@ -470,7 +474,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 		return resp, nil
 	}
 
-	// Payload is carried in EDNS option 0xFF00 (binary, no encoding).
+	// Payload: prefer EDNS option 0xFF00 (when resolver forwards it); else decode from question name (works with 8.8.8.8 etc).
 	var payload []byte
 	for _, rr := range query.Additional {
 		if rr.Type != dns.RRTypeOPT {
@@ -482,6 +486,17 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 		}
 		payload = dns.FindEDNSOption(opts, upstreamEDNSOptionCode)
 		break
+	}
+	if len(payload) < 8 {
+		// Fallback: payload in question name (Base32). Normalize to uppercase so QNAME case randomization (e.g. 8.8.8.8) doesn't break decode.
+		encoded := bytes.ToUpper(bytes.Join(prefix, nil))
+		decoded := make([]byte, base32Encoding.DecodedLen(len(encoded)))
+		n, err := base32Encoding.Decode(decoded, encoded)
+		if err != nil {
+			resp.Flags |= dns.RcodeNameError
+			return resp, nil
+		}
+		payload = decoded[:n]
 	}
 	if len(payload) < 8 {
 		resp.Flags |= dns.RcodeNameError
@@ -650,10 +665,20 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			}
 			return err
 		}
+		if os.Getenv("DNSTT_DEBUG") != "" {
+			hexLen := 64
+			if n < hexLen {
+				hexLen = n
+			}
+			log.Printf("[server] received packet %d bytes from %s (before process) hex=%s", n, addr, hex.EncodeToString(buf[:hexLen]))
+		}
 
 		// Got a UDP packet. Try to parse it as a DNS message.
 		query, err := dns.MessageFromWireFormat(buf[:n])
 		if err != nil {
+			if os.Getenv("DNSTT_DEBUG") != "" {
+				log.Printf("[server] parse failed from %s: %v", addr, err)
+			}
 			if fallbackMgr != nil {
 				// Packet is not a valid DNS message, forward it if fallback is configured.
 				fallbackMgr.HandlePacket(buf[:n], addr)
@@ -662,8 +687,36 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			}
 			continue
 		}
+		if os.Getenv("DNSTT_DEBUG") != "" {
+			qname := ""
+			if len(query.Question) > 0 {
+				qname = query.Question[0].Name.String()
+			}
+			hasOPT := false
+			for _, rr := range query.Additional {
+				if rr.Type == dns.RRTypeOPT {
+					hasOPT = true
+					break
+				}
+			}
+			log.Printf("[server] parsed: id=%d qr=%d qdcount=%d qname=%s has_opt=%v wire_size=%d", query.ID, (query.Flags>>15)&1, len(query.Question), qname, hasOPT, n)
+		}
 
 		resp, payload := responseFor(&query, domain)
+		if os.Getenv("DNSTT_DEBUG") != "" {
+			rcode := uint16(0)
+			if resp != nil {
+				rcode = resp.Rcode()
+			}
+			payloadLen := 0
+			if payload != nil {
+				payloadLen = len(payload)
+			}
+			log.Printf("[server] responseFor: resp_rcode=%d payload_len=%d (need >=8 for tunnel)", rcode, payloadLen)
+			if resp != nil && payloadLen < 8 && len(query.Question) == 1 {
+				log.Printf("[server] no tunnel payload in query (resolver may have stripped EDNS option 0xFF00); send client to NS directly or use DoH/DoT")
+			}
+		}
 		// Extract the ClientID from the payload.
 		var clientID turbotunnel.ClientID
 		n = copy(clientID[:], payload)
@@ -672,13 +725,18 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			// Discard padding and pull out the packets contained in
 			// the payload.
 			r := bytes.NewReader(payload)
+			nPackets := 0
 			for {
 				p, err := nextPacket(r)
 				if err != nil {
 					break
 				}
+				nPackets++
 				// Feed the incoming packet to KCP.
 				ttConn.QueueIncoming(p, clientID)
+			}
+			if os.Getenv("DNSTT_DEBUG") != "" && (len(payload) > 0 || nPackets > 0) {
+				log.Printf("[server] received payload %d bytes (%d packets) from %s", 8+len(payload), nPackets, clientID)
 			}
 		} else {
 			// Payload is not long enough to contain a ClientID.
@@ -719,8 +777,16 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 		}
 
 		if rec.Resp.Rcode() == dns.RcodeNoError && len(rec.Resp.Question) == 1 {
-			// Fill the OPT RR with downstream packets in option 0xFF01 (binary).
-			rec.Resp.Answer = nil
+			// Downstream in TXT Answer so 8.8.8.8 and other public resolvers work (they don't strip TXT).
+			rec.Resp.Answer = []dns.RR{
+				{
+					Name:  rec.Resp.Question[0].Name,
+					Type:  rec.Resp.Question[0].Type,
+					Class: rec.Resp.Question[0].Class,
+					TTL:   responseTTL,
+					Data:  nil,
+				},
+			}
 
 			var payload bytes.Buffer
 			limit := maxEncodedPayload
@@ -729,6 +795,15 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 				var p []byte
 				unstash := ttConn.Unstash(rec.ClientID)
 				outgoing := ttConn.OutgoingQueue(rec.ClientID)
+				// When channel has pending records, don't wait long so we drain and avoid "channel full" drops.
+				waitDelay := maxResponseDelay
+				if len(ch) > 0 {
+					waitDelay = 0
+				}
+				if !timer.Stop() {
+					select { case <-timer.C: default: }
+				}
+				timer.Reset(waitDelay)
 				select {
 				case p = <-unstash:
 				default:
@@ -763,12 +838,9 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 			}
 			timer.Stop()
 
-			optData := dns.BuildEDNSOptions([]dns.EDNSOption{{Code: downstreamEDNSOptionCode, Data: payload.Bytes()}})
-			for i := range rec.Resp.Additional {
-				if rec.Resp.Additional[i].Type == dns.RRTypeOPT {
-					rec.Resp.Additional[i].Data = optData
-					break
-				}
+			rec.Resp.Answer[0].Data = dns.EncodeRDataTXT(payload.Bytes())
+			if os.Getenv("DNSTT_DEBUG") != "" && payload.Len() > 0 {
+				log.Printf("[server] send TXT payload %d bytes to %s", payload.Len(), rec.ClientID)
 			}
 		}
 
@@ -811,7 +883,7 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 // This function needs to be kept in sync with sendLoop with regard to how it
 // builds candidate responses.
 func computeMaxEncodedPayload(limit int) int {
-	// 64+64+64+62 octets, needs to be base32-decodable.
+	// 64+64+64+62 octets (max name), for TXT payload size search.
 	maxLengthName, err := dns.NewName([][]byte{
 		[]byte("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
 		[]byte("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
@@ -838,30 +910,27 @@ func computeMaxEncodedPayload(limit int) int {
 	if int(queryLimit) != limit {
 		queryLimit = 0xffff
 	}
-	// Minimal upstream option so responseFor returns a valid response.
-	minUpstreamOpt := dns.BuildEDNSOptions([]dns.EDNSOption{{Code: upstreamEDNSOptionCode, Data: make([]byte, 8)}})
 	query := &dns.Message{
 		Question: []dns.Question{
 			{Name: maxLengthName, Type: dns.RRTypeTXT, Class: dns.RRTypeTXT},
 		},
 		Additional: []dns.RR{
-			{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: queryLimit, TTL: 0, Data: minUpstreamOpt},
+			{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: queryLimit, TTL: 0, Data: []byte{}},
 		},
 	}
 	resp, _ := responseFor(query, dns.Name([][]byte{}))
-	resp.Answer = nil
+	if resp == nil {
+		return 0
+	}
+	resp.Answer = []dns.RR{
+		{Name: query.Question[0].Name, Type: dns.RRTypeTXT, Class: query.Question[0].Class, TTL: responseTTL, Data: nil},
+	}
 
 	low := 0
 	high := 32768
 	for low+1 < high {
 		mid := (low + high) / 2
-		optData := dns.BuildEDNSOptions([]dns.EDNSOption{{Code: downstreamEDNSOptionCode, Data: make([]byte, mid)}})
-		for i := range resp.Additional {
-			if resp.Additional[i].Type == dns.RRTypeOPT {
-				resp.Additional[i].Data = optData
-				break
-			}
-		}
+		resp.Answer[0].Data = dns.EncodeRDataTXT(make([]byte, mid))
 		buf, err := resp.WireFormat()
 		if err != nil {
 			panic(err)
@@ -913,7 +982,7 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 		}
 	}()
 
-	ch := make(chan *record, 512) // was 100; larger buffer to absorb bursts during sendLoop's 1s wait
+	ch := make(chan *record, 8192) // large buffer for concurrent connections; sendLoop drains quickly when channel has pending
 	defer close(ch)
 
 	// Create a fallback manager if an address is specified.
