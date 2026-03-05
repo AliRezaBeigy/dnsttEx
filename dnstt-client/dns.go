@@ -31,7 +31,7 @@ const (
 	// initPollDelay whenever an a send occurs that is not the result of the
 	// poll timer expiring.
 	initPollDelay       = 500 * time.Millisecond
-	maxPollDelay        = 10 * time.Second
+	maxPollDelay        = 2 * time.Second // was 10s; cap at 2s to limit stall on unstable DNS
 	pollDelayMultiplier = 2.0
 
 	// A limit on the number of empty poll requests we may send in a burst

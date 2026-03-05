@@ -167,20 +167,12 @@ func (sm *sessionManager) closeSessionLocked() {
 	sm.conv = 0
 }
 
-// createSession creates a new KCP connection, Noise channel, and smux session.
-// Caller must NOT hold sm.mu lock.
-func (sm *sessionManager) createSession() error {
-	sm.mu.Lock()
-	// Close existing session if any
-	sm.closeSessionLocked()
-
-	// Open a KCP conn on the PacketConn.
-	// We do this outside the lock to avoid holding it during I/O operations.
-	sm.mu.Unlock()
-
+// createSessionUnlocked creates a new KCP connection, Noise channel, and smux
+// session. It does not touch sm.mu and must be called without holding it.
+func (sm *sessionManager) createSessionUnlocked() (*kcp.UDPSession, io.ReadWriteCloser, *smux.Session, uint32, error) {
 	conn, err := kcp.NewConn2(sm.remoteAddr, nil, 0, 0, sm.pconn)
 	if err != nil {
-		return fmt.Errorf("opening KCP conn: %v", err)
+		return nil, nil, nil, 0, fmt.Errorf("opening KCP conn: %v", err)
 	}
 	conv := conn.GetConv()
 	log.Printf("begin session %08x", conv)
@@ -188,14 +180,15 @@ func (sm *sessionManager) createSession() error {
 	// Permit coalescing the payloads of consecutive sends.
 	conn.SetStreamMode(true)
 	// Disable the dynamic congestion window (limit only by the maximum of
-	// local and remote static windows).
+	// local and remote static windows). Use nodelay=1 and resend=2 for
+	// fast retransmit on the high-latency, potentially lossy DNS transport.
 	conn.SetNoDelay(
-		0, // default nodelay
-		0, // default interval
-		0, // default resend
-		1, // nc=1 => congestion window off
+		1,  // nodelay=1: flush immediately, no Nagle-like coalescing delay
+		20, // interval=20ms: KCP update tick (0 causes edge-case behavior in kcp-go)
+		2,  // resend=2: fast retransmit after 2 ACK gaps (0 = disabled)
+		1,  // nc=1: congestion window off
 	)
-	conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
+	conn.SetWindowSize(512, 512) // was QueueSize/2=64; larger window for high-latency DNS
 	if rc := conn.SetMtu(sm.mtu); !rc {
 		conn.Close()
 		panic(rc)
@@ -205,29 +198,55 @@ func (sm *sessionManager) createSession() error {
 	rw, err := noise.NewClient(conn, sm.pubkey)
 	if err != nil {
 		conn.Close()
-		return err
+		return nil, nil, nil, 0, err
 	}
 
 	// Start a smux session on the Noise channel.
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.Version = 2
-	smuxConfig.KeepAliveTimeout = idleTimeout
-	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024 // default is 65536
+	smuxConfig.KeepAliveInterval = 15 * time.Second // send PING every 15s
+	smuxConfig.KeepAliveTimeout = 30 * time.Second  // declare dead after 30s (was 2 min)
+	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024    // default is 65536
 	sess, err := smux.Client(rw, smuxConfig)
 	if err != nil {
 		rw.Close()
 		conn.Close()
-		return fmt.Errorf("opening smux session: %v", err)
+		return nil, nil, nil, 0, fmt.Errorf("opening smux session: %v", err)
 	}
 
-	// Lock again to update the session
+	return conn, rw, sess, conv, nil
+}
+
+// createSession closes any existing session and establishes a new one.
+// Caller must NOT hold sm.mu.
+func (sm *sessionManager) createSession() error {
+	// Phase 1: close the old session under the write lock.
 	sm.mu.Lock()
+	sm.closeSessionLocked()
+	sm.mu.Unlock()
+
+	// Phase 2: create new resources without holding any lock.
+	// Multiple concurrent callers are benign: only one will win phase 3.
+	conn, rw, sess, conv, err := sm.createSessionUnlocked()
+	if err != nil {
+		return err
+	}
+
+	// Phase 3: store under the write lock. If another goroutine already
+	// created a session, discard ours and keep theirs.
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if sm.sess != nil {
+		sess.Close()
+		rw.Close()
+		conn.Close()
+		log.Printf("discarding duplicate session %08x (already have %08x)", conv, sm.conv)
+		return nil
+	}
 	sm.conn = conn
 	sm.rw = rw
 	sm.sess = sess
 	sm.conv = conv
-	sm.mu.Unlock()
-
 	return nil
 }
 
@@ -239,50 +258,38 @@ func (sm *sessionManager) closeSession() {
 }
 
 // getSession returns the current session, creating one if needed.
+// Must not hold sm.mu when calling this function.
 func (sm *sessionManager) getSession() (*smux.Session, uint32, error) {
+	// Fast path: session already exists.
 	sm.mu.RLock()
-	sess := sm.sess
-	conv := sm.conv
+	sess, conv := sm.sess, sm.conv
 	sm.mu.RUnlock()
-
 	if sess != nil {
 		return sess, conv, nil
 	}
 
-	// Need to create a new session. Upgrade to write lock.
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
-	// Double-check after acquiring write lock
-	if sm.sess != nil {
-		return sm.sess, sm.conv, nil
-	}
-
-	// Create new session
-	err := sm.createSession()
-	if err != nil {
+	// Slow path: createSession manages its own locking; must not hold sm.mu.
+	if err := sm.createSession(); err != nil {
 		return nil, 0, err
 	}
-
-	return sm.sess, sm.conv, nil
+	sm.mu.RLock()
+	sess, conv = sm.sess, sm.conv
+	sm.mu.RUnlock()
+	return sess, conv, nil
 }
 
-// openStream opens a new stream, recreating the session if necessary.
+// openStream opens a new stream, recreating the session if it appears closed.
 func (sm *sessionManager) openStream() (*smux.Stream, uint32, error) {
-	// Try to get existing session
 	sess, conv, err := sm.getSession()
 	if err != nil {
 		return nil, 0, err
 	}
 
-	// Try to open a stream
 	stream, err := sess.OpenStream()
 	if err == nil {
 		return stream, conv, nil
 	}
 
-	// If opening stream failed, the session might be closed.
-	// Check if it's a closed pipe error or similar.
 	errStr := err.Error()
 	isClosedError := errors.Is(err, io.ErrClosedPipe) ||
 		strings.Contains(errStr, "closed pipe") ||
@@ -290,44 +297,29 @@ func (sm *sessionManager) openStream() (*smux.Stream, uint32, error) {
 		strings.Contains(errStr, "use of closed network connection") ||
 		err == io.EOF
 
-	if isClosedError {
-		log.Printf("session %08x appears closed, recreating: %v", conv, err)
-
-		// Use write lock to serialize session recreation attempts
-		sm.mu.Lock()
-		// Double-check: another goroutine might have already recreated the session
-		if sm.sess != nil && sm.sess != sess {
-			// Session was recreated by another goroutine
-			sess = sm.sess
-			conv = sm.conv
-			sm.mu.Unlock()
-		} else {
-			// We need to recreate
-			sm.closeSessionLocked()
-			sm.mu.Unlock()
-
-			// Create a new session (this acquires its own lock)
-			err = sm.createSession()
-			if err != nil {
-				return nil, 0, fmt.Errorf("recreating session: %v", err)
-			}
-
-			// Get the new session
-			sm.mu.RLock()
-			sess = sm.sess
-			conv = sm.conv
-			sm.mu.RUnlock()
-		}
-
-		// Try again with the (possibly new) session
-		stream, err = sess.OpenStream()
-		if err != nil {
-			return nil, 0, fmt.Errorf("session %08x opening stream after recreate: %v", conv, err)
-		}
-		return stream, conv, nil
+	if !isClosedError {
+		return nil, 0, fmt.Errorf("session %08x opening stream: %v", conv, err)
 	}
 
-	return nil, 0, fmt.Errorf("session %08x opening stream: %v", conv, err)
+	log.Printf("session %08x closed, recreating: %v", conv, err)
+	// Clear the dead session only if it hasn't already been replaced by
+	// another goroutine.
+	sm.mu.Lock()
+	if sm.sess == sess {
+		sm.closeSessionLocked()
+	}
+	sm.mu.Unlock()
+
+	// Delegate to getSession which will call createSession if needed.
+	sess, conv, err = sm.getSession()
+	if err != nil {
+		return nil, 0, fmt.Errorf("recreating session: %v", err)
+	}
+	stream, err = sess.OpenStream()
+	if err != nil {
+		return nil, 0, fmt.Errorf("session %08x opening stream after recreate: %v", conv, err)
+	}
+	return stream, conv, nil
 }
 
 func handle(local *net.TCPConn, sm *sessionManager) error {

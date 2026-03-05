@@ -259,8 +259,9 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string) error 
 	// Put an smux session on top of the encrypted Noise channel.
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.Version = 2
-	smuxConfig.KeepAliveTimeout = idleTimeout
-	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024 // default is 65536
+	smuxConfig.KeepAliveInterval = 15 * time.Second // send PING every 15s
+	smuxConfig.KeepAliveTimeout = 30 * time.Second  // declare dead after 30s (was idleTimeout=2min)
+	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024    // default is 65536
 	sess, err := smux.Server(rw, smuxConfig)
 	if err != nil {
 		return err
@@ -304,14 +305,16 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string) 
 		// Permit coalescing the payloads of consecutive sends.
 		conn.SetStreamMode(true)
 		// Disable the dynamic congestion window (limit only by the
-		// maximum of local and remote static windows).
+		// maximum of local and remote static windows). Use nodelay=1
+		// and resend=2 for fast retransmit on the high-latency,
+		// potentially lossy DNS transport.
 		conn.SetNoDelay(
-			0, // default nodelay
-			0, // default interval
-			0, // default resend
-			1, // nc=1 => congestion window off
+			1,  // nodelay=1: flush immediately, no Nagle-like coalescing delay
+			20, // interval=20ms: KCP update tick (0 causes edge-case behavior in kcp-go)
+			2,  // resend=2: fast retransmit after 2 ACK gaps (0 = disabled)
+			1,  // nc=1: congestion window off
 		)
-		conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
+		conn.SetWindowSize(512, 512) // was QueueSize/2=64; larger window for high-latency DNS
 		if rc := conn.SetMtu(mtu); !rc {
 			panic(rc)
 		}
@@ -580,7 +583,7 @@ func (m *FallbackManager) HandlePacket(packet []byte, clientAddr net.Addr) {
 		// Session doesn't exist, create a new one.
 		newConn, err := net.ListenPacket("udp", ":0")
 		if err != nil {
-			log.Printf("failed to create fallback socket for %s: %v", clientKey, err)
+			log.Printf("failed to create fallback socket for %v: %v", clientKey, err)
 			return
 		}
 		proxyConn = newConn // Use the new connection
@@ -601,7 +604,7 @@ func (m *FallbackManager) HandlePacket(packet []byte, clientAddr net.Addr) {
 	// Forward the client's packet to the fallback address.
 	_, err := proxyConn.WriteTo(packet, m.fallbackAddr)
 	if err != nil {
-		log.Printf("fallback write to %s for client %s failed: %v", m.fallbackAddr, clientKey, err)
+		log.Printf("fallback write to %s for client %v failed: %v", m.fallbackAddr, clientKey, err)
 	}
 }
 
@@ -692,6 +695,9 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			select {
 			case ch <- &record{resp, addr, clientID}:
 			default:
+				// sendLoop is busy; drop this response opportunity.
+				// The client will retry after its poll timer fires.
+				log.Printf("sendLoop channel full, dropping response for %s", clientID)
 			}
 		}
 	}
@@ -952,7 +958,7 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 		}
 	}()
 
-	ch := make(chan *record, 100)
+	ch := make(chan *record, 512) // was 100; larger buffer to absorb bursts during sendLoop's 1s wait
 	defer close(ch)
 
 	// Create a fallback manager if an address is specified.

@@ -377,3 +377,23 @@ response. For the server, there may be more space available in some
 responses and less in others (depending on the size of the corresponding
 query); the logged value is the minimum that is guaranteed to be
 supported in any response.
+
+
+## Test results
+
+*Last updated by `scripts/run-tests.ps1`. Run without `-Short` to refresh metrics.*
+
+<!-- test-results-start -->
+**Last run:** 2026-03-05 18:45 · 38 passed, 0 failed, 0 skipped · 69.3s
+
+- **Throughput** (multiple streams at once): 3.9 MB/s over 10 connections (160 KB in 41 ms)
+
+- **Latency** (round-trip time): median 0 ms, 95th %ile 2 ms, 99th %ile 5 ms (n=100)
+
+- **Wire overhead** (DNS encoding): 3.3× — 128 KB payload becomes 424 KB on the wire
+
+- **Reconnect** (after server restart): 59.4 s
+
+<!-- test-results-end -->
+
+

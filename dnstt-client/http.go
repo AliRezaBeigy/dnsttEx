@@ -63,7 +63,7 @@ func NewHTTPPacketConn(rt http.RoundTripper, urlString string, numSenders int) (
 	c := &HTTPPacketConn{
 		client: &http.Client{
 			Transport: rt,
-			Timeout:   1 * time.Minute,
+			Timeout:   10 * time.Second, // was 1min; fail fast on hung resolvers (server responds in <1s normally)
 		},
 		urlString:       urlString,
 		QueuePacketConn: turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, 0),

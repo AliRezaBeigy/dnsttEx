@@ -5,3 +5,6 @@ dnstt-server/dnstt-server
 /dnstt-server_*
 /bin/
 /build/
+
+integration/*.json
+*.exe
