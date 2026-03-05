@@ -4,7 +4,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/base32"
 	"net"
 	"testing"
 	"time"
@@ -12,6 +11,27 @@ import (
 	"dnsttEx/dns"
 	"dnsttEx/turbotunnel"
 )
+
+// base36Encode encodes src into Base36 (0-9a-v, 5 bits/symbol) for name-based tests.
+func base36EncodeTest(src []byte) []byte {
+	const alphabet = "0123456789abcdefghijklmnopqrstuv"
+	n := (len(src)*8 + 4) / 5
+	dst := make([]byte, n)
+	for i, bitOffset := 0, 0; i < n; i++ {
+		byteIdx := bitOffset / 8
+		bits := bitOffset % 8
+		var v byte
+		if byteIdx < len(src) {
+			v = src[byteIdx] << bits
+			if byteIdx+1 < len(src) {
+				v |= src[byteIdx+1] >> (8 - bits)
+			}
+		}
+		dst[i] = alphabet[v>>3]
+		bitOffset += 5
+	}
+	return dst
+}
 
 // buildTunnelQuery builds a valid DNS TXT query with payload in EDNS option 0xFF00.
 // Question name is minimal ("t" + domain). OPT advertises 4096-byte payload.
@@ -189,14 +209,11 @@ func TestResponseFor(t *testing.T) {
 		}
 	})
 
-	t.Run("name-based query (Base32 in name, no OPT payload) returns NoError and payload", func(t *testing.T) {
-		// Simulates public resolvers: payload only in question name. Uppercase Base32; server normalizes for case randomization.
+	t.Run("name-based query (Base36 in name, no OPT payload) returns NoError and payload", func(t *testing.T) {
+		// Simulates public resolvers: payload only in question name. Base36 (0-9a-v); server decodes case-insensitively.
 		clientID := turbotunnel.NewClientID()
 		rawPayload := append(clientID[:], 0xe0) // 8 + 1 byte
-		b32 := base32.StdEncoding.WithPadding(base32.NoPadding)
-		enc := make([]byte, b32.EncodedLen(len(rawPayload)))
-		b32.Encode(enc, rawPayload)
-		enc = bytes.ToUpper(enc)
+		enc := base36EncodeTest(rawPayload)
 		var labels [][]byte
 		for len(enc) > 0 {
 			n := 63
@@ -234,12 +251,10 @@ func TestResponseFor(t *testing.T) {
 	})
 
 	t.Run("name-based with lowercase subdomain (QNAME case randomization) still decodes", func(t *testing.T) {
-		// Resolvers may lowercase or randomize case; server normalizes to uppercase before Base32 decode.
+		// Resolvers may lowercase or randomize case; server decodes Base36 case-insensitively.
 		clientID := turbotunnel.NewClientID()
 		rawPayload := append(clientID[:], 0xe0)
-		b32 := base32.StdEncoding.WithPadding(base32.NoPadding)
-		enc := make([]byte, b32.EncodedLen(len(rawPayload)))
-		b32.Encode(enc, rawPayload)
+		enc := base36EncodeTest(rawPayload)
 		enc = bytes.ToLower(enc) // simulate resolver sending lowercase
 		var labels [][]byte
 		for len(enc) > 0 {
@@ -314,7 +329,7 @@ func TestRecvLoopInjectsPackets(t *testing.T) {
 	}()
 
 	// Build a query that carries a real KCP-style packet.
-	// Packet format inside the name (after base32+domain):
+	// Packet format inside the name (after base36+domain):
 	//   [clientID:8][padding header 0xe3][3 random pad bytes][packet len 0x04][4 data bytes]
 	clientID := turbotunnel.NewClientID()
 	dataPacket := []byte{0xde, 0xad, 0xbe, 0xef}

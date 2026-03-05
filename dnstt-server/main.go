@@ -50,7 +50,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/base32"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -119,7 +118,44 @@ var (
 	maxUDPPayload = 1280 - 40 - 8
 )
 
-var base32Encoding = base32.StdEncoding.WithPadding(base32.NoPadding)
+// Base36 (0-9a-v, 5 bits/symbol); decode is case-insensitive for QNAME randomization.
+const base36Alphabet = "0123456789abcdefghijklmnopqrstuv"
+
+func base36DecodedLen(n int) int { return n * 5 / 8 }
+
+func base36Decode(dst, src []byte) error {
+	bits := 0
+	acc := uint(0)
+	out := 0
+	for _, c := range src {
+		var v byte
+		switch {
+		case c >= '0' && c <= '9':
+			v = c - '0'
+		case c >= 'a' && c <= 'z':
+			v = c - 'a' + 10
+		case c >= 'A' && c <= 'Z':
+			v = c - 'A' + 10
+		default:
+			return errBase36Decode
+		}
+		if v >= 32 {
+			return errBase36Decode
+		}
+		acc = acc<<5 | uint(v)
+		bits += 5
+		if bits >= 8 {
+			bits -= 8
+			if out < len(dst) {
+				dst[out] = byte(acc >> bits)
+			}
+			out++
+		}
+	}
+	return nil
+}
+
+var errBase36Decode = errors.New("invalid base36")
 
 // generateKeypair generates a private key and the corresponding public key. If
 // privkeyFilename and pubkeyFilename are respectively empty, it prints the
@@ -488,15 +524,14 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 		break
 	}
 	if len(payload) < 8 {
-		// Fallback: payload in question name (Base32). Normalize to uppercase so QNAME case randomization (e.g. 8.8.8.8) doesn't break decode.
-		encoded := bytes.ToUpper(bytes.Join(prefix, nil))
-		decoded := make([]byte, base32Encoding.DecodedLen(len(encoded)))
-		n, err := base32Encoding.Decode(decoded, encoded)
-		if err != nil {
+		// Fallback: payload in question name (Base36). Decode is case-insensitive for QNAME randomization (e.g. 8.8.8.8).
+		encoded := bytes.Join(prefix, nil)
+		decoded := make([]byte, base36DecodedLen(len(encoded)))
+		if err := base36Decode(decoded, encoded); err != nil {
 			resp.Flags |= dns.RcodeNameError
 			return resp, nil
 		}
-		payload = decoded[:n]
+		payload = decoded
 	}
 	if len(payload) < 8 {
 		resp.Flags |= dns.RcodeNameError

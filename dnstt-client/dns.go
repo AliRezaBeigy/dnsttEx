@@ -3,9 +3,9 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
-	"encoding/base32"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -41,11 +41,66 @@ const (
 	rateLimitBackoffMultiplier = 2.0
 )
 
-// Base32 (uppercase, no padding): case-insensitive decode on server handles QNAME case randomization.
-var base32Encoding = base32.StdEncoding.WithPadding(base32.NoPadding)
+// Base36 uses 0-9a-v (32 of 36 symbols); 5 bits/symbol so expansion = 8/5, same as Base32.
+// Server decodes case-insensitively for QNAME randomization. Alphabet is DNS-safe.
+const base36Alphabet = "0123456789abcdefghijklmnopqrstuv"
 
-// DNSPacketConn sends and receives tunnel payload over DNS. Upstream is Base32 in the
-// question name (uppercase); server decodes case-insensitively for QNAME randomization.
+func base36EncodedLen(n int) int { return (n*8 + 4) / 5 }
+
+func base36Encode(dst, src []byte) {
+	for i, bitOffset := 0, 0; i < len(dst); i++ {
+		byteIdx := bitOffset / 8
+		bits := bitOffset % 8
+		var v byte
+		if byteIdx < len(src) {
+			v = src[byteIdx] << bits
+			if byteIdx+1 < len(src) {
+				v |= src[byteIdx+1] >> (8 - bits)
+			}
+		}
+		dst[i] = base36Alphabet[v>>3]
+		bitOffset += 5
+	}
+}
+
+var errBase36Decode = errors.New("invalid base36")
+
+func base36Decode(dst, src []byte) error {
+	bits := 0
+	acc := uint(0)
+	out := 0
+	for _, c := range src {
+		var v byte
+		switch {
+		case c >= '0' && c <= '9':
+			v = c - '0'
+		case c >= 'a' && c <= 'z':
+			v = c - 'a' + 10
+		case c >= 'A' && c <= 'Z':
+			v = c - 'A' + 10
+		default:
+			return errBase36Decode
+		}
+		if v >= 32 {
+			return errBase36Decode
+		}
+		acc = acc<<5 | uint(v)
+		bits += 5
+		if bits >= 8 {
+			bits -= 8
+			if out < len(dst) {
+				dst[out] = byte(acc >> bits)
+			}
+			out++
+		}
+	}
+	return nil
+}
+
+func base36DecodedLen(n int) int { return n * 5 / 8 }
+
+// DNSPacketConn sends and receives tunnel payload over DNS. Upstream is Base36 in the
+// question name (0-9a-v); server decodes case-insensitively for QNAME randomization.
 // No EDNS for payload. Downstream from TXT Answer first, then EDNS 0xFF01 if present.
 //
 // We don't have a need to match up a query and a response by ID. Queries and
@@ -237,7 +292,7 @@ func nameCapacity(domain dns.Name) int {
 		capacity -= len(label) + 1
 	}
 	capacity = capacity * maxLabelLen / (maxLabelLen + 1) // each label: 1 byte length + maxLabelLen
-	capacity = capacity * 5 / 8                           // Base32 expansion
+	capacity = capacity * 5 / 8                           // Base36 expansion (5 bits/symbol, same as Base32)
 	return capacity
 }
 
@@ -274,7 +329,7 @@ func (c *DNSPacketConn) buildUpstreamPayload(packets [][]byte) []byte {
 	return buf.Bytes()
 }
 
-// send encodes payload in the question name (Base32, uppercase) for public resolvers; no EDNS.
+// send encodes payload in the question name (Base36, 0-9a-v) for public resolvers; no EDNS.
 func (c *DNSPacketConn) send(transport net.PacketConn, packets [][]byte, addr net.Addr) error {
 	capacity := nameCapacity(c.domain)
 	decoded := c.buildUpstreamPayload(packets)
@@ -288,9 +343,9 @@ func (c *DNSPacketConn) send(transport net.PacketConn, packets [][]byte, addr ne
 		c.QueuePacketConn.Stash(packets[0], addr)
 		decoded = c.buildUpstreamPayload(nil)
 	}
-	encoded := make([]byte, base32Encoding.EncodedLen(len(decoded)))
-	base32Encoding.Encode(encoded, decoded)
-	encoded = bytes.ToUpper(encoded) // uppercase so server can normalize for case randomization
+	encoded := make([]byte, base36EncodedLen(len(decoded)))
+	base36Encode(encoded, decoded)
+	// Server decodes case-insensitively for QNAME randomization
 	labels := chunks(encoded, maxLabelLen)
 	labels = append(labels, c.domain...)
 	name, err := dns.NewName(labels)

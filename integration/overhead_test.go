@@ -10,7 +10,7 @@ import (
 )
 
 // TestOverhead measures the ratio of DNS wire bytes to application payload bytes.
-// Name-based uses Base32 (8/5 expansion), case-insensitive decode for QNAME randomization; overhead ~3×.
+// Name-based uses Base36 (0-9a-v, 8/5 expansion), case-insensitive decode for QNAME randomization; overhead ~3×.
 //
 // Wire bytes are counted by countingUDPRelay, which sits transparently between
 // the dnstt-client and dnstt-server subprocesses.
