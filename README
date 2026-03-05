@@ -32,6 +32,15 @@ tunnel terminate at the proxy.
 ```
 
 
+## Easy install (tunnel server)
+
+On a Linux server (Fedora, Rocky, CentOS, Debian, Ubuntu), you can install and configure the dnsttEx tunnel server with one command:
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/AliRezaBeigy/dnsttEx/main/scripts/dnsttEx-deploy.sh)
+```
+
+
 ## DNS zone setup
 
 Because the server side of the tunnel acts like an authoritative name
