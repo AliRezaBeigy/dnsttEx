@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"www.bamsoftware.com/git/dnstt.git/dns"
-	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
+	"dnsttEx/dns"
+	"dnsttEx/turbotunnel"
 )
 
 // buildTunnelQuery builds a valid DNS TXT query with payload in EDNS option 0xFF00.

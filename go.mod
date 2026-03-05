@@ -1,4 +1,4 @@
-module www.bamsoftware.com/git/dnstt.git
+module dnsttEx
 
 go 1.24
 

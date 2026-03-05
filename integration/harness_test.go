@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"www.bamsoftware.com/git/dnstt.git/noise"
+	"dnsttEx/noise"
 )
 
 var (

@@ -9,8 +9,8 @@ import (
 	"net"
 	"time"
 
-	"www.bamsoftware.com/git/dnstt.git/dns"
-	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
+	"dnsttEx/dns"
+	"dnsttEx/turbotunnel"
 )
 
 	// EDNS option codes for tunnel payload (RFC 6891 private use).

@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"www.bamsoftware.com/git/dnstt.git/dns"
-	"www.bamsoftware.com/git/dnstt.git/noise"
-	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
+	"dnsttEx/dns"
+	"dnsttEx/noise"
+	"dnsttEx/turbotunnel"
 )
 
 // TestSessionManagerNoDeadlock verifies that concurrent calls to createSession

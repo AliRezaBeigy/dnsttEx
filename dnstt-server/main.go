@@ -65,9 +65,9 @@ import (
 	"github.com/jellydator/ttlcache/v3"
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
-	"www.bamsoftware.com/git/dnstt.git/dns"
-	"www.bamsoftware.com/git/dnstt.git/noise"
-	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
+	"dnsttEx/dns"
+	"dnsttEx/noise"
+	"dnsttEx/turbotunnel"
 )
 
 const (
