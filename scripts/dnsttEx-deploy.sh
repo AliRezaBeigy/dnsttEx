@@ -95,9 +95,10 @@ show_menu() {
     echo "3) Check service status"
     echo "4) View service logs"
     echo "5) Show configuration info"
+    echo "6) Uninstall dnsttEx server"
     echo "0) Exit"
     echo ""
-    print_question "Please select an option (0-5): "
+    print_question "Please select an option (0-6): "
 }
 
 handle_menu() {
@@ -121,8 +122,9 @@ handle_menu() {
                 journalctl -u "$SERVICE_NAME" -f
                 ;;
             5) show_configuration_info ;;
+            6) uninstall_server ;;
             0) print_status "Goodbye!"; exit 0 ;;
-            *) print_error "Invalid choice. Please enter 0-5." ;;
+            *) print_error "Invalid choice. Please enter 0-6." ;;
         esac
         if [[ "$choice" != "4" ]]; then
             echo ""
@@ -218,6 +220,90 @@ show_configuration_info() {
         echo -e "  ${YELLOW}systemctl status danted${NC}  ${YELLOW}journalctl -u danted -f${NC}"
     fi
     echo ""
+}
+
+remove_iptables_rules() {
+    local iface
+    iface=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -1)
+    iface="${iface:-eth0}"
+    print_status "Removing iptables rules..."
+    while iptables -C INPUT -p udp --dport "$DNSTT_PORT" -j ACCEPT 2>/dev/null; do
+        iptables -D INPUT -p udp --dport "$DNSTT_PORT" -j ACCEPT
+    done
+    while iptables -t nat -C PREROUTING -i "$iface" -p udp --dport 53 -j REDIRECT --to-ports "$DNSTT_PORT" 2>/dev/null; do
+        iptables -t nat -D PREROUTING -i "$iface" -p udp --dport 53 -j REDIRECT --to-ports "$DNSTT_PORT"
+    done
+    if command -v ip6tables &>/dev/null && [[ -f /proc/net/if_inet6 ]]; then
+        while ip6tables -C INPUT -p udp --dport "$DNSTT_PORT" -j ACCEPT 2>/dev/null; do
+            ip6tables -D INPUT -p udp --dport "$DNSTT_PORT" -j ACCEPT
+        done
+        while ip6tables -t nat -C PREROUTING -i "$iface" -p udp --dport 53 -j REDIRECT --to-ports "$DNSTT_PORT" 2>/dev/null; do
+            ip6tables -t nat -D PREROUTING -i "$iface" -p udp --dport 53 -j REDIRECT --to-ports "$DNSTT_PORT"
+        done
+    fi
+    save_iptables_rules
+}
+
+remove_firewall_rules() {
+    if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
+        print_status "Removing firewalld rules..."
+        firewall-cmd --permanent --remove-port="${DNSTT_PORT}/udp" 2>/dev/null
+        firewall-cmd --permanent --remove-port=53/udp 2>/dev/null
+        firewall-cmd --reload 2>/dev/null
+    fi
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        print_status "Removing ufw rules..."
+        ufw delete allow "${DNSTT_PORT}/udp" 2>/dev/null
+        ufw delete allow 53/udp 2>/dev/null
+    fi
+}
+
+uninstall_server() {
+    print_warning "This will stop the dnsttEx server and remove binaries, config, and the system user."
+    print_question "Continue? [y/N]: "
+    read -r confirm
+    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && print_status "Uninstall cancelled." && return 0
+
+    detect_os
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        print_status "Stopping $SERVICE_NAME..."
+        systemctl stop "$SERVICE_NAME"
+    fi
+    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
+        print_status "Disabling $SERVICE_NAME..."
+        systemctl disable "$SERVICE_NAME" 2>/dev/null
+    fi
+    local svc="${SYSTEMD_DIR}/${SERVICE_NAME}.service"
+    if [[ -f "$svc" ]]; then
+        print_status "Removing systemd service..."
+        rm -f "$svc"
+        systemctl daemon-reload
+    fi
+
+    remove_firewall_rules
+    remove_iptables_rules
+
+    if [[ -f "${INSTALL_DIR}/dnsttEx-server" ]]; then
+        print_status "Removing dnsttEx-server binary..."
+        rm -f "${INSTALL_DIR}/dnsttEx-server"
+    fi
+    if [[ -d "$CONFIG_DIR" ]]; then
+        print_status "Removing config directory $CONFIG_DIR..."
+        rm -rf "$CONFIG_DIR"
+    fi
+    if id "$DNSTT_USER" &>/dev/null; then
+        print_status "Removing user $DNSTT_USER..."
+        userdel "$DNSTT_USER" 2>/dev/null || true
+    fi
+
+    print_status "dnsttEx server uninstalled."
+    print_question "Also remove this deploy script from $SCRIPT_INSTALL_PATH? [y/N]: "
+    read -r rm_script
+    if [[ "$rm_script" == "y" || "$rm_script" == "Y" ]]; then
+        rm -f "$SCRIPT_INSTALL_PATH"
+        print_status "Script removed. Goodbye!"
+        exit 0
+    fi
 }
 
 detect_os() {
