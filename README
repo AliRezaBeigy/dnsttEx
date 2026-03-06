@@ -1,7 +1,33 @@
-Userspace DNS tunnel with support for DoH and DoT
-https://www.bamsoftware.com/software/dnstt/
-David Fifield <david@bamsoftware.com>
-Public domain
+# dnsttEx
+
+## Changes in this fork (dnsttEx)
+
+This fork adds the following on top of upstream dnstt (after commit ae95dda):
+
+- **Modified KCP** — In-tree KCP with a 12-byte header and tuning (queue sizes, keepalive, backoff).
+- **DNS encoding** — Name-based encoding with more room in the 253-octet name; Base36 and compacter framing.
+- **Reliability** — Deadlock fix, smux keepalive and Poller backoff fixes, automatic session reconnection (upstream).
+
+See [CHANGELOG.md](CHANGELOG.md) for version history and details.
+
+
+## Test results
+
+*Last updated by `scripts/run-tests.ps1`. Run without `-Short` to refresh metrics.*
+
+<!-- test-results-start -->
+**Last run:** 2026-03-06 04:34 · 42 passed, 0 failed, 0 skipped · 74.8s
+
+- **Throughput** (multiple streams at once): 7.1 MB/s over 10 connections (160 KB in 22 ms)
+
+- **Latency** (round-trip time): median 50 ms, 95th %ile 51 ms, 99th %ile 52 ms (n=100)
+
+- **Wire overhead** (DNS encoding): 3.0× — 128 KB payload becomes 378 KB on the wire
+
+- **Reconnect** (after server restart): 59.5 s
+
+<!-- test-results-end -->
+---
 
 dnstt is a DNS tunnel with these features:
  * Works over DNS over HTTPS (DoH) and DNS over TLS (DoT) as well as
@@ -386,21 +412,3 @@ response. For the server, there may be more space available in some
 responses and less in others (depending on the size of the corresponding
 query); the logged value is the minimum that is guaranteed to be
 supported in any response.
-
-
-## Test results
-
-*Last updated by `scripts/run-tests.ps1`. Run without `-Short` to refresh metrics.*
-
-<!-- test-results-start -->
-**Last run:** 2026-03-06 04:34 · 42 passed, 0 failed, 0 skipped · 74.8s
-
-- **Throughput** (multiple streams at once): 7.1 MB/s over 10 connections (160 KB in 22 ms)
-
-- **Latency** (round-trip time): median 50 ms, 95th %ile 51 ms, 99th %ile 52 ms (n=100)
-
-- **Wire overhead** (DNS encoding): 3.0× — 128 KB payload becomes 378 KB on the wire
-
-- **Reconnect** (after server restart): 59.5 s
-
-<!-- test-results-end -->
