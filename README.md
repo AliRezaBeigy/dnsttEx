@@ -11,6 +11,14 @@ This fork adds the following on top of upstream dnstt (after commit ae95dda):
 See [CHANGELOG.md](CHANGELOG.md) for version history and details.
 
 
+## Easy install (tunnel server)
+
+On a Linux server (Fedora, Rocky, CentOS, Debian, Ubuntu), you can install and configure the dnsttEx tunnel server with one command:
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/AliRezaBeigy/dnsttEx/main/scripts/dnsttEx-deploy.sh)
+```
+
 ## Test results
 
 *Last updated by `scripts/run-tests.ps1`. Run without `-Short` to refresh metrics.*
@@ -55,15 +63,6 @@ tunnel terminate at the proxy.
 |local |  |s                                   |remote|
 | app  |  |o                                   | app  |
 '------'  |r                                   '------'
-```
-
-
-## Easy install (tunnel server)
-
-On a Linux server (Fedora, Rocky, CentOS, Debian, Ubuntu), you can install and configure the dnsttEx tunnel server with one command:
-
-```bash
-bash <(curl -Ls https://raw.githubusercontent.com/AliRezaBeigy/dnsttEx/main/scripts/dnsttEx-deploy.sh)
 ```
 
 
