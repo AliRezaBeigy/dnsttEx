@@ -10,14 +10,21 @@ This fork adds the following on top of upstream dnstt (after commit ae95dda):
 
 See [CHANGELOG.md](CHANGELOG.md) for version history and details.
 
-
 ## Easy install (tunnel server)
 
-On a Linux server (Fedora, Rocky, CentOS, Debian, Ubuntu), you can install and configure the dnsttEx tunnel server with one command:
+On a Linux server (Fedora, Rocky, CentOS, Debian, Ubuntu), you can install and configure the dnsttEx tunnel server with
+one command:
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/AliRezaBeigy/dnsttEx/main/scripts/dnsttEx-deploy.sh)
 ```
+
+## Comparison
+
+| Metric | dnstt (tweaked) | dnsttEx (1.0.0) |
+|--------|--------------------|-----------------|
+| **Throughput** (10 streams, 160 KB) | 3.9 MB/s (41 ms) | 7.1 MB/s (22 ms) |
+| **Wire overhead** (128 KB payload) | 3.3× → 424 KB | 3.0× → 378 KB |
 
 ## Test results
 
@@ -38,13 +45,14 @@ bash <(curl -Ls https://raw.githubusercontent.com/AliRezaBeigy/dnsttEx/main/scri
 ---
 
 dnstt is a DNS tunnel with these features:
- * Works over DNS over HTTPS (DoH) and DNS over TLS (DoT) as well as
-   plaintext UDP DNS.
- * Embeds a sequencing and session protocol (KCP/smux), which means that
-   the client does not have to wait for a response before sending more
-   data, and any lost packets are automatically retransmitted.
- * Encrypts the contents of the tunnel and authenticates the server by
-   public key.
+
+* Works over DNS over HTTPS (DoH) and DNS over TLS (DoT) as well as
+  plaintext UDP DNS.
+* Embeds a sequencing and session protocol (KCP/smux), which means that
+  the client does not have to wait for a response before sending more
+  data, and any lost packets are automatically retransmitted.
+* Encrypts the contents of the tunnel and authenticates the server by
+  public key.
 
 dnstt is an application-layer tunnel that runs in userspace. It doesn't
 provide a TUN/TAP interface; it only hooks up a local TCP port with a
@@ -64,7 +72,6 @@ tunnel terminate at the proxy.
 | app  |  |o                                   | app  |
 '------'  |r                                   '------'
 ```
-
 
 ## DNS zone setup
 
@@ -90,10 +97,10 @@ Now, when a recursive DNS resolver receives a query for a name like
 aaaa.t.example.com, it will forward the query to the tunnel server at
 203.0.113.2 or 2001:db8::2.
 
-
 ## Tunnel server setup
 
 Compile the server:
+
 ```
 tunnel-server$ cd dnstt-server
 tunnel-server$ go build
@@ -101,6 +108,7 @@ tunnel-server$ go build
 
 First you need to generate the server keypair that will be used to
 authenticate the server and encrypt the tunnel.
+
 ```
 tunnel-server$ ./dnstt-server -gen-key -privkey-file server.key -pubkey-file server.pub
 privkey written to server.key
@@ -111,6 +119,7 @@ Run the server. You need to provide an address that will listen for UDP
 DNS packets (`:5300`), the private key file (`server.key`), the root of
 the DNS zone (`t.example.com`), and a TCP address to which incoming
 tunnel streams will be forwarded (`127.0.0.1:8000`).
+
 ```
 tunnel-server$ ./dnstt-server -udp :5300 -privkey-file server.key t.example.com 127.0.0.1:8000
 ```
@@ -121,6 +130,7 @@ but that requires the program to run as root. It is better to run the
 program as an ordinary user and have it listen on an unprivileged port
 (`:5300` above), and port-forward port 53 to it. On Linux, use these
 commands to forward external port 53 to localhost port 5300:
+
 ```
 tunnel-server$ sudo iptables -I INPUT -p udp --dport 5300 -j ACCEPT
 tunnel-server$ sudo iptables -t nat -I PREROUTING -i eth0 -p udp --dport 53 -j REDIRECT --to-ports 5300
@@ -131,14 +141,15 @@ tunnel-server$ sudo ip6tables -t nat -I PREROUTING -i eth0 -p udp --dport 53 -j 
 You need to also run something for the tunnel server to connect to. It
 can be a proxy server or anything else. For testing, you can use an
 Ncat listener:
+
 ```
 tunnel-server$ ncat -l -k -v 127.0.0.1 8000
 ```
 
-
 ## Tunnel client setup
 
 Compile the client:
+
 ```
 tunnel-client$ cd dnstt-client
 tunnel-client$ go build
@@ -149,28 +160,33 @@ server.key on the client; leave it on the server.
 
 Choose a public DoH or DoT resolver. There is a list of DoH resolvers
 here:
- * https://github.com/curl/curl/wiki/DNS-over-HTTPS#publicly-available-servers
+
+* https://github.com/curl/curl/wiki/DNS-over-HTTPS#publicly-available-servers
 
 And DoT resolvers here:
- * https://dnsprivacy.org/wiki/display/DP/DNS+Privacy+Public+Resolvers#DNSPrivacyPublicResolvers-DNS-over-TLS%28DoT%29
- * https://dnsencryption.info/imc19-doe.html
+
+* https://dnsprivacy.org/wiki/display/DP/DNS+Privacy+Public+Resolvers#DNSPrivacyPublicResolvers-DNS-over-TLS%28DoT%29
+* https://dnsencryption.info/imc19-doe.html
 
 To run the tunnel client using DoH, you need to provide the URL of the
 DoH resolver (`https://doh.example/dns-query`), the server's public key
 files (`server.pub`), the root of the DNS zone (`t.example.com`), and
 the local TCP port that will receive connections and forward them
 through the tunnel (`127.0.0.1:7000`):
+
 ```
 tunnel-client$ ./dnstt-client -doh https://doh.example/dns-query -pubkey-file server.pub t.example.com 127.0.0.1:7000
 ```
 
 For DoT, it's the same, but use the `-dot` option instead:
+
 ```
 tunnel-client$ ./dnstt-client -dot dot.example:853 -pubkey-file server.pub t.example.com 127.0.0.1:7000
 ```
 
 Once the tunnel client is running, you can connect to the local end of
 the tunnel, type something, and see it appear at the remote end.
+
 ```
 tunnel-client$ ncat -v 127.0.0.1 7000
 ```
@@ -180,14 +196,12 @@ recursive resolver or directly to the tunnel server
 (`-udp tns.example.com`), but it does not provide any covertness for the
 tunnel and should only be used for testing.
 
-
 ## How to make a proxy
 
 dnstt is only a tunnel; it's up to you what you want to connect to it.
 You can make the tunnel work like an ordinary SOCKS or HTTP proxy by
 having the tunnel server forward to a standard proxy server. There are
 many ways to set it up; here are some examples.
-
 
 ### Ncat HTTP proxy
 
@@ -208,7 +222,6 @@ your applications to use 127.0.0.1:7000 as an HTTP proxy.
 tunnel-client$ ./dnstt-client -doh https://doh.example/dns-query -pubkey-file server.pub t.example.com 127.0.0.1:7000
 tunnel-client$ curl --proxy http://127.0.0.1:7000/ https://wtfismyip.com/text
 ```
-
 
 ### SSH SOCKS proxy
 
@@ -257,7 +270,6 @@ tunnel-client$ ssh -N -D 127.0.0.1:7000 -o HostKeyAlias=tunnel-server -p 8000 12
 tunnel-client$ curl --proxy socks5h://127.0.0.1:7000/ https://wtfismyip.com/text
 ```
 
-
 ### Tor bridge
 
 You can run a Tor bridge on the tunnel server and tunnel the connection
@@ -282,7 +294,6 @@ Bridge 127.0.0.1:7000 FINGERPRINT
 
 If you use a system tor, the client SOCKS port will be 127.0.0.1:9050.
 If you use Tor Browser, it will be 127.0.0.1:9150.
-
 
 ## Covertness
 
@@ -323,17 +334,18 @@ distribution. You can control the distribution of fingerprints (or
 select a specific single fingerprint) using the `-utls` option. The
 syntax of the option's argument is a comma-separated list of fingerprint
 names, each optionally preceded by an integer weight and `*`.
+
 ```
 $ ./dnstt-client -utls '3*Firefox,2*Chrome,1*iOS' ...
 $ ./dnstt-client -utls Firefox ...
 $ ./dnstt-client -utls random ...
 ```
+
 Run `./dnstt-client -help` to see the available fingerprint names and
 the default distribution. The `random` fingerprint is a randomized
 fingerprint. The special value `none` disables uTLS and uses the native
 crypto/tls fingerprint, which is less covert but likely to be compatible
 with more servers.
-
 
 ## Encryption and authentication
 
@@ -372,6 +384,7 @@ run `dnstt-server -gen-key` without the `-privkey-file` and
 `-pubkey-file` options, it will display the keys rather than save them
 to files. You can then use the keys with `-privkey` on the server and
 `-pubkey` on the client.
+
 ```
 $ ./dnstt-server -gen-key
 privkey 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
@@ -379,11 +392,11 @@ pubkey  0000111122223333444455556666777788889999aaaabbbbccccddddeeeeffff
 $ ./dnstt-server -udp :5300 -privkey 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef t.example.com 127.0.0.1:8000
 $ ./dnstt-client -dot dot.example:853 -pubkey 0000111122223333444455556666777788889999aaaabbbbccccddddeeeeffff t.example.com 127.0.0.1:7000
 ```
+
 If you run the server without `-privkey-file` or `-privkey`, it will
 generate a temporary keypair and print the public key in the log. But
 the key will be different the next time you restart the server, and you
 will have to reconfigure clients.
-
 
 ## Payload sizes
 
@@ -401,6 +414,7 @@ the `-mtu` option on the server. The default is 1232 bytes; this ought
 to be supported by most resolvers that understand EDNS(0) (RFC 6891).
 For maximum compatibility, set the maximum to 512, but know that doing
 so will reduce downstream bandwidth.
+
 ```
 $ ./dnstt-server -mtu 512 -doh https://doh.example/dns-query -pubkey-file server.pub t.example.com 127.0.0.1:7000
 ```
