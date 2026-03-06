@@ -44,13 +44,13 @@ const (
 	IKCP_MTU_DEF     = 1400
 	IKCP_ACK_FAST    = 3
 	IKCP_INTERVAL    = 100
-	IKCP_OVERHEAD    = 16 // compact: conv(4)+cmd(1)+frg(1)+wnd(2)+ts(2)+sn(2)+una(2)+len(2)
+	IKCP_OVERHEAD    = 12 // minimal: conv(2)+cmd_frg(1)+wnd(1)+ts(2)+sn(2)+una(2)+len(2)
 	IKCP_DEADLINK    = 20
 	IKCP_THRESH_INIT = 2
 	IKCP_THRESH_MIN  = 2
 	IKCP_PROBE_INIT  = 7000   // 7 secs to probe window size
 	IKCP_PROBE_LIMIT = 120000 // up to 120 secs to probe window
-	IKCP_SN_OFFSET   = 10     // offset of sn (2 bytes) in wire header
+	IKCP_SN_OFFSET   = 6      // offset of sn (2 bytes) in wire header
 )
 
 // monotonic reference time point
@@ -137,12 +137,13 @@ type segment struct {
 	data     []byte
 }
 
-// encode a segment into buffer (compact 16-byte header for DNS tunnel)
+// encode a segment into buffer (12-byte header: conv(2), cmd_frg(1), wnd(1), ts/sn/una/len(2 each))
 func (seg *segment) encode(ptr []byte) []byte {
-	ptr = ikcp_encode32u(ptr, seg.conv)
-	ptr = ikcp_encode8u(ptr, seg.cmd)
-	ptr = ikcp_encode8u(ptr, seg.frg)
-	ptr = ikcp_encode16u(ptr, seg.wnd)
+	ptr = ikcp_encode16u(ptr, uint16(seg.conv&0xFFFF))
+	// cmd 81,82,83,84 -> 0,1,2,3 in high 2 bits; frg in low 6 bits (max 63)
+	ptr = ikcp_encode8u(ptr, uint8((seg.cmd-81)<<6)|(seg.frg&0x3F))
+	// wnd is 1 byte on wire; cap at 255 so we never advertise 0 when window is large (e.g. SetWindowSize(512))
+	ptr = ikcp_encode8u(ptr, byte(_imin_(uint32(seg.wnd), 255)))
 	ptr = ikcp_encode16u(ptr, uint16(seg.ts&0xFFFF))
 	ptr = ikcp_encode16u(ptr, uint16(seg.sn&0xFFFF))
 	ptr = ikcp_encode16u(ptr, uint16(seg.una&0xFFFF))
@@ -357,6 +358,10 @@ func (kcp *KCP) Send(buffer []byte) int {
 	if count == 0 {
 		count = 1
 	}
+	// Wire header uses 6 bits for frg (max 63); cap fragment count so frg fits.
+	if count > 64 {
+		return -1
+	}
 
 	for i := 0; i < count; i++ {
 		var size int
@@ -547,22 +552,28 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 
 	for {
 		var ts, sn, length, una, conv uint32
-		var ts16, sn16, una16, len16 uint16
+		var conv16, ts16, sn16, una16, len16 uint16
 		var wnd uint16
+		var wnd8 byte
 		var cmd, frg uint8
+		var cmdFrg byte
 
 		if len(data) < int(IKCP_OVERHEAD) {
 			break
 		}
 
-		data = ikcp_decode32u(data, &conv)
-		if conv != kcp.conv {
+		data = ikcp_decode16u(data, &conv16)
+		conv = uint32(conv16)
+		if conv != (kcp.conv & 0xFFFF) {
 			return -1
 		}
+		conv = kcp.conv
 
-		data = ikcp_decode8u(data, &cmd)
-		data = ikcp_decode8u(data, &frg)
-		data = ikcp_decode16u(data, &wnd)
+		data = ikcp_decode8u(data, &cmdFrg)
+		cmd = (cmdFrg>>6)+81
+		frg = cmdFrg & 0x3F
+		data = ikcp_decode8u(data, &wnd8)
+		wnd = uint16(wnd8)
 		data = ikcp_decode16u(data, &ts16)
 		data = ikcp_decode16u(data, &sn16)
 		data = ikcp_decode16u(data, &una16)

@@ -953,13 +953,13 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 		if fecFlag == typeData || fecFlag == typeParity { // 16bit kcp cmd [81-84] and frg [0-255] will not overlap with FEC type 0x00f1 0x00f2
 			// packet with FEC
 			if fecFlag == typeData && len(data) >= fecHeaderSizePlus2+IKCP_OVERHEAD {
-				conv = binary.LittleEndian.Uint32(data[fecHeaderSizePlus2:])
+				conv = uint32(binary.LittleEndian.Uint16(data[fecHeaderSizePlus2:]))
 				sn = uint32(binary.LittleEndian.Uint16(data[fecHeaderSizePlus2+IKCP_SN_OFFSET:]))
 				convRecovered = true
 			}
 		} else {
-			// packet without FEC (compact 16-byte header: sn is 2 bytes at IKCP_SN_OFFSET)
-			conv = binary.LittleEndian.Uint32(data)
+			// packet without FEC (12-byte header: conv 2 bytes, sn 2 bytes at IKCP_SN_OFFSET)
+			conv = uint32(binary.LittleEndian.Uint16(data))
 			sn = uint32(binary.LittleEndian.Uint16(data[IKCP_SN_OFFSET:]))
 			convRecovered = true
 		}
@@ -1196,8 +1196,9 @@ func DialWithOptions(raddr string, block BlockCrypt, dataShards, parityShards in
 		return nil, errors.WithStack(err)
 	}
 
-	var convid uint32
-	binary.Read(rand.Reader, binary.LittleEndian, &convid)
+	b := make([]byte, 2)
+	io.ReadFull(rand.Reader, b)
+	convid := uint32(binary.LittleEndian.Uint16(b))
 	return newUDPSession(convid, dataShards, parityShards, nil, conn, true, udpaddr, block), nil
 }
 
@@ -1213,8 +1214,9 @@ func NewConn3(convid uint32, raddr net.Addr, block BlockCrypt, dataShards, parit
 
 // NewConn2 establishes a session and talks KCP protocol over a packet connection.
 func NewConn2(raddr net.Addr, block BlockCrypt, dataShards, parityShards int, conn net.PacketConn) (*UDPSession, error) {
-	var convid uint32
-	binary.Read(rand.Reader, binary.LittleEndian, &convid)
+	b := make([]byte, 2)
+	io.ReadFull(rand.Reader, b)
+	convid := uint32(binary.LittleEndian.Uint16(b))
 	return NewConn3(convid, raddr, block, dataShards, parityShards, conn)
 }
 
