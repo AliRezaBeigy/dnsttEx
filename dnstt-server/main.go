@@ -64,7 +64,7 @@ import (
 	"time"
 
 	"github.com/jellydator/ttlcache/v3"
-	"github.com/xtaci/kcp-go/v5"
+	"dnsttEx/internal/kcp"
 	"github.com/xtaci/smux"
 	"dnsttEx/dns"
 	"dnsttEx/noise"

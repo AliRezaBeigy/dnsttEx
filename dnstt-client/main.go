@@ -55,7 +55,7 @@ import (
 	"time"
 
 	utls "github.com/refraction-networking/utls"
-	"github.com/xtaci/kcp-go/v5"
+	"dnsttEx/internal/kcp"
 	"github.com/xtaci/smux"
 	"dnsttEx/dns"
 	"dnsttEx/noise"
