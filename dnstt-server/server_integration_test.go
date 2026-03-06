@@ -74,7 +74,7 @@ func TestResponseFor(t *testing.T) {
 			t.Fatalf("buildTunnelQuery: %v", err)
 		}
 
-		resp, payload := responseFor(query, domain)
+		resp, payload, _ := responseFor(query, domain)
 		if resp == nil {
 			t.Fatal("responseFor returned nil response")
 		}
@@ -99,7 +99,7 @@ func TestResponseFor(t *testing.T) {
 				{Name: domain2, Type: dns.RRTypeTXT, Class: dns.ClassIN},
 			},
 		}
-		resp, _ := responseFor(query, domain)
+		resp, _, _ := responseFor(query, domain)
 		if resp != nil {
 			t.Fatalf("expected nil for a DNS response message, got %+v", resp)
 		}
@@ -117,7 +117,7 @@ func TestResponseFor(t *testing.T) {
 				{Type: dns.RRTypeOPT, Class: 4096, Data: []byte{}},
 			},
 		}
-		resp, _ := responseFor(query, domain)
+		resp, _, _ := responseFor(query, domain)
 		if resp == nil {
 			t.Fatal("expected non-nil response for wrong domain")
 		}
@@ -137,7 +137,7 @@ func TestResponseFor(t *testing.T) {
 				{Type: dns.RRTypeOPT, Class: 4096, Data: []byte{}},
 			},
 		}
-		resp, _ := responseFor(query, domain)
+		resp, _, _ := responseFor(query, domain)
 		if resp == nil {
 			t.Fatal("expected non-nil response for A query")
 		}
@@ -158,7 +158,7 @@ func TestResponseFor(t *testing.T) {
 				{Type: dns.RRTypeOPT, Class: 4096, Data: []byte{}},
 			},
 		}
-		resp, _ := responseFor(query, domain)
+		resp, _, _ := responseFor(query, domain)
 		if resp == nil {
 			t.Fatal("expected non-nil response for duplicate OPT")
 		}
@@ -167,22 +167,27 @@ func TestResponseFor(t *testing.T) {
 		}
 	})
 
-	t.Run("EDNS payload too small returns FORMERR", func(t *testing.T) {
-		// Build a valid name but advertise only 512 bytes (< maxUDPPayload=1232).
+	t.Run("EDNS payload 512 accepted (response capped, no FORMERR)", func(t *testing.T) {
+		// Resolvers that only advertise 512 get accepted; server caps response size per request.
 		clientID := turbotunnel.NewClientID()
 		rawPayload := append(clientID[:], 0xe0)
 		query, err := buildTunnelQuery(rawPayload, domain)
 		if err != nil {
 			t.Fatalf("buildTunnelQuery: %v", err)
 		}
-		// Override the EDNS payload size to something too small.
 		query.Additional[0].Class = 512
-		resp, _ := responseFor(query, domain)
+		resp, payload, maxSize := responseFor(query, domain)
 		if resp == nil {
 			t.Fatal("expected non-nil response")
 		}
-		if resp.Rcode() != dns.RcodeFormatError {
-			t.Errorf("expected FORMERR for small EDNS payload, got %d", resp.Rcode())
+		if resp.Rcode() != dns.RcodeNoError {
+			t.Errorf("expected NoError when EDNS=512 (cap response), got %d", resp.Rcode())
+		}
+		if len(payload) == 0 {
+			t.Fatal("expected payload")
+		}
+		if maxSize != 512 {
+			t.Errorf("maxResponseSize = %d, want 512", maxSize)
 		}
 	})
 
@@ -200,7 +205,7 @@ func TestResponseFor(t *testing.T) {
 				{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: 0, Data: []byte{}},
 			},
 		}
-		resp, _ := responseFor(query, domain)
+		resp, _, _ := responseFor(query, domain)
 		if resp == nil {
 			t.Fatal("expected non-nil response")
 		}
@@ -239,7 +244,7 @@ func TestResponseFor(t *testing.T) {
 				{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: 0, Data: []byte{}},
 			},
 		}
-		resp, payload := responseFor(query, domain)
+		resp, payload, _ := responseFor(query, domain)
 		if resp == nil {
 			t.Fatal("responseFor returned nil response")
 		}
@@ -278,7 +283,7 @@ func TestResponseFor(t *testing.T) {
 				{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: 0, Data: []byte{}},
 			},
 		}
-		resp, payload := responseFor(query, domain)
+		resp, payload, _ := responseFor(query, domain)
 		if resp == nil || resp.Rcode() != dns.RcodeNoError {
 			t.Fatalf("expected NoError when subdomain is lowercase (case randomization), got rcode %d", resp.Rcode())
 		}

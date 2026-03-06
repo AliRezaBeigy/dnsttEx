@@ -411,11 +411,10 @@ func nextPacket(r *bytes.Reader) ([]byte, error) {
 }
 
 // responseFor constructs a response dns.Message that is appropriate for query.
-// Along with the dns.Message, it returns the query's decoded data payload. If
-// the returned dns.Message is nil, it means that there should be no response to
-// this query. If the returned dns.Message has an Rcode() of dns.RcodeNoError,
-// the message is a candidate for for carrying downstream data in a TXT record.
-func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
+// It returns (resp, payload, maxResponseSize). If resp is nil, no response is sent.
+// If resp has RcodeNoError, payload is the decoded tunnel data and maxResponseSize
+// is the maximum UDP response size for this request (min of requester's EDNS size and server -mtu).
+func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte, int) {
 	resp := &dns.Message{
 		ID:       query.ID,
 		Flags:    0x8000, // QR = 1, RCODE = no error
@@ -424,7 +423,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 
 	if query.Flags&0x8000 != 0 {
 		// QR != 0, this is not a query. Don't even send a response.
-		return nil, nil
+		return nil, nil, 0
 	}
 
 	// Check for EDNS(0) support. Include our own OPT RR only if we receive
@@ -445,7 +444,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 			// received, a FORMERR (RCODE=1) MUST be returned."
 			resp.Flags |= dns.RcodeFormatError
 			log.Printf("FORMERR: more than one OPT RR")
-			return resp, nil
+			return resp, nil, maxUDPPayload
 		}
 		resp.Additional = append(resp.Additional, dns.RR{
 			Name:  dns.Name{},
@@ -465,7 +464,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 			resp.Flags |= dns.ExtendedRcodeBadVers & 0xf
 			additional.TTL = (dns.ExtendedRcodeBadVers >> 4) << 24
 			log.Printf("BADVERS: EDNS version %d != 0", version)
-			return resp, nil
+			return resp, nil, maxUDPPayload
 		}
 
 		payloadSize = int(rr.Class)
@@ -475,14 +474,17 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 		// lower than 512 MUST be treated as equal to 512."
 		payloadSize = 512
 	}
-	// We will return RcodeFormatError if payloadSize is too small, but
-	// first, check the name in order to set the AA bit properly.
+	// Cap response size by requester's limit and server -mtu; don't reject 512-only resolvers.
+	effectiveMaxResponse := payloadSize
+	if effectiveMaxResponse > maxUDPPayload {
+		effectiveMaxResponse = maxUDPPayload
+	}
 
 	// There must be exactly one question.
 	if len(query.Question) != 1 {
 		resp.Flags |= dns.RcodeFormatError
 		log.Printf("FORMERR: too few or too many questions (%d)", len(query.Question))
-		return resp, nil
+		return resp, nil, effectiveMaxResponse
 	}
 	question := query.Question[0]
 	// Check the name to see if it ends in our chosen domain, and extract
@@ -494,7 +496,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 		// Not a name we are authoritative for.
 		resp.Flags |= dns.RcodeNameError
 		log.Printf("NXDOMAIN: not authoritative for %s", question.Name)
-		return resp, nil
+		return resp, nil, effectiveMaxResponse
 	}
 	resp.Flags |= 0x0400 // AA = 1
 
@@ -502,12 +504,12 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 		// We don't support OPCODE != QUERY.
 		resp.Flags |= dns.RcodeNotImplemented
 		log.Printf("NOTIMPL: unrecognized OPCODE %d", query.Opcode())
-		return resp, nil
+		return resp, nil, effectiveMaxResponse
 	}
 
 	if question.Type != dns.RRTypeTXT {
 		resp.Flags |= dns.RcodeNameError
-		return resp, nil
+		return resp, nil, effectiveMaxResponse
 	}
 
 	// Payload: prefer EDNS option 0xFF00 (when resolver forwards it); else decode from question name (works with 8.8.8.8 etc).
@@ -529,22 +531,16 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 		decoded := make([]byte, base36DecodedLen(len(encoded)))
 		if err := base36Decode(decoded, encoded); err != nil {
 			resp.Flags |= dns.RcodeNameError
-			return resp, nil
+			return resp, nil, effectiveMaxResponse
 		}
 		payload = decoded
 	}
 	if len(payload) < 9 {
 		resp.Flags |= dns.RcodeNameError
-		return resp, nil
+		return resp, nil, effectiveMaxResponse
 	}
 
-	if payloadSize < maxUDPPayload {
-		resp.Flags |= dns.RcodeFormatError
-		log.Printf("FORMERR: requester payload size %d is too small (minimum %d)", payloadSize, maxUDPPayload)
-		return resp, nil
-	}
-
-	return resp, payload
+	return resp, payload, effectiveMaxResponse
 }
 
 // record represents a DNS message appropriate for a response to a previously
@@ -553,9 +549,10 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 // receives instances of record and may fill in the message's Answer section
 // before sending it.
 type record struct {
-	Resp     *dns.Message
-	Addr     net.Addr
-	ClientID turbotunnel.ClientID
+	Resp            *dns.Message
+	Addr            net.Addr
+	ClientID        turbotunnel.ClientID
+	MaxResponseSize int // max UDP response size for this request (min of requester EDNS and server -mtu)
 }
 
 // --- Fallback NAT logic for non-DNS packets ---
@@ -737,7 +734,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			log.Printf("[server] parsed: id=%d qr=%d qdcount=%d qname=%s has_opt=%v wire_size=%d", query.ID, (query.Flags>>15)&1, len(query.Question), qname, hasOPT, n)
 		}
 
-		resp, payload := responseFor(&query, domain)
+		resp, payload, maxRespSize := responseFor(&query, domain)
 		if os.Getenv("DNSTT_DEBUG") != "" {
 			rcode := uint16(0)
 			if resp != nil {
@@ -796,7 +793,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 		// If a response is called for, pass it to sendLoop via the channel.
 		if resp != nil {
 			select {
-			case ch <- &record{resp, addr, clientID}:
+			case ch <- &record{Resp: resp, Addr: addr, ClientID: clientID, MaxResponseSize: maxRespSize}:
 			default:
 				// sendLoop is busy; drop this response opportunity.
 				// The client will retry after its poll timer fires.
@@ -837,7 +834,11 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 			}
 
 			var payload bytes.Buffer
-			limit := maxEncodedPayload
+			// Use per-request limit so 512-only resolvers still get responses (smaller TXT).
+			limit := computeMaxEncodedPayload(rec.MaxResponseSize)
+			if limit > maxEncodedPayload {
+				limit = maxEncodedPayload
+			}
 			timer := time.NewTimer(maxResponseDelay)
 			for {
 				var p []byte
@@ -897,11 +898,15 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 			log.Printf("resp WireFormat: %v", err)
 			continue
 		}
-		// Truncate if necessary.
+		// Truncate if necessary (per-request limit; 512-only resolvers get smaller responses).
 		// https://tools.ietf.org/html/rfc1035#section-4.1.1
-		if len(buf) > maxUDPPayload {
-			log.Printf("truncating response of %d bytes to max of %d", len(buf), maxUDPPayload)
-			buf = buf[:maxUDPPayload]
+		maxSize := rec.MaxResponseSize
+		if maxSize <= 0 {
+			maxSize = maxUDPPayload
+		}
+		if len(buf) > maxSize {
+			log.Printf("truncating response of %d bytes to max of %d", len(buf), maxSize)
+			buf = buf[:maxSize]
 			buf[2] |= 0x02 // TC = 1
 		}
 
@@ -966,7 +971,7 @@ func computeMaxEncodedPayload(limit int) int {
 			{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: queryLimit, TTL: 0, Data: []byte{}},
 		},
 	}
-	resp, _ := responseFor(query, dns.Name([][]byte{}))
+	resp, _, _ := responseFor(query, dns.Name([][]byte{}))
 	if resp == nil {
 		return 0
 	}
