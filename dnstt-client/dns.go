@@ -309,14 +309,22 @@ func chunks(p []byte, n int) [][]byte {
 	return out
 }
 
-// buildUpstreamPayload builds raw payload: ClientID(8) + padding byte + padding bytes + [1-byte len + packet]*.
+// buildUpstreamPayload builds raw payload with compact framing:
+//   - ClientID(8) + mode byte. Mode: 0 = poll (no data); 1–223 = single packet of that length; 224+ = legacy (224+nPad, nPad bytes, then [1-byte len + packet]*).
 func (c *DNSPacketConn) buildUpstreamPayload(packets [][]byte) []byte {
 	var buf bytes.Buffer
 	buf.Write(c.clientID[:])
-	nPad := numPadding
 	if len(packets) == 0 {
-		nPad = numPaddingForPoll
+		buf.WriteByte(0) // poll: no data
+		return buf.Bytes()
 	}
+	if len(packets) == 1 && len(packets[0]) >= 1 && len(packets[0]) < 224 {
+		buf.WriteByte(byte(len(packets[0])))
+		buf.Write(packets[0])
+		return buf.Bytes()
+	}
+	// Legacy multi-packet or single packet with len 0 or >= 224
+	nPad := numPadding
 	buf.WriteByte(byte(224 + nPad))
 	io.CopyN(&buf, rand.Reader, int64(nPad))
 	for _, p := range packets {

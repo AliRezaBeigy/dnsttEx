@@ -211,8 +211,9 @@ func TestResponseFor(t *testing.T) {
 
 	t.Run("name-based query (Base36 in name, no OPT payload) returns NoError and payload", func(t *testing.T) {
 		// Simulates public resolvers: payload only in question name. Base36 (0-9a-v); server decodes case-insensitively.
+		// Compact framing: poll = clientID(8) + 0 (9 bytes total).
 		clientID := turbotunnel.NewClientID()
-		rawPayload := append(clientID[:], 0xe0) // 8 + 1 byte
+		rawPayload := append(clientID[:], 0) // compact poll: 8 + 1 byte
 		enc := base36EncodeTest(rawPayload)
 		var labels [][]byte
 		for len(enc) > 0 {

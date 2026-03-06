@@ -523,7 +523,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 		payload = dns.FindEDNSOption(opts, upstreamEDNSOptionCode)
 		break
 	}
-	if len(payload) < 8 {
+	if len(payload) < 9 {
 		// Fallback: payload in question name (Base36). Decode is case-insensitive for QNAME randomization (e.g. 8.8.8.8).
 		encoded := bytes.Join(prefix, nil)
 		decoded := make([]byte, base36DecodedLen(len(encoded)))
@@ -533,7 +533,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 		}
 		payload = decoded
 	}
-	if len(payload) < 8 {
+	if len(payload) < 9 {
 		resp.Flags |= dns.RcodeNameError
 		return resp, nil
 	}
@@ -755,29 +755,42 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 		// Extract the ClientID from the payload.
 		var clientID turbotunnel.ClientID
 		n = copy(clientID[:], payload)
-		payload = payload[n:]
-		if n == len(clientID) {
-			// Discard padding and pull out the packets contained in
-			// the payload.
-			r := bytes.NewReader(payload)
-			nPackets := 0
-			for {
-				p, err := nextPacket(r)
-				if err != nil {
-					break
+		body := payload[n:]
+		if n == len(clientID) && len(body) >= 1 {
+			// Compact framing: first byte 0 = poll; 1–223 = single packet length; 224+ = legacy (padding then [len+packet]*).
+			first := body[0]
+			if first == 0 {
+				// Poll: no packets
+			} else if first >= 1 && first < 224 {
+				// Single packet of length first
+				if len(body) >= 1+int(first) {
+					p := body[1 : 1+first]
+					ttConn.QueueIncoming(p, clientID)
+					if os.Getenv("DNSTT_DEBUG") != "" {
+						log.Printf("[server] received payload %d bytes (1 packet, compact) from %s", 8+1+int(first), clientID)
+					}
 				}
-				nPackets++
-				// Feed the incoming packet to KCP.
-				ttConn.QueueIncoming(p, clientID)
-			}
-			if os.Getenv("DNSTT_DEBUG") != "" && (len(payload) > 0 || nPackets > 0) {
-				log.Printf("[server] received payload %d bytes (%d packets) from %s", 8+len(payload), nPackets, clientID)
+			} else {
+				// Legacy: padding byte + padding bytes + [len+packet]*
+				r := bytes.NewReader(body)
+				nPackets := 0
+				for {
+					p, err := nextPacket(r)
+					if err != nil {
+						break
+					}
+					nPackets++
+					ttConn.QueueIncoming(p, clientID)
+				}
+				if os.Getenv("DNSTT_DEBUG") != "" && (len(body) > 0 || nPackets > 0) {
+					log.Printf("[server] received payload %d bytes (%d packets) from %s", 8+len(body), nPackets, clientID)
+				}
 			}
 		} else {
-			// Payload is not long enough to contain a ClientID.
+			// Payload too short (no full ClientID) or no mode byte (8 bytes only).
 			if resp != nil && resp.Rcode() == dns.RcodeNoError {
 				resp.Flags |= dns.RcodeNameError
-				log.Printf("NXDOMAIN: %d bytes are too short to contain a ClientID", n)
+				log.Printf("NXDOMAIN: %d bytes payload (need at least 9 for ClientID+mode)", len(payload))
 			}
 		}
 		// If a response is called for, pass it to sendLoop via the channel.
