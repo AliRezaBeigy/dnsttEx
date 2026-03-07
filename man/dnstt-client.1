@@ -1,5 +1,5 @@
 .\" https://man.openbsd.org/mdoc.7
-.Dd 2020-08-30
+.Dd 2026-03-07
 .Dt DNSTT-CLIENT 1
 .Os
 
@@ -13,7 +13,12 @@
 .Sh SYNOPSIS
 
 .Nm
-.Op Fl doh Ar URL | Fl dot Ar HOST : Ns Ar PORT | Fl udp Ar HOST : Ns Ar PORT
+.Op Fl doh Ar URL
+.Op Fl dot Ar HOST : Ns Ar PORT
+.Op Fl udp Ar HOST : Ns Ar PORT
+.Op Fl resolvers-file Ar path
+.Op Fl resolver-policy Ar policy
+.Op Fl scan
 .Op Fl pubkey Ar HEX | Fl pubkey-file Ar FILENAME
 .Ar DOMAIN
 .Ar LOCALADDR : Ns Ar LOCALPORT
@@ -38,13 +43,24 @@ DNS over TLS,
 or classical DNS over UDP.
 
 .Pp
-You must use exactly one of the
+You must specify at least one resolver using
 .Fl doh ,
 .Fl dot ,
-or
+.Fl udp ,
+and/or
+.Fl resolvers-file .
+Each of
+.Fl doh ,
+.Fl dot ,
+and
 .Fl udp
-options,
-to specify what form of DNS to use:
+may be repeated to add multiple resolvers;
+types may be mixed.
+All resolvers are merged into a single pool and used according to
+.Fl resolver-policy .
+If only one resolver is given, behavior is unchanged from single-resolver mode.
+.Pp
+Resolver options:
 
 .Bl -tag
 
@@ -97,6 +113,25 @@ where
 .Xr dnstt-server 1
 is running.
 
+.It Fl resolvers-file Ar path
+Load resolvers from
+.Ar path .
+One resolver per line; prefix each line with
+.Cm doh: ,
+.Cm dot: ,
+or
+.Cm udp:
+followed by the URL or host:port.
+Lines starting with
+.Ql #
+and blank lines are ignored.
+.Fl resolvers-file
+may be repeated; all files are merged with any resolvers given by
+.Fl doh ,
+.Fl dot ,
+or
+.Fl udp .
+
 .El
 
 .Pp
@@ -121,7 +156,7 @@ is a string of 64 hexadecimal digits.
 .Ar FILENAME
 is the name of a file containing
 64 hexadecimal digits and an
-optional training newline character.
+optional trailing newline character.
 
 .El
 
@@ -176,6 +211,30 @@ The special value
 .Cm none
 disables uTLS and uses the native Go crypto/tls fingerprint.
 
+.It Fl resolver-policy Ar policy
+When multiple resolvers are in the pool, choose how to select among them:
+.Cm round-robin ,
+.Cm least-ping
+(default), or
+.Cm weighted-traffic .
+.Pp
+.Cm least-ping
+round-robins until each endpoint has at least one RTT measurement,
+then prefers the healthy endpoint with the lowest RTT.
+.Cm weighted-traffic
+selects with probability proportional to bytes received per endpoint,
+falling back to round-robin until traffic is non-zero.
+.Cm round-robin
+cycles through resolvers in order.
+
+.It Fl scan
+Before starting the tunnel, probe every resolver and keep only those
+that return a valid tunnel response from the server.
+UDP endpoints are probed via a dedicated socket; DoH and DoT endpoints
+cannot be probed and are assumed OK (a warning is logged).
+.Nm
+exits with an error if no resolver passes the scan.
+
 .It Fl help
 Describes command line usage.
 Shows the default value of
@@ -183,6 +242,17 @@ Shows the default value of
 and the available TLS fingerprint labels.
 
 .El
+
+.Ss Resolver pool and health
+
+When the pool has more than one UDP resolver, a background goroutine
+probes each one every 15 seconds on a dedicated socket (separate from
+the traffic socket) and tracks RTT and health.
+After two consecutive probe failures an endpoint is marked unhealthy
+and skipped by the selection policy.
+All endpoints are marked healthy again on the next successful probe.
+If every endpoint is unhealthy, selection falls back to the full list
+so the tunnel does not stall.
 
 
 .Sh EXAMPLES
@@ -213,6 +283,31 @@ Use the given hex string as the server public key.
 
 .Bd -literal -offset indent
 dnstt-client -dot resolver.example:853 -pubkey 14ca15f53660e248d289d9302f992c4bee518f2361d6343dafa7b417b5a3d752 t.example.com 127.0.0.1:7000
+.Ed
+
+.Pp
+Use multiple DoH resolvers with least-ping policy and pre-start scan:
+
+.Bd -literal -offset indent
+dnstt-client -doh https://resolver1.example/dns-query -doh https://resolver2.example/dns-query -resolver-policy least-ping -scan -pubkey-file server.pub t.example.com 127.0.0.1:7000
+.Ed
+
+.Pp
+Load resolvers from a file and scan before starting:
+
+.Bd -literal -offset indent
+dnstt-client -resolvers-file resolvers.txt -scan -pubkey-file server.pub t.example.com 127.0.0.1:7000
+.Ed
+
+.Pp
+Example
+.Pa resolvers.txt :
+.Bd -literal -offset indent
+# Primary
+doh:https://resolver.example/dns-query
+dot:resolver.example:853
+# Fallback
+udp:192.0.2.1:53
 .Ed
 
 

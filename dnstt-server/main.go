@@ -63,17 +63,20 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jellydator/ttlcache/v3"
-	"dnsttEx/internal/kcp"
-	"github.com/xtaci/smux"
 	"dnsttEx/dns"
+	"dnsttEx/internal/kcp"
 	"dnsttEx/noise"
 	"dnsttEx/turbotunnel"
+
+	"github.com/jellydator/ttlcache/v3"
+	"github.com/xtaci/smux"
 )
 
 const (
 	upstreamEDNSOptionCode   = 0xFF00
 	downstreamEDNSOptionCode = 0xFF01
+	// Health-check probe: client sends payload with mode byte 0xFF (PING), server responds with "PONG".
+	probeModePING = 0xFF
 )
 
 const (
@@ -552,7 +555,8 @@ type record struct {
 	Resp            *dns.Message
 	Addr            net.Addr
 	ClientID        turbotunnel.ClientID
-	MaxResponseSize int // max UDP response size for this request (min of requester EDNS and server -mtu)
+	MaxResponseSize int  // max UDP response size for this request (min of requester EDNS and server -mtu)
+	PongResponse    bool // true: health-check PING; send payload "PONG" only
 }
 
 // --- Fallback NAT logic for non-DNS packets ---
@@ -754,8 +758,19 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 		n = copy(clientID[:], payload)
 		body := payload[n:]
 		if n == len(clientID) && len(body) >= 1 {
-			// Compact framing: first byte 0 = poll; 1–223 = single packet length; 224+ = legacy (padding then [len+packet]*).
 			first := body[0]
+			if first == probeModePING {
+				// Health-check PING: respond with PONG only; don't touch tunnel.
+				if resp != nil {
+					select {
+					case ch <- &record{Resp: resp, Addr: addr, ClientID: clientID, MaxResponseSize: maxRespSize, PongResponse: true}:
+					default:
+						log.Printf("sendLoop channel full, dropping PONG response")
+					}
+				}
+				continue
+			}
+			// Compact framing: first byte 0 = poll; 1–223 = single packet length; 224+ = legacy (padding then [len+packet]*).
 			if first == 0 {
 				// Poll: no packets
 			} else if first >= 1 && first < 224 {
@@ -833,63 +848,71 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 				},
 			}
 
-			var payload bytes.Buffer
-			// Use per-request limit so 512-only resolvers still get responses (smaller TXT).
-			limit := computeMaxEncodedPayload(rec.MaxResponseSize)
-			if limit > maxEncodedPayload {
-				limit = maxEncodedPayload
-			}
-			timer := time.NewTimer(maxResponseDelay)
-			for {
-				var p []byte
-				unstash := ttConn.Unstash(rec.ClientID)
-				outgoing := ttConn.OutgoingQueue(rec.ClientID)
-				// When channel has pending records, don't wait long so we drain and avoid "channel full" drops.
-				waitDelay := maxResponseDelay
-				if len(ch) > 0 {
-					waitDelay = 0
+			if rec.PongResponse {
+				// Health-check PING: respond with literal "PONG" only.
+				rec.Resp.Answer[0].Data = dns.EncodeRDataTXT([]byte("PONG"))
+			} else {
+				var payload bytes.Buffer
+				// Use per-request limit so 512-only resolvers still get responses (smaller TXT).
+				limit := computeMaxEncodedPayload(rec.MaxResponseSize)
+				if limit > maxEncodedPayload {
+					limit = maxEncodedPayload
 				}
-				if !timer.Stop() {
-					select { case <-timer.C: default: }
-				}
-				timer.Reset(waitDelay)
-				select {
-				case p = <-unstash:
-				default:
+				timer := time.NewTimer(maxResponseDelay)
+				for {
+					var p []byte
+					unstash := ttConn.Unstash(rec.ClientID)
+					outgoing := ttConn.OutgoingQueue(rec.ClientID)
+					// When channel has pending records, don't wait long so we drain and avoid "channel full" drops.
+					waitDelay := maxResponseDelay
+					if len(ch) > 0 {
+						waitDelay = 0
+					}
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					timer.Reset(waitDelay)
 					select {
 					case p = <-unstash:
-					case p = <-outgoing:
 					default:
 						select {
 						case p = <-unstash:
 						case p = <-outgoing:
-						case <-timer.C:
-						case nextRec = <-ch:
+						default:
+							select {
+							case p = <-unstash:
+							case p = <-outgoing:
+							case <-timer.C:
+							case nextRec = <-ch:
+							}
 						}
 					}
-				}
-				timer.Reset(0)
+					timer.Reset(0)
 
-				if len(p) == 0 {
-					break
-				}
+					if len(p) == 0 {
+						break
+					}
 
-				limit -= 2 + len(p)
-				if payload.Len() > 0 && limit < 0 {
-					ttConn.Stash(p, rec.ClientID)
-					break
+					limit -= 2 + len(p)
+					if payload.Len() > 0 && limit < 0 {
+						ttConn.Stash(p, rec.ClientID)
+						break
+					}
+					if int(uint16(len(p))) != len(p) {
+						panic(len(p))
+					}
+					binary.Write(&payload, binary.BigEndian, uint16(len(p)))
+					payload.Write(p)
 				}
-				if int(uint16(len(p))) != len(p) {
-					panic(len(p))
-				}
-				binary.Write(&payload, binary.BigEndian, uint16(len(p)))
-				payload.Write(p)
-			}
-			timer.Stop()
+				timer.Stop()
 
-			rec.Resp.Answer[0].Data = dns.EncodeRDataTXT(payload.Bytes())
-			if os.Getenv("DNSTT_DEBUG") != "" && payload.Len() > 0 {
-				log.Printf("[server] send TXT payload %d bytes to %s", payload.Len(), rec.ClientID)
+				rec.Resp.Answer[0].Data = dns.EncodeRDataTXT(payload.Bytes())
+				if os.Getenv("DNSTT_DEBUG") != "" && payload.Len() > 0 {
+					log.Printf("[server] send TXT payload %d bytes to %s", payload.Len(), rec.ClientID)
+				}
 			}
 		}
 

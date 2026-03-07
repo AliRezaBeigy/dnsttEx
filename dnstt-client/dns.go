@@ -390,6 +390,56 @@ func (c *DNSPacketConn) send(transport net.PacketConn, packets [][]byte, addr ne
 	return err
 }
 
+// Probe mode bytes (first byte of payload after clientID).
+const (
+	probeModePoll = 0   // normal idle poll
+	probeModePING = 0xFF // health-check PING; server must respond with PONG
+)
+
+// BuildProbeMessage builds a minimal DNS message for health check: client sends
+// PING (mode 0xFF), server responds with PONG. Used by the health checker and -scan.
+func BuildProbeMessage(domain dns.Name, clientID turbotunnel.ClientID) ([]byte, error) {
+	// Payload: clientID(8) + mode byte PING.
+	raw := make([]byte, 9)
+	copy(raw, clientID[:])
+	raw[8] = probeModePING
+	encoded := make([]byte, base36EncodedLen(len(raw)))
+	base36Encode(encoded, raw)
+	labels := chunks(encoded, maxLabelLen)
+	labels = append(labels, domain...)
+	name, err := dns.NewName(labels)
+	if err != nil {
+		return nil, err
+	}
+	var id uint16
+	binary.Read(rand.Reader, binary.BigEndian, &id)
+	query := &dns.Message{
+		ID:    id,
+		Flags: 0x0100,
+		Question: []dns.Question{
+			{Name: name, Type: dns.RRTypeTXT, Class: dns.ClassIN},
+		},
+		Additional: []dns.RR{
+			{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: 0, Data: []byte{}},
+		},
+	}
+	return query.WireFormat()
+}
+
+// ProbeResponsePONG is the exact payload the server must return for a PING health check.
+var ProbeResponsePONG = []byte("PONG")
+
+// VerifyProbeResponse checks that a raw DNS wire-format response is a valid
+// PONG to our PING: RcodeNoError, question under domain, and payload equals "PONG".
+func VerifyProbeResponse(buf []byte, domain dns.Name) bool {
+	resp, err := dns.MessageFromWireFormat(buf)
+	if err != nil {
+		return false
+	}
+	payload := dnsResponsePayload(&resp, domain)
+	return payload != nil && bytes.Equal(payload, ProbeResponsePONG)
+}
+
 // sendLoop batches packets into the question name (limited by nameCapacity). Also sends polling queries when idle.
 // Poll timing can be overridden with DNSTT_POLL_INIT_MS and DNSTT_POLL_MAX_MS (e.g. 500/2000 for conservative resolvers).
 func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error {

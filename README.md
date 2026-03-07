@@ -7,6 +7,7 @@ This fork adds the following on top of upstream dnstt (after commit ae95dda):
 - **Modified KCP** — In-tree KCP with a 12-byte header and tuning (queue sizes, keepalive, backoff).
 - **DNS encoding** — Name-based encoding with more room in the 253-octet name; Base36 and compacter framing.
 - **Reliability** — Deadlock fix, smux keepalive and Poller backoff fixes, automatic session reconnection (upstream).
+- **Multi-resolver pool** — Client accepts multiple `-doh`/`-dot`/`-udp` flags and/or a `-resolvers-file`. Resolvers are multiplexed via a `ResolverPool` with three selection policies: `round-robin`, `least-ping`, and `weighted-traffic`. A background health checker probes UDP endpoints every 15 s and tracks RTT; unhealthy endpoints are skipped with automatic fallback. Use `-scan` to filter the list to only resolvers that reach the server before starting.
 
 See [CHANGELOG.md](CHANGELOG.md) for version history and details.
 
@@ -25,6 +26,86 @@ bash <(curl -Ls https://raw.githubusercontent.com/AliRezaBeigy/dnsttEx/main/scri
 |--------|--------------------|-----------------|
 | **Throughput** (10 streams, 160 KB) | 3.9 MB/s (41 ms) | 7.1 MB/s (22 ms) |
 | **Wire overhead** (128 KB payload) | 3.3× → 424 KB | 3.0× → 378 KB |
+
+## Multi-resolver client
+
+The client supports multiple DNS resolvers simultaneously. Flags `-doh`, `-dot`,
+and `-udp` may be repeated, and/or a resolver file may be given with
+`-resolvers-file`. All sources are merged into a single pool.
+
+### Repeatable flags
+
+```
+tunnel-client$ ./dnstt-client \
+    -doh https://doh1.example/dns-query \
+    -doh https://doh2.example/dns-query \
+    -dot dot.example:853 \
+    -pubkey-file server.pub t.example.com 127.0.0.1:7000
+```
+
+### Resolver file (`-resolvers-file`)
+
+One resolver per line. Lines starting with `#` and blank lines are ignored.
+Supported prefixes: `doh:`, `dot:`, `udp:`.
+
+```
+# resolvers.txt
+doh:https://doh1.example/dns-query
+doh:https://doh2.example/dns-query
+dot:dot.example:853
+udp:8.8.8.8:53
+```
+
+```
+tunnel-client$ ./dnstt-client -resolvers-file resolvers.txt \
+    -pubkey-file server.pub t.example.com 127.0.0.1:7000
+```
+
+Multiple `-resolvers-file` flags are allowed and are merged.
+
+### Selection policy (`-resolver-policy`)
+
+| Policy | Description |
+|---|---|
+| `least-ping` (default) | Prefer the resolver with the lowest measured RTT |
+| `round-robin` | Rotate through healthy resolvers in order |
+| `weighted-traffic` | Choose with probability proportional to bytes received from each resolver |
+
+```
+tunnel-client$ ./dnstt-client -doh url1 -doh url2 \
+    -resolver-policy round-robin \
+    -pubkey-file server.pub t.example.com 127.0.0.1:7000
+```
+
+### Pre-start scan (`-scan`)
+
+When `-scan` is set the client probes every resolver before starting and keeps
+only those that return a valid tunnel response. Useful when the resolver list is
+large and some entries may not reach the server.
+
+```
+tunnel-client$ ./dnstt-client -resolvers-file resolvers.txt -scan \
+    -pubkey-file server.pub t.example.com 127.0.0.1:7000
+```
+
+If no resolver passes the scan the client exits with an error.
+
+### Health check
+
+When more than one resolver is active a background goroutine probes each
+resolver every 15 seconds and tracks RTT and health. Unhealthy resolvers are
+skipped by the selection policy; if all are unhealthy traffic falls back to
+the full list so the tunnel does not stop.
+
+### SS_PLUGIN_OPTIONS (shadowsocks plugin)
+
+Multiple resolvers are supported in plugin mode by repeating the key:
+
+```
+doh=https://doh1.example/dns-query;doh=https://doh2.example/dns-query;resolver-policy=least-ping;domain=t.example.com;pubkey=...
+```
+
+`resolvers-file=path` is also accepted.
 
 ## Test results
 

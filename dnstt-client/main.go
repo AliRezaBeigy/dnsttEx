@@ -16,6 +16,17 @@
 //	-dot resolver.example:853
 //	-udp resolver.example:53
 //
+// Flags may be repeated to specify multiple resolvers:
+//
+//	-doh url1 -doh url2 -dot addr1 -udp addr2
+//
+// A resolver file may also be given:
+//
+//	-resolvers-file /path/to/resolvers.txt
+//
+// File format: one resolver per line, prefix doh:, dot:, or udp:.
+// Lines starting with # or blank lines are ignored.
+//
 // You can give the server's public key as a file or as a hex string. Use
 // "dnstt-server -gen-key" to get the public key.
 //
@@ -39,15 +50,13 @@
 package main
 
 import (
-	"context"
-	"crypto/tls"
+	"bufio"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -397,6 +406,124 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 
 var dialerControl func(network, address string, c syscall.RawConn) error = nil
 
+// stringSliceFlag is a flag.Value that collects repeated string flags into a slice.
+type stringSliceFlag []string
+
+func (f *stringSliceFlag) String() string {
+	if f == nil {
+		return ""
+	}
+	return strings.Join(*f, ",")
+}
+
+func (f *stringSliceFlag) Set(value string) error {
+	*f = append(*f, value)
+	return nil
+}
+
+// parseResolversFile parses a resolvers file and appends to specs.
+// Format: one resolver per line, prefix doh:, dot:, or udp:.
+// Lines starting with # and blank lines are ignored.
+func parseResolversFile(path string) ([]resolverSpec, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var specs []resolverSpec
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		idx := strings.Index(line, ":")
+		if idx < 0 {
+			return nil, fmt.Errorf("resolver file: invalid line %q (expected doh:..., dot:..., or udp:...)", line)
+		}
+		typ := strings.ToLower(line[:idx])
+		addr := line[idx+1:]
+		switch typ {
+		case "doh", "dot", "udp":
+		default:
+			return nil, fmt.Errorf("resolver file: unknown type %q in line %q", typ, line)
+		}
+		// For doh entries that don't start with https:// add the scheme.
+		if typ == "doh" && !strings.HasPrefix(strings.ToLower(addr), "https://") {
+			addr = "https://" + addr + "/dns-query"
+		}
+		specs = append(specs, resolverSpec{typ: typ, addr: addr})
+	}
+	return specs, scanner.Err()
+}
+
+// scanResolvers probes each endpoint and returns only those that get a valid
+// server response within timeout.
+//
+// For UDP endpoints the dedicated probeConn is used so the scan socket is
+// never shared with the later readLoop. For DoH/DoT endpoints SetReadDeadline
+// is a no-op on the underlying QueuePacketConn, so we log a warning and treat
+// those endpoints as passing without a real probe.
+func scanResolvers(endpoints []*poolEndpoint, domain dns.Name, timeout time.Duration) []*poolEndpoint {
+	probeID := turbotunnel.NewClientID()
+	probeBuilder := func() ([]byte, error) { return BuildProbeMessage(domain, probeID) }
+	probeVerify := func(buf []byte) bool { return VerifyProbeResponse(buf, domain) }
+
+	var mu sync.Mutex
+	var passed []*poolEndpoint
+	var wg sync.WaitGroup
+
+	for _, ep := range endpoints {
+		ep := ep
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			// DoH/DoT: no dedicated probe socket; deadlines are no-ops on
+			// QueuePacketConn. Warn and pass through unconditionally.
+			if ep.probeConn == nil {
+				log.Printf("scan: %s (DoH/DoT) cannot be probed; assumed OK", ep.name)
+				mu.Lock()
+				passed = append(passed, ep)
+				mu.Unlock()
+				return
+			}
+
+			// UDP: use the dedicated probe socket.
+			msg, err := probeBuilder()
+			if err != nil {
+				log.Printf("scan: build probe for %s: %v", ep.name, err)
+				return
+			}
+			ep.probeConn.SetDeadline(time.Now().Add(timeout))
+			_, err = ep.probeConn.WriteTo(msg, ep.addr)
+			if err != nil {
+				ep.probeConn.SetDeadline(time.Time{})
+				log.Printf("scan: %s write error: %v", ep.name, err)
+				return
+			}
+			buf := make([]byte, 4096)
+			n, _, err := ep.probeConn.ReadFrom(buf)
+			ep.probeConn.SetDeadline(time.Time{})
+			if err != nil {
+				log.Printf("scan: %s no response: %v", ep.name, err)
+				return
+			}
+			if probeVerify(buf[:n]) {
+				log.Printf("scan: %s OK", ep.name)
+				mu.Lock()
+				passed = append(passed, ep) // Fix #3: use ep, not endpoints[i]
+				mu.Unlock()
+			} else {
+				log.Printf("scan: %s bad response", ep.name)
+			}
+		}()
+	}
+	wg.Wait()
+	return passed
+}
+
 func main() {
 	// If no command-line arguments are given, try to read options from
 	// environment variables, for compatibility with shadowsocks plugins.
@@ -404,9 +531,10 @@ func main() {
 	if len(os.Args) == 1 {
 		pluginOpts := os.Getenv("SS_PLUGIN_OPTIONS")
 		if pluginOpts != "" {
-			var transportFlag, resolver, pubkey, domainStr string
+			var dohURLs, dotAddrs, udpAddrs []string
+			var resolverFiles []string
+			var pubkey, domainStr, policy string
 
-			// Parse the semicolon-separated list of options.
 			options := strings.Split(pluginOpts, ";")
 			for _, opt := range options {
 				parts := strings.SplitN(opt, "=", 2)
@@ -416,14 +544,18 @@ func main() {
 				key, value := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
 				switch key {
 				case "doh":
-					transportFlag = "-doh"
-					resolver = value
+					if !strings.HasPrefix(strings.ToLower(value), "https://") {
+						value = "https://" + value + "/dns-query"
+					}
+					dohURLs = append(dohURLs, value)
 				case "dot":
-					transportFlag = "-dot"
-					resolver = value
+					dotAddrs = append(dotAddrs, value)
 				case "udp":
-					transportFlag = "-udp"
-					resolver = value
+					udpAddrs = append(udpAddrs, value)
+				case "resolvers-file":
+					resolverFiles = append(resolverFiles, value)
+				case "resolver-policy":
+					policy = value
 				case "pubkey":
 					pubkey = value
 				case "domain":
@@ -436,61 +568,64 @@ func main() {
 			localHost := os.Getenv("SS_LOCAL_HOST")
 			localPort := os.Getenv("SS_LOCAL_PORT")
 
-			// Validate that we have all the required options, mimicking the shell script's checks.
-			if transportFlag == "" {
-				fmt.Fprintf(os.Stderr, "dnstt-client: SS_PLUGIN_OPTIONS must contain one of: doh, dot, or udp")
-				os.Exit(1)
-			}
-			if resolver == "" {
+			if len(dohURLs)+len(dotAddrs)+len(udpAddrs)+len(resolverFiles) == 0 {
+				// Fallback: check remote host/port.
 				remoteHost := os.Getenv("SS_REMOTE_HOST")
 				remotePort := os.Getenv("SS_REMOTE_PORT")
 				if remoteHost == "" || remotePort == "" {
-					fmt.Fprintf(os.Stderr, "dnstt-client: SS_PLUGIN_OPTIONS must contain one of: doh, dot, or udp")
+					fmt.Fprintf(os.Stderr, "dnstt-client: SS_PLUGIN_OPTIONS must contain one of: doh, dot, udp, or resolvers-file\n")
 					os.Exit(1)
 				}
-				resolver = net.JoinHostPort(remoteHost, remotePort)
-			}
-			if transportFlag == "-doh" {
-				if !strings.HasPrefix(strings.ToLower(resolver), "https://") {
-					resolver = "https://" + resolver + "/dns-query"
-				}
+				udpAddrs = append(udpAddrs, net.JoinHostPort(remoteHost, remotePort))
 			}
 			if pubkey == "" {
-				fmt.Fprintf(os.Stderr, "dnstt-client: SS_PLUGIN_OPTIONS must contain pubkey")
+				fmt.Fprintf(os.Stderr, "dnstt-client: SS_PLUGIN_OPTIONS must contain pubkey\n")
 				os.Exit(1)
 			}
 			if domainStr == "" {
-				fmt.Fprintf(os.Stderr, "dnstt-client: SS_PLUGIN_OPTIONS must contain domain")
+				fmt.Fprintf(os.Stderr, "dnstt-client: SS_PLUGIN_OPTIONS must contain domain\n")
 				os.Exit(1)
 			}
 			if localHost == "" {
-				fmt.Fprintf(os.Stderr, "dnstt-client: SS_LOCAL_HOST environment variable not set")
+				fmt.Fprintf(os.Stderr, "dnstt-client: SS_LOCAL_HOST environment variable not set\n")
 				os.Exit(1)
 			}
 			if localPort == "" {
-				fmt.Fprintf(os.Stderr, "dnstt-client: SS_LOCAL_PORT environment variable not set")
+				fmt.Fprintf(os.Stderr, "dnstt-client: SS_LOCAL_PORT environment variable not set\n")
 				os.Exit(1)
 			}
 
 			// Reconstruct os.Args so the existing flag-parsing logic can be used.
-			os.Args = []string{
-				os.Args[0],
-				transportFlag,
-				resolver,
-				"-pubkey",
-				pubkey,
-				domainStr,
-				net.JoinHostPort(localHost, localPort),
+			args := []string{os.Args[0]}
+			for _, u := range dohURLs {
+				args = append(args, "-doh", u)
 			}
+			for _, a := range dotAddrs {
+				args = append(args, "-dot", a)
+			}
+			for _, a := range udpAddrs {
+				args = append(args, "-udp", a)
+			}
+			for _, f := range resolverFiles {
+				args = append(args, "-resolvers-file", f)
+			}
+			if policy != "" {
+				args = append(args, "-resolver-policy", policy)
+			}
+			args = append(args, "-pubkey", pubkey, domainStr, net.JoinHostPort(localHost, localPort))
+			os.Args = args
 		}
 	}
 
-	var dohURL string
-	var dotAddr string
+	var dohURLs stringSliceFlag
+	var dotAddrs stringSliceFlag
+	var udpAddrs stringSliceFlag
+	var resolverFiles stringSliceFlag
 	var pubkeyFilename string
 	var pubkeyString string
-	var udpAddr string
 	var utlsDistribution string
+	var resolverPolicy string
+	var doScan bool
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
@@ -499,6 +634,8 @@ func main() {
 Examples:
   %[1]s -doh https://resolver.example/dns-query -pubkey-file server.pub t.example.com 127.0.0.1:7000
   %[1]s -dot resolver.example:853 -pubkey-file server.pub t.example.com 127.0.0.1:7000
+  %[1]s -doh url1 -doh url2 -resolver-policy least-ping -pubkey-file server.pub t.example.com 127.0.0.1:7000
+  %[1]s -resolvers-file resolvers.txt -scan -pubkey-file server.pub t.example.com 127.0.0.1:7000
 
 `, os.Args[0])
 		flag.PrintDefaults()
@@ -524,14 +661,19 @@ Known TLS fingerprints for -utls are:
 			fmt.Fprintln(flag.CommandLine.Output(), line.String())
 		}
 	}
-	flag.StringVar(&dohURL, "doh", "", "URL of DoH resolver")
-	flag.StringVar(&dotAddr, "dot", "", "address of DoT resolver")
+	flag.Var(&dohURLs, "doh", "URL of DoH resolver (may be repeated)")
+	flag.Var(&dotAddrs, "dot", "address of DoT resolver (may be repeated)")
+	flag.Var(&udpAddrs, "udp", "address of UDP DNS resolver (may be repeated)")
+	flag.Var(&resolverFiles, "resolvers-file", "file with one resolver per line (doh:URL, dot:host:port, udp:host:port); may be repeated")
 	flag.StringVar(&pubkeyString, "pubkey", "", fmt.Sprintf("server public key (%d hex digits)", noise.KeyLen*2))
 	flag.StringVar(&pubkeyFilename, "pubkey-file", "", "read server public key from file")
-	flag.StringVar(&udpAddr, "udp", "", "address of UDP DNS resolver")
 	flag.StringVar(&utlsDistribution, "utls",
 		"4*random,3*Firefox_120,1*Firefox_105,3*Chrome_120,1*Chrome_102,1*iOS_14,1*iOS_13",
 		"choose TLS fingerprint from weighted distribution")
+	flag.StringVar(&resolverPolicy, "resolver-policy", "least-ping",
+		"resolver selection policy when multiple resolvers are used: round-robin, least-ping, weighted-traffic")
+	flag.BoolVar(&doScan, "scan", false,
+		"pre-start scan: test each resolver and keep only those that receive a valid server response")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.LUTC)
@@ -584,81 +726,97 @@ Known TLS fingerprints for -utls are:
 		log.Printf("uTLS fingerprint %s %s", utlsClientHelloID.Client, utlsClientHelloID.Version)
 	}
 
-	// Iterate over the remote resolver address options and select one and
-	// only one.
-	var remoteAddr net.Addr
-	var pconn net.PacketConn
-	for _, opt := range []struct {
-		s string
-		f func(string) (net.Addr, net.PacketConn, error)
-	}{
-		// -doh
-		{dohURL, func(s string) (net.Addr, net.PacketConn, error) {
-			addr := turbotunnel.DummyAddr{}
-			var rt http.RoundTripper
-			if utlsClientHelloID == nil {
-				transport := http.DefaultTransport.(*http.Transport).Clone()
-				// Disable DefaultTransport's default Proxy =
-				// ProxyFromEnvironment setting, for conformity
-				// with utlsRoundTripper and with DoT mode,
-				// which do not take a proxy from the
-				// environment.
-				transport.Proxy = nil
-				rt = transport
-			} else {
-				rt = NewUTLSRoundTripper(nil, utlsClientHelloID)
-			}
-			pconn, err := NewHTTPPacketConn(rt, dohURL, 32)
-			return addr, pconn, err
-		}},
-		// -dot
-		{dotAddr, func(s string) (net.Addr, net.PacketConn, error) {
-			addr := turbotunnel.DummyAddr{}
-			var dialTLSContext func(ctx context.Context, network, addr string) (net.Conn, error)
-			if utlsClientHelloID == nil {
-				dialTLSContext = (&tls.Dialer{
-					NetDialer: &net.Dialer{
-						Control: dialerControl,
-					},
-				}).DialContext
-			} else {
-				dialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-					return utlsDialContext(ctx, network, addr, nil, utlsClientHelloID)
+	// Build the merged resolver list from flags and files.
+	var specs []resolverSpec
+	for _, u := range dohURLs {
+		specs = append(specs, resolverSpec{typ: "doh", addr: u})
+	}
+	for _, a := range dotAddrs {
+		specs = append(specs, resolverSpec{typ: "dot", addr: a})
+	}
+	for _, a := range udpAddrs {
+		specs = append(specs, resolverSpec{typ: "udp", addr: a})
+	}
+	for _, path := range resolverFiles {
+		fileSpecs, err := parseResolversFile(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "reading resolvers file %q: %v\n", path, err)
+			os.Exit(1)
+		}
+		specs = append(specs, fileSpecs...)
+	}
+
+	if len(specs) == 0 {
+		fmt.Fprintf(os.Stderr, "one of -doh, -dot, -udp, or -resolvers-file is required\n")
+		os.Exit(1)
+	}
+
+	// Validate policy.
+	switch resolverPolicy {
+	case "round-robin", "least-ping", "weighted-traffic":
+	default:
+		fmt.Fprintf(os.Stderr, "invalid -resolver-policy %q; must be round-robin, least-ping, or weighted-traffic\n", resolverPolicy)
+		os.Exit(1)
+	}
+
+	// Build endpoints.
+	endpoints := make([]*poolEndpoint, 0, len(specs))
+	for _, spec := range specs {
+		ep, _, err := buildEndpointFromSpec(spec, utlsClientHelloID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error initializing resolver %s %s: %v\n", spec.typ, spec.addr, err)
+			os.Exit(1)
+		}
+		endpoints = append(endpoints, ep)
+	}
+
+	// Pre-start scan: filter to only resolvers that get a valid server response.
+	if doScan {
+		log.Printf("scanning %d resolver(s)...", len(endpoints))
+		passed := scanResolvers(endpoints, domain, 8*time.Second)
+		// Close endpoints that didn't pass.
+		passedSet := make(map[*poolEndpoint]bool, len(passed))
+		for _, ep := range passed {
+			passedSet[ep] = true
+		}
+		for _, ep := range endpoints {
+			if !passedSet[ep] {
+				ep.conn.Close()
+				if ep.probeConn != nil {
+					ep.probeConn.Close()
 				}
 			}
-			pconn, err := NewTLSPacketConn(dotAddr, dialTLSContext)
-			return addr, pconn, err
-		}},
-		// -udp
-		{udpAddr, func(s string) (net.Addr, net.PacketConn, error) {
-			addr, err := net.ResolveUDPAddr("udp", s)
-			if err != nil {
-				return nil, nil, err
-			}
-			lc := net.ListenConfig{
-				Control: dialerControl,
-			}
-			pconn, err := lc.ListenPacket(context.Background(), "udp", ":0")
-			return addr, pconn, err
-		}},
-	} {
-		if opt.s == "" {
-			continue
 		}
-		if pconn != nil {
-			fmt.Fprintf(os.Stderr, "only one of -doh, -dot, and -udp may be given\n")
+		if len(passed) == 0 {
+			fmt.Fprintf(os.Stderr, "no resolvers passed -scan; check your resolver list and that the server is reachable\n")
 			os.Exit(1)
 		}
-		var err error
-		remoteAddr, pconn, err = opt.f(opt.s)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
+		log.Printf("scan: %d/%d resolver(s) passed", len(passed), len(endpoints))
+		endpoints = passed
 	}
-	if pconn == nil {
-		fmt.Fprintf(os.Stderr, "one of -doh, -dot, or -udp is required\n")
-		os.Exit(1)
+
+	// Build the transport pconn.
+	var remoteAddr net.Addr
+	var pconn net.PacketConn
+
+	if len(endpoints) == 1 {
+		// Single resolver: keep current behavior. Close probeConn so the probe
+		// socket is not leaked (pool is not used, so it would never be closed).
+		if endpoints[0].probeConn != nil {
+			endpoints[0].probeConn.Close()
+			endpoints[0].probeConn = nil
+		}
+		pconn = endpoints[0].conn
+		remoteAddr = endpoints[0].addr
+	} else {
+		// Multiple resolvers: wrap in ResolverPool.
+		probeID := turbotunnel.NewClientID()
+		probeBuilder := func() ([]byte, error) { return BuildProbeMessage(domain, probeID) }
+		probeVerify := func(buf []byte) bool { return VerifyProbeResponse(buf, domain) }
+		pool := NewResolverPool(endpoints, resolverPolicy, probeBuilder, probeVerify)
+		pconn = pool
+		remoteAddr = turbotunnel.DummyAddr{}
+		log.Printf("using %d resolver(s) with policy %q", len(endpoints), resolverPolicy)
 	}
 
 	pconn = NewDNSPacketConn(pconn, remoteAddr, domain)
