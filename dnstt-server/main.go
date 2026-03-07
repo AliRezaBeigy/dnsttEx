@@ -51,7 +51,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -498,7 +497,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte, int
 	if !ok {
 		// Not a name we are authoritative for.
 		resp.Flags |= dns.RcodeNameError
-		log.Printf("NXDOMAIN: not authoritative for %s", question.Name)
+		log.Printf("NXDOMAIN: not authoritative for %s (query name not under domain)", question.Name)
 		return resp, nil, effectiveMaxResponse
 	}
 	resp.Flags |= 0x0400 // AA = 1
@@ -512,6 +511,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte, int
 
 	if question.Type != dns.RRTypeTXT {
 		resp.Flags |= dns.RcodeNameError
+		log.Printf("NXDOMAIN: QTYPE not TXT (got %d) for %s", question.Type, question.Name)
 		return resp, nil, effectiveMaxResponse
 	}
 
@@ -534,12 +534,14 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte, int
 		decoded := make([]byte, base36DecodedLen(len(encoded)))
 		if err := base36Decode(decoded, encoded); err != nil {
 			resp.Flags |= dns.RcodeNameError
+			log.Printf("NXDOMAIN: Base36 decode failed for name prefix (user data in query name): %v", err)
 			return resp, nil, effectiveMaxResponse
 		}
 		payload = decoded
 	}
 	if len(payload) < 9 {
 		resp.Flags |= dns.RcodeNameError
+		log.Printf("NXDOMAIN: payload too short (%d bytes, need 9 for ClientID+mode) for %s", len(payload), question.Name)
 		return resp, nil, effectiveMaxResponse
 	}
 
@@ -702,20 +704,9 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			}
 			return err
 		}
-		if os.Getenv("DNSTT_DEBUG") != "" {
-			hexLen := 64
-			if n < hexLen {
-				hexLen = n
-			}
-			log.Printf("[server] received packet %d bytes from %s (before process) hex=%s", n, addr, hex.EncodeToString(buf[:hexLen]))
-		}
-
 		// Got a UDP packet. Try to parse it as a DNS message.
 		query, err := dns.MessageFromWireFormat(buf[:n])
 		if err != nil {
-			if os.Getenv("DNSTT_DEBUG") != "" {
-				log.Printf("[server] parse failed from %s: %v", addr, err)
-			}
 			if fallbackMgr != nil {
 				// Packet is not a valid DNS message, forward it if fallback is configured.
 				fallbackMgr.HandlePacket(buf[:n], addr)
@@ -724,36 +715,8 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			}
 			continue
 		}
-		if os.Getenv("DNSTT_DEBUG") != "" {
-			qname := ""
-			if len(query.Question) > 0 {
-				qname = query.Question[0].Name.String()
-			}
-			hasOPT := false
-			for _, rr := range query.Additional {
-				if rr.Type == dns.RRTypeOPT {
-					hasOPT = true
-					break
-				}
-			}
-			log.Printf("[server] parsed: id=%d qr=%d qdcount=%d qname=%s has_opt=%v wire_size=%d", query.ID, (query.Flags>>15)&1, len(query.Question), qname, hasOPT, n)
-		}
 
 		resp, payload, maxRespSize := responseFor(&query, domain)
-		if os.Getenv("DNSTT_DEBUG") != "" {
-			rcode := uint16(0)
-			if resp != nil {
-				rcode = resp.Rcode()
-			}
-			payloadLen := 0
-			if payload != nil {
-				payloadLen = len(payload)
-			}
-			log.Printf("[server] responseFor: resp_rcode=%d payload_len=%d (need >=8 for tunnel)", rcode, payloadLen)
-			if resp != nil && payloadLen < 8 && len(query.Question) == 1 {
-				log.Printf("[server] no tunnel payload in query (resolver may have stripped EDNS option 0xFF00); send client to NS directly or use DoH/DoT")
-			}
-		}
 		// Extract the ClientID from the payload.
 		var clientID turbotunnel.ClientID
 		n = copy(clientID[:], payload)
@@ -782,6 +745,9 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 						log.Printf("sendLoop channel full, dropping PONG response")
 					}
 				}
+				if pongSize > 0 && os.Getenv("DNSTT_DEBUG") != "" {
+					log.Printf("DNSTT_DEBUG: MTU probe received, will send PONG %d bytes", pongSize)
+				}
 				continue
 			}
 			// Compact framing: first byte 0 = poll; 1–223 = single packet length; 224+ = legacy (padding then [len+packet]*).
@@ -792,31 +758,23 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 				if len(body) >= 1+int(first) {
 					p := body[1 : 1+first]
 					ttConn.QueueIncoming(p, clientID)
-					if os.Getenv("DNSTT_DEBUG") != "" {
-						log.Printf("[server] received payload %d bytes (1 packet, compact) from %s", 8+1+int(first), clientID)
-					}
 				}
 			} else {
 				// Legacy: padding byte + padding bytes + [len+packet]*
 				r := bytes.NewReader(body)
-				nPackets := 0
 				for {
 					p, err := nextPacket(r)
 					if err != nil {
 						break
 					}
-					nPackets++
 					ttConn.QueueIncoming(p, clientID)
-				}
-				if os.Getenv("DNSTT_DEBUG") != "" && (len(body) > 0 || nPackets > 0) {
-					log.Printf("[server] received payload %d bytes (%d packets) from %s", 8+len(body), nPackets, clientID)
 				}
 			}
 		} else {
 			// Payload too short (no full ClientID) or no mode byte (8 bytes only).
 			if resp != nil && resp.Rcode() == dns.RcodeNoError {
 				resp.Flags |= dns.RcodeNameError
-				log.Printf("NXDOMAIN: %d bytes payload (need at least 9 for ClientID+mode)", len(payload))
+				log.Printf("NXDOMAIN: payload too short for ClientID+mode (payload %d bytes) query %s", len(payload), query.Question[0].Name)
 			}
 		}
 		// If a response is called for, pass it to sendLoop via the channel.
@@ -870,10 +828,10 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 			if minimalWireSize > maxSize {
 				// Minimal response (empty payload) already exceeds maxSize; send valid TC=1 (no answer) if it fits.
 				tcResp := &dns.Message{
-					ID:       rec.Resp.ID,
-					Flags:    rec.Resp.Flags | 0x02, // TC = 1
-					Question: rec.Resp.Question,
-					Answer:   nil,
+					ID:         rec.Resp.ID,
+					Flags:      rec.Resp.Flags | 0x02, // TC = 1
+					Question:   rec.Resp.Question,
+					Answer:     nil,
 					Additional: rec.Resp.Additional,
 				}
 				tcBuf, err := tcResp.WireFormat()
@@ -896,12 +854,18 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 						}
 					}
 					rec.Resp.Answer[0].Data = dns.EncodeRDataTXT(make([]byte, pongN))
+					if os.Getenv("DNSTT_DEBUG") != "" {
+						log.Printf("DNSTT_DEBUG: PONG sent requested=%d actual_payload=%d", rec.PongPayloadSize, pongN)
+					}
 				} else {
 					pongEnc := dns.EncodeRDataTXT([]byte("PONG"))
 					if minimalWireSize+len(pongEnc) <= maxSize {
 						rec.Resp.Answer[0].Data = pongEnc
 					} else {
 						rec.Resp.Answer[0].Data = dns.EncodeRDataTXT([]byte{})
+					}
+					if os.Getenv("DNSTT_DEBUG") != "" {
+						log.Printf("DNSTT_DEBUG: PONG sent (health) payload=4 bytes")
 					}
 				}
 			} else {
@@ -963,9 +927,6 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 				timer.Stop()
 
 				rec.Resp.Answer[0].Data = dns.EncodeRDataTXT(payload.Bytes())
-				if os.Getenv("DNSTT_DEBUG") != "" && payload.Len() > 0 {
-					log.Printf("[server] send TXT payload %d bytes to %s", payload.Len(), rec.ClientID)
-				}
 			}
 		}
 

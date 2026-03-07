@@ -51,6 +51,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -63,16 +64,32 @@ import (
 	"syscall"
 	"time"
 
-	utls "github.com/refraction-networking/utls"
-	"dnsttEx/internal/kcp"
-	"github.com/xtaci/smux"
 	"dnsttEx/dns"
+	"dnsttEx/internal/kcp"
 	"dnsttEx/noise"
 	"dnsttEx/turbotunnel"
+
+	utls "github.com/refraction-networking/utls"
+	"github.com/xtaci/smux"
 )
 
 // smux streams will be closed after this much time without receiving data.
 const idleTimeout = 2 * time.Minute
+
+// dnsttDebug returns true when DNSTT_DEBUG is set (for verbose PING/PONG and MTU discovery logs).
+func dnsttDebug() bool { return os.Getenv("DNSTT_DEBUG") != "" }
+
+// dnsttDebugHexDump returns a hex dump of b for DNSTT_DEBUG logs. If len(b) > max, only the first max bytes are shown.
+func dnsttDebugHexDump(b []byte, max int) string {
+	const defaultMax = 512
+	if max <= 0 {
+		max = defaultMax
+	}
+	if len(b) <= max {
+		return hex.Dump(b)
+	}
+	return hex.Dump(b[:max]) + fmt.Sprintf("\t... (%d bytes total)\n", len(b))
+}
 
 // readKeyFromFile reads a key from a named file.
 func readKeyFromFile(filename string) ([]byte, error) {
@@ -193,8 +210,8 @@ func (sm *sessionManager) createSessionUnlocked() (*kcp.UDPSession, io.ReadWrite
 	// Start a smux session on the Noise channel.
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.Version = 2
-	smuxConfig.KeepAliveInterval = 15 * time.Second // send PING every 15s
-	smuxConfig.KeepAliveTimeout = 30 * time.Second  // declare dead after 30s (was 2 min)
+	smuxConfig.KeepAliveInterval = 60 * time.Second // send PING every 15s
+	smuxConfig.KeepAliveTimeout = 300 * time.Second // declare dead after 30s (was 2 min)
 	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024    // default is 65536
 	sess, err := smux.Client(rw, smuxConfig)
 	if err != nil {
@@ -374,7 +391,7 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 	if maxPayloadInName < mtu {
 		mtu = maxPayloadInName
 	}
-	log.Printf("effective MTU %d", mtu)
+	log.Printf("Tunnel MTU: %d bytes (max payload per DNS response)", mtu)
 
 	// Create session manager
 	sm := newSessionManager(pubkey, domain, remoteAddr, pconn, mtu)
@@ -488,7 +505,7 @@ func scanResolvers(endpoints []*poolEndpoint, domain dns.Name, timeout time.Dura
 			// DoH/DoT: no dedicated probe socket; deadlines are no-ops on
 			// QueuePacketConn. Warn and pass through unconditionally.
 			if ep.probeConn == nil {
-				log.Printf("scan: %s (DoH/DoT) cannot be probed; assumed OK", ep.name)
+				log.Printf("Scan: %s (DoH/DoT) cannot probe; assumed OK", ep.name)
 				mu.Lock()
 				passed = append(passed, ep)
 				mu.Unlock()
@@ -498,30 +515,46 @@ func scanResolvers(endpoints []*poolEndpoint, domain dns.Name, timeout time.Dura
 			// UDP: use the dedicated probe socket.
 			msg, err := probeBuilder()
 			if err != nil {
-				log.Printf("scan: build probe for %s: %v", ep.name, err)
+				log.Printf("Scan: %s — PING build failed: %v", ep.name, err)
 				return
 			}
 			ep.probeConn.SetDeadline(time.Now().Add(timeout))
 			_, err = ep.probeConn.WriteTo(msg, ep.addr)
 			if err != nil {
 				ep.probeConn.SetDeadline(time.Time{})
-				log.Printf("scan: %s write error: %v", ep.name, err)
+				log.Printf("Scan: %s — PING send failed: %v", ep.name, err)
 				return
+			}
+			log.Printf("Scan: %s ← PING sent", ep.name)
+			if dnsttDebug() {
+				log.Printf("DNSTT_DEBUG: PING to %s (health probe, no requested payload size)", ep.name)
+				log.Printf("DNSTT_DEBUG: PING query (hex):\n%s", dnsttDebugHexDump(msg, 0))
 			}
 			buf := make([]byte, 4096)
 			n, _, err := ep.probeConn.ReadFrom(buf)
 			ep.probeConn.SetDeadline(time.Time{})
 			if err != nil {
-				log.Printf("scan: %s no response: %v", ep.name, err)
+				log.Printf("Scan: %s — no PONG (timeout or error: %v)", ep.name, err)
 				return
 			}
+			if dnsttDebug() {
+				log.Printf("DNSTT_DEBUG: PONG response (hex):\n%s", dnsttDebugHexDump(buf[:n], 0))
+			}
 			if probeVerify(buf[:n]) {
-				log.Printf("scan: %s OK", ep.name)
+				payloadLen := 0
+				if resp, err := dns.MessageFromWireFormat(buf[:n]); err == nil {
+					payload := dnsResponsePayload(&resp, domain)
+					payloadLen = len(payload)
+				}
+				log.Printf("Scan: %s → PONG received (%d bytes)", ep.name, payloadLen)
+				if dnsttDebug() {
+					log.Printf("DNSTT_DEBUG: PONG from %s payload %d bytes (health probe)", ep.name, payloadLen)
+				}
 				mu.Lock()
 				passed = append(passed, ep) // Fix #3: use ep, not endpoints[i]
 				mu.Unlock()
 			} else {
-				log.Printf("scan: %s bad response: %s", ep.name, ExplainProbeResponseFailure(buf[:n], domain))
+				log.Printf("Scan: %s → bad response: %s", ep.name, ExplainProbeResponseFailure(buf[:n], domain))
 			}
 		}()
 	}
@@ -538,10 +571,16 @@ func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration) {
 	}
 	probeID := turbotunnel.NewClientID()
 
-	// Server MTU: increase response size until no answer.
-	serverSizes := []int{512, 1024, 1232, 1452, 2048, 4096}
+	// Server MTU: how big a response can the path deliver? (server→client)
+	serverSizes := []int{256, 512, 1024, 1232, 1452, 2048, 4096}
 	serverMTU := 0
+	if dnsttDebug() {
+		log.Printf("DNSTT_DEBUG: MTU phase 1 %s: testing max response size (server→client)", ep.name)
+	}
 	for _, size := range serverSizes {
+		if dnsttDebug() {
+			log.Printf("DNSTT_DEBUG: MTU probe %s: testing response size %d (requested from server)", ep.name, size)
+		}
 		msg, err := BuildMTUProbeMessage(domain, probeID, size)
 		if err != nil {
 			continue
@@ -552,13 +591,33 @@ func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration) {
 			ep.probeConn.SetDeadline(time.Time{})
 			break
 		}
+		if dnsttDebug() {
+			log.Printf("DNSTT_DEBUG: MTU probe %s: testing response size %d, PING query (hex):\n%s", ep.name, size, dnsttDebugHexDump(msg, 0))
+		}
 		buf := make([]byte, 4096)
 		n, _, err := ep.probeConn.ReadFrom(buf)
 		ep.probeConn.SetDeadline(time.Time{})
+		responseLen := 0
+		if err == nil {
+			if resp, parseErr := dns.MessageFromWireFormat(buf[:n]); parseErr == nil {
+				if p := dnsResponsePayload(&resp, domain); p != nil {
+					responseLen = len(p)
+				}
+			}
+		}
+		ok := err == nil && VerifyMTUProbeResponse(buf[:n], domain, size)
+		if dnsttDebug() {
+			if err != nil {
+				log.Printf("DNSTT_DEBUG: MTU probe %s: response error (requested %d): %v", ep.name, size, err)
+			} else {
+				log.Printf("DNSTT_DEBUG: MTU probe %s: response payload %d bytes (requested %d), ok=%v", ep.name, responseLen, size, ok)
+				log.Printf("DNSTT_DEBUG: MTU probe %s: testing response size %d, PONG response (hex):\n%s", ep.name, size, dnsttDebugHexDump(buf[:n], 0))
+			}
+		}
 		if err != nil {
 			break
 		}
-		if VerifyMTUProbeResponse(buf[:n], domain, size) {
+		if ok {
 			serverMTU = size
 		} else {
 			break
@@ -568,10 +627,18 @@ func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration) {
 		serverMTU = 512 // safe default
 	}
 
-	// Client MTU: increase request size until no PONG answer.
-	clientSizes := []int{512, 768, 1024, 1280, 1500, 2048, 2500, 3000, 4096}
+	// Client MTU: how big can our query be and still get a PONG? (Independent of response size—
+	// many paths allow larger requests but truncate responses, so we probe both.)
+	// DNS limits the question name to 255 octets, so max query wire size is ~282; we only probe up to that.
+	clientSizes := []int{64, 128, 192, 256, 280}
 	clientMTU := 0
+	if dnsttDebug() {
+		log.Printf("DNSTT_DEBUG: MTU phase 2 %s: testing max request (query) size (client→server)", ep.name)
+	}
 	for _, size := range clientSizes {
+		if dnsttDebug() {
+			log.Printf("DNSTT_DEBUG: MTU probe %s: testing request size %d bytes (client→server)", ep.name, size)
+		}
 		msg, err := BuildProbeMessageWithRequestSize(domain, probeID, size)
 		if err != nil {
 			continue
@@ -582,13 +649,33 @@ func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration) {
 			ep.probeConn.SetDeadline(time.Time{})
 			break
 		}
+		if dnsttDebug() {
+			log.Printf("DNSTT_DEBUG: MTU probe %s: testing request size %d bytes, PING query (hex):\n%s", ep.name, size, dnsttDebugHexDump(msg, 0))
+		}
 		buf := make([]byte, 4096)
 		n, _, err := ep.probeConn.ReadFrom(buf)
 		ep.probeConn.SetDeadline(time.Time{})
+		responseLen := 0
+		if err == nil {
+			if resp, parseErr := dns.MessageFromWireFormat(buf[:n]); parseErr == nil {
+				if p := dnsResponsePayload(&resp, domain); p != nil {
+					responseLen = len(p)
+				}
+			}
+		}
+		ok := err == nil && VerifyProbeResponse(buf[:n], domain)
+		if dnsttDebug() {
+			if err != nil {
+				log.Printf("DNSTT_DEBUG: MTU probe %s: response error (request size %d): %v", ep.name, size, err)
+			} else {
+				log.Printf("DNSTT_DEBUG: MTU probe %s: response payload %d bytes (request size %d), PONG ok=%v", ep.name, responseLen, size, ok)
+				log.Printf("DNSTT_DEBUG: MTU probe %s: testing request size %d bytes, PONG response (hex):\n%s", ep.name, size, dnsttDebugHexDump(buf[:n], 0))
+			}
+		}
 		if err != nil {
 			break
 		}
-		if VerifyProbeResponse(buf[:n], domain) {
+		if ok {
 			clientMTU = size
 		} else {
 			break
@@ -599,7 +686,7 @@ func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration) {
 	}
 
 	ep.setMaxSizes(serverMTU, clientMTU)
-	log.Printf("MTU discovery %s: server=%d client=%d", ep.name, serverMTU, clientMTU)
+	log.Printf("MTU discovery: %s → max response %d bytes, max request %d bytes", ep.name, serverMTU, clientMTU)
 }
 
 func main() {
@@ -853,7 +940,7 @@ Known TLS fingerprints for -utls are:
 
 	// Pre-start scan: filter to only resolvers that get a valid server response.
 	if doScan {
-		log.Printf("scanning %d resolver(s)...", len(endpoints))
+		log.Printf("Scan: sending PING to %d resolver(s) (check server reachability)", len(endpoints))
 		passed := scanResolvers(endpoints, domain, 8*time.Second)
 		// Close endpoints that didn't pass.
 		passedSet := make(map[*poolEndpoint]bool, len(passed))
@@ -872,7 +959,7 @@ Known TLS fingerprints for -utls are:
 			fmt.Fprintf(os.Stderr, "no resolvers passed -scan; check your resolver list and that the server is reachable\n")
 			os.Exit(1)
 		}
-		log.Printf("scan: %d/%d resolver(s) passed", len(passed), len(endpoints))
+		log.Printf("Scan: %d/%d resolver(s) responded with PONG", len(passed), len(endpoints))
 		endpoints = passed
 	}
 
@@ -908,7 +995,7 @@ Known TLS fingerprints for -utls are:
 		pconn = pool
 		remoteAddr = turbotunnel.DummyAddr{}
 		effectiveMaxResponse = pool.MinMaxResponseSize(4096)
-		log.Printf("using %d resolver(s) with policy %q", len(endpoints), resolverPolicy)
+		log.Printf("Using %d resolver(s), policy: %q", len(endpoints), resolverPolicy)
 	}
 	if clientMTUFlag > 0 && (effectiveMaxResponse <= 0 || clientMTUFlag < effectiveMaxResponse) {
 		effectiveMaxResponse = clientMTUFlag
