@@ -422,7 +422,8 @@ func (f *stringSliceFlag) Set(value string) error {
 }
 
 // parseResolversFile parses a resolvers file and appends to specs.
-// Format: one resolver per line, prefix doh:, dot:, or udp:.
+// Format: one resolver per line, prefix doh:, dot:, or udp:. A bare IP or
+// hostname with no prefix is treated as udp:host:53.
 // Lines starting with # and blank lines are ignored.
 func parseResolversFile(path string) ([]resolverSpec, error) {
 	f, err := os.Open(path)
@@ -439,11 +440,15 @@ func parseResolversFile(path string) ([]resolverSpec, error) {
 			continue
 		}
 		idx := strings.Index(line, ":")
+		var typ, addr string
 		if idx < 0 {
-			return nil, fmt.Errorf("resolver file: invalid line %q (expected doh:..., dot:..., or udp:...)", line)
+			// Bare IP or hostname: treat as UDP on port 53
+			typ = "udp"
+			addr = line + ":53"
+		} else {
+			typ = strings.ToLower(line[:idx])
+			addr = line[idx+1:]
 		}
-		typ := strings.ToLower(line[:idx])
-		addr := line[idx+1:]
 		switch typ {
 		case "doh", "dot", "udp":
 		default:
@@ -664,7 +669,7 @@ Known TLS fingerprints for -utls are:
 	flag.Var(&dohURLs, "doh", "URL of DoH resolver (may be repeated)")
 	flag.Var(&dotAddrs, "dot", "address of DoT resolver (may be repeated)")
 	flag.Var(&udpAddrs, "udp", "address of UDP DNS resolver (may be repeated)")
-	flag.Var(&resolverFiles, "resolvers-file", "file with one resolver per line (doh:URL, dot:host:port, udp:host:port); may be repeated")
+	flag.Var(&resolverFiles, "resolvers-file", "file with one resolver per line (doh:URL, dot:host:port, udp:host:port, or bare IP/host as udp:53); may be repeated")
 	flag.StringVar(&pubkeyString, "pubkey", "", fmt.Sprintf("server public key (%d hex digits)", noise.KeyLen*2))
 	flag.StringVar(&pubkeyFilename, "pubkey-file", "", "read server public key from file")
 	flag.StringVar(&utlsDistribution, "utls",

@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,6 +27,14 @@ const (
 	// ~16 MB queued, well within practical limits.
 	recvChCap = 4096
 )
+
+// testHookHealthCheckInterval, when non-zero, overrides healthCheckInterval in
+// healthLoop so integration tests can run without waiting 15s per tick.
+var testHookHealthCheckInterval time.Duration
+
+// testHookHealthCheckTimeout, when non-zero, overrides healthCheckTimeout in
+// probeEndpoint so integration tests can fail fast on unresponsive resolvers.
+var testHookHealthCheckTimeout time.Duration
 
 // resolverSpec holds a parsed resolver from flags or file.
 type resolverSpec struct {
@@ -146,6 +155,8 @@ func NewResolverPool(endpoints []*poolEndpoint, policy string, probeBuilder func
 	// Start health checker.
 	go rp.healthLoop(probeBuilder, probeVerify)
 
+	// Log initial pool status (all healthy at start).
+	rp.logPoolStatus()
 	return rp
 }
 
@@ -176,7 +187,11 @@ func (rp *ResolverPool) readLoop(idx int, ep *poolEndpoint) {
 }
 
 func (rp *ResolverPool) healthLoop(probeBuilder func() ([]byte, error), probeVerify func([]byte) bool) {
-	ticker := time.NewTicker(healthCheckInterval)
+	interval := healthCheckInterval
+	if testHookHealthCheckInterval != 0 {
+		interval = testHookHealthCheckInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -201,7 +216,82 @@ func (rp *ResolverPool) healthLoop(probeBuilder func() ([]byte, error), probeVer
 			}()
 		}
 		wg.Wait()
+		rp.logPoolStatus()
 	}
+}
+
+// logPoolStatus logs a one-line summary of pool health and current selection.
+func (rp *ResolverPool) logPoolStatus() {
+	type epSnap struct {
+		ep      *poolEndpoint
+		healthy bool
+		ranked  bool
+		rtt     time.Duration
+		bytes   uint64
+	}
+	snaps := make([]epSnap, len(rp.endpoints))
+	for i, e := range rp.endpoints {
+		h, r, rtt := e.snapshot()
+		snaps[i] = epSnap{ep: e, healthy: h, ranked: r, rtt: rtt, bytes: e.bytesPassed.Load()}
+	}
+	var healthyNames, unhealthyNames []string
+	var candidates []epSnap
+	for _, s := range snaps {
+		if s.healthy {
+			healthyNames = append(healthyNames, s.ep.name)
+			candidates = append(candidates, s)
+		} else {
+			unhealthyNames = append(unhealthyNames, s.ep.name)
+		}
+	}
+	nHealthy := len(healthyNames)
+	total := len(rp.endpoints)
+	var selected string
+	if nHealthy == 0 {
+		selected = "none (all unhealthy, not sending to avoid network burst)"
+	} else {
+		switch rp.policy {
+		case "least-ping":
+			var unranked []epSnap
+			for _, s := range candidates {
+				if !s.ranked {
+					unranked = append(unranked, s)
+				}
+			}
+			if len(unranked) > 0 {
+				selected = unranked[0].ep.name + " (unranked, round-robin)"
+			} else {
+				best := candidates[0]
+				for _, s := range candidates[1:] {
+					if s.rtt < best.rtt {
+						best = s
+					}
+				}
+				selected = fmt.Sprintf("%s (rtt=%v)", best.ep.name, best.rtt)
+			}
+		case "weighted-traffic":
+			var totalB uint64
+			for _, s := range candidates {
+				totalB += s.bytes
+			}
+			if totalB == 0 {
+				selected = candidates[0].ep.name + " (round-robin until traffic)"
+			} else {
+				selected = fmt.Sprintf("%s (weighted)", candidates[0].ep.name)
+			}
+		default:
+			selected = fmt.Sprintf("%s (round-robin)", candidates[0].ep.name)
+		}
+	}
+	msg := fmt.Sprintf("resolver pool: %d/%d healthy", nHealthy, total)
+	if nHealthy > 0 {
+		msg += " — " + strings.Join(healthyNames, ", ")
+	}
+	if len(unhealthyNames) > 0 {
+		msg += "; unhealthy: " + strings.Join(unhealthyNames, ", ")
+	}
+	msg += "; selected: " + selected
+	log.Printf("resolverpool: %s", msg)
 }
 
 // probeEndpoint sends one probe on ep.probeConn (a dedicated UDP socket,
@@ -212,7 +302,11 @@ func (rp *ResolverPool) probeEndpoint(ep *poolEndpoint, probeBuilder func() ([]b
 		return
 	}
 
-	deadline := time.Now().Add(healthCheckTimeout)
+	timeout := healthCheckTimeout
+	if testHookHealthCheckTimeout != 0 {
+		timeout = testHookHealthCheckTimeout
+	}
+	deadline := time.Now().Add(timeout)
 	start := time.Now()
 
 	ep.probeConn.SetDeadline(deadline)
@@ -264,15 +358,13 @@ func (rp *ResolverPool) pickEndpoint() *poolEndpoint {
 		snaps[i] = epSnap{ep: e, healthy: h, ranked: r, rtt: rtt, bytes: e.bytesPassed.Load()}
 	}
 
-	// Build candidate list: prefer healthy, fall back to all.
+	// Build candidate list: only healthy endpoints. When none are healthy,
+	// return nil so we don't send to dead resolvers and burst the network.
 	candidates := snaps[:0:0]
 	for _, s := range snaps {
 		if s.healthy {
 			candidates = append(candidates, s)
 		}
-	}
-	if len(candidates) == 0 {
-		candidates = snaps
 	}
 	if len(candidates) == 0 {
 		return nil

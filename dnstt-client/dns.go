@@ -311,11 +311,16 @@ func chunks(p []byte, n int) [][]byte {
 
 // buildUpstreamPayload builds raw payload with compact framing:
 //   - ClientID(8) + mode byte. Mode: 0 = poll (no data); 1–223 = single packet of that length; 224+ = legacy (224+nPad, nPad bytes, then [1-byte len + packet]*).
+//   For poll (no data), random bytes are appended so each query name differs (avoids DNS/resolver cache).
 func (c *DNSPacketConn) buildUpstreamPayload(packets [][]byte) []byte {
 	var buf bytes.Buffer
 	buf.Write(c.clientID[:])
 	if len(packets) == 0 {
 		buf.WriteByte(0) // poll: no data
+		noise := make([]byte, probeNoiseLen)
+		if _, err := rand.Read(noise); err == nil {
+			buf.Write(noise)
+		}
 		return buf.Bytes()
 	}
 	if len(packets) == 1 && len(packets[0]) >= 1 && len(packets[0]) < 224 {
@@ -396,13 +401,21 @@ const (
 	probeModePING = 0xFF // health-check PING; server must respond with PONG
 )
 
+// probeNoiseLen is the number of random bytes appended to each PING to avoid
+// DNS/resolver cache (query name changes every time).
+const probeNoiseLen = 6
+
 // BuildProbeMessage builds a minimal DNS message for health check: client sends
 // PING (mode 0xFF), server responds with PONG. Used by the health checker and -scan.
+// Random bytes are appended after PING so each probe has a unique query name (cache bust).
 func BuildProbeMessage(domain dns.Name, clientID turbotunnel.ClientID) ([]byte, error) {
-	// Payload: clientID(8) + mode byte PING.
-	raw := make([]byte, 9)
+	// Payload: clientID(8) + mode byte PING + random noise (cache bust).
+	raw := make([]byte, 9+probeNoiseLen)
 	copy(raw, clientID[:])
 	raw[8] = probeModePING
+	if _, err := rand.Read(raw[9:]); err != nil {
+		return nil, err
+	}
 	encoded := make([]byte, base36EncodedLen(len(raw)))
 	base36Encode(encoded, raw)
 	labels := chunks(encoded, maxLabelLen)

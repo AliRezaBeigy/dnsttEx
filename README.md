@@ -8,6 +8,7 @@ This fork adds the following on top of upstream dnstt (after commit ae95dda):
 - **DNS encoding** — Name-based encoding with more room in the 253-octet name; Base36 and compacter framing.
 - **Reliability** — Deadlock fix, smux keepalive and Poller backoff fixes, automatic session reconnection (upstream).
 - **Multi-resolver pool** — Client accepts multiple `-doh`/`-dot`/`-udp` flags and/or a `-resolvers-file`. Resolvers are multiplexed via a `ResolverPool` with three selection policies: `round-robin`, `least-ping`, and `weighted-traffic`. A background health checker probes UDP endpoints every 15 s and tracks RTT; unhealthy endpoints are skipped with automatic fallback. Use `-scan` to filter the list to only resolvers that reach the server before starting.
+- **Cache bust** — Idle poll queries include random bytes in the DNS name so each query is unique; resolvers and DNS caches cannot return stale responses.
 
 See [CHANGELOG.md](CHANGELOG.md) for version history and details.
 
@@ -46,7 +47,7 @@ tunnel-client$ ./dnstt-client \
 ### Resolver file (`-resolvers-file`)
 
 One resolver per line. Lines starting with `#` and blank lines are ignored.
-Supported prefixes: `doh:`, `dot:`, `udp:`.
+Supported prefixes: `doh:`, `dot:`, `udp:`. A bare IP or hostname (no prefix) is treated as `udp:host:53`.
 
 ```
 # resolvers.txt

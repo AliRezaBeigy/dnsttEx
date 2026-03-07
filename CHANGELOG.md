@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-03-07
+
+### Added
+
+- **Resolver file: bare IP/host** — lines in `-resolvers-file` that are a plain IP or hostname are now accepted and treated as `udp:host:53`.
+- **Probe and poll cache bust** — health-check PING and idle poll queries now include random bytes in the payload so each query has a unique DNS name, avoiding stale responses from resolver or DNS cache.
+- **Resolver pool integration tests** — tests for probe round-trip (PONG response) and for the health checker marking unresponsive resolvers unhealthy so the pool keeps using only healthy ones.
+- **Resolver pool status logging** — the client logs a one-line summary to the console after each health check (and at startup): how many resolvers are healthy, which are unhealthy, and which resolver is currently selected (including RTT for `least-ping`). When all are unhealthy it logs that no traffic is being sent to avoid network burst.
+
+### Changed
+
+- **No traffic when all resolvers unhealthy** — when every resolver in the pool is unhealthy, the pool no longer falls back to sending to the full list. It sends nothing so the network is not burst with traffic to unresponsive resolvers; send failures trigger the existing backoff and status log shows "selected: none (all unhealthy, not sending to avoid network burst)".
+
 ## [1.1.0] - 2026-03-07
 
 ### Added
@@ -43,6 +56,7 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/AliRezaBeigy/dnsttEx/releases/tag/v1.0.0
