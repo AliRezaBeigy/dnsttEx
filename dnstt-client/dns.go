@@ -41,6 +41,12 @@ const (
 	// Consecutive send errors before we back off poll rate (resolver rate limiting).
 	rateLimitBackoffThreshold  = 3
 	rateLimitBackoffMultiplier = 2.0
+
+	// handshakeCompressMaxSends: for the first this many sends that contain data,
+	// we try to compress the payload (KCP/Noise/smux handshake burst). 0 = disabled.
+	handshakeCompressMaxSends = 256
+	compressedModeByte        = 0xFE // mode byte meaning "body is flate-compressed"
+	maxDecompressedBody       = 65535
 )
 
 // Base36 uses 0-9a-v (32 of 36 symbols); 5 bits/symbol so expansion = 8/5, same as Base32.
@@ -117,6 +123,8 @@ type DNSPacketConn struct {
 	// Sending on pollChan permits sendLoop to send an empty polling query.
 	// sendLoop also does its own polling according to a time schedule.
 	pollChan chan struct{}
+	// handshakeSendsRemain: number of data sends left for which we try compression (atomic).
+	handshakeSendsRemain int32
 	// QueuePacketConn is the direct receiver of ReadFrom and WriteTo calls.
 	// recvLoop and sendLoop take the messages out of the receive and send
 	// queues and actually put them on the network.
@@ -134,12 +142,13 @@ func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name, 
 	// Generate a new random ClientID.
 	clientID := turbotunnel.NewClientID()
 	c := &DNSPacketConn{
-		clientID:        clientID,
-		domain:          domain,
-		maxResponseSize: maxResponseSize,
-		maxRequestSize:  maxRequestSize,
-		pollChan:        make(chan struct{}, pollLimit),
-		QueuePacketConn: turbotunnel.NewQueuePacketConn(clientID, 0),
+		clientID:              clientID,
+		domain:                domain,
+		maxResponseSize:       maxResponseSize,
+		maxRequestSize:        maxRequestSize,
+		pollChan:              make(chan struct{}, pollLimit),
+		handshakeSendsRemain:  handshakeCompressMaxSends,
+		QueuePacketConn:       turbotunnel.NewQueuePacketConn(clientID, 0),
 	}
 	go func() {
 		err := c.recvLoop(transport)
@@ -437,6 +446,36 @@ func (c *DNSPacketConn) buildUpstreamPayload(packets [][]byte) []byte {
 	return buf.Bytes()
 }
 
+// compressHandshakeBody flate-compresses body and returns clientID(8) + 0xFE + uint16(len(body)) + compressed,
+// or nil if compression is not beneficial or fails. Caller must ensure len(body) <= maxDecompressedBody.
+func (c *DNSPacketConn) compressHandshakeBody(body []byte) []byte {
+	if len(body) == 0 || len(body) > maxDecompressedBody {
+		return nil
+	}
+	var compressed bytes.Buffer
+	w, err := flate.NewWriter(&compressed, flate.BestSpeed)
+	if err != nil {
+		return nil
+	}
+	if _, err := w.Write(body); err != nil {
+		w.Close()
+		return nil
+	}
+	if err := w.Close(); err != nil {
+		return nil
+	}
+	// Only use if smaller: 8 + 1 + 2 + len(compressed) < 8 + len(body) => 3 + len(compressed) < len(body)
+	if 3+compressed.Len() >= len(body) {
+		return nil
+	}
+	out := make([]byte, 8+1+2+compressed.Len())
+	copy(out, c.clientID[:])
+	out[8] = compressedModeByte
+	binary.BigEndian.PutUint16(out[9:11], uint16(len(body)))
+	copy(out[11:], compressed.Bytes())
+	return out
+}
+
 // send encodes payload in the question name (Base36, 0-9a-v) for public resolvers; no EDNS.
 // When maxRespOverride > 0 or maxReqOverride > 0 (e.g. from ResolverPool.NextSendMTU), this
 // send uses that resolver's MTU: OPT Class = maxRespOverride, payload capped by maxReqOverride.
@@ -455,6 +494,16 @@ func (c *DNSPacketConn) send(transport net.PacketConn, packets [][]byte, addr ne
 	if len(decoded) > capacity && len(packets) == 1 {
 		c.QueuePacketConn.Stash(packets[0], addr)
 		decoded = c.buildUpstreamPayload(nil)
+	}
+	// Optionally use compressed form for handshake-phase data sends.
+	if len(packets) > 0 && atomic.LoadInt32(&c.handshakeSendsRemain) > 0 {
+		if len(decoded) > 8 {
+			body := decoded[8:]
+			if compressed := c.compressHandshakeBody(body); compressed != nil && len(compressed) <= capacity {
+				decoded = compressed
+				atomic.AddInt32(&c.handshakeSendsRemain, -1)
+			}
+		}
 	}
 	buf, err := c.buildQueryWire(decoded, maxRespOverride)
 	if err != nil {
