@@ -111,6 +111,7 @@ type DNSPacketConn struct {
 	clientID        turbotunnel.ClientID
 	domain          dns.Name
 	maxResponseSize int // max UDP response size to request (OPT Class); 0 = 4096
+	maxRequestSize  int // max request (query) wire size from MTU discovery; 0 = use nameCapacity only
 	// Sending on pollChan permits sendLoop to send an empty polling query.
 	// sendLoop also does its own polling according to a time schedule.
 	pollChan chan struct{}
@@ -125,13 +126,16 @@ type DNSPacketConn struct {
 // messages encoded by DNSPacketConn. addr is the address to be passed to
 // transport.WriteTo whenever a message needs to be sent. maxResponseSize is the
 // max response size to request from the server (OPT Class); 0 means 4096.
-func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name, maxResponseSize int) *DNSPacketConn {
+// maxRequestSize is the max request (query) wire size from MTU discovery; 0
+// means use nameCapacity only (no MTU-based limit).
+func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name, maxResponseSize, maxRequestSize int) *DNSPacketConn {
 	// Generate a new random ClientID.
 	clientID := turbotunnel.NewClientID()
 	c := &DNSPacketConn{
 		clientID:        clientID,
 		domain:          domain,
 		maxResponseSize: maxResponseSize,
+		maxRequestSize:  maxRequestSize,
 		pollChan:        make(chan struct{}, pollLimit),
 		QueuePacketConn: turbotunnel.NewQueuePacketConn(clientID, 0),
 	}
@@ -324,6 +328,80 @@ func chunks(p []byte, n int) [][]byte {
 	return out
 }
 
+// buildQueryWire builds the DNS query wire bytes from decoded upstream payload.
+// optMaxResp: when > 0, use as OPT Class (max response size for server); when 0, use c.maxResponseSize.
+func (c *DNSPacketConn) buildQueryWire(decoded []byte, optMaxResp int) ([]byte, error) {
+	encoded := make([]byte, base36EncodedLen(len(decoded)))
+	base36Encode(encoded, decoded)
+	labels := chunks(encoded, maxLabelLen)
+	labels = append(labels, c.domain...)
+	name, err := dns.NewName(labels)
+	if err != nil {
+		return nil, err
+	}
+	optClass := uint16(4096)
+	if optMaxResp > 0 {
+		optClass = uint16(optMaxResp)
+	} else if c.maxResponseSize > 0 {
+		optClass = uint16(c.maxResponseSize)
+	}
+	if optClass > 0 && optClass < 512 {
+		optClass = 512
+	}
+	query := &dns.Message{
+		ID:    0,
+		Flags: 0x0100,
+		Question: []dns.Question{
+			{Name: name, Type: dns.RRTypeTXT, Class: dns.ClassIN},
+		},
+		Additional: []dns.RR{
+			{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: optClass, TTL: 0, Data: []byte{}},
+		},
+	}
+	return query.WireFormat()
+}
+
+// maxDecodedPayloadForMaxWire returns the maximum decoded payload length that
+// fits in a query whose wire size is at most maxWire. Used when maxRequestSize
+// (client MTU) is set so we don't send requests larger than the path allows.
+func (c *DNSPacketConn) maxDecodedPayloadForMaxWire(maxWire int) int {
+	if maxWire <= 0 {
+		return nameCapacity(c.domain)
+	}
+	capByName := nameCapacity(c.domain)
+	// Binary search for largest decoded length that fits.
+	lo, hi := 0, capByName+1
+	for lo+1 < hi {
+		mid := (lo + hi) / 2
+		dummy := make([]byte, mid)
+		wire, err := c.buildQueryWire(dummy, 0)
+		if err != nil {
+			hi = mid
+			continue
+		}
+		if len(wire) <= maxWire {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	return lo
+}
+
+// effectiveSendCapacity returns the max decoded payload length we may send in
+// one query: min(nameCapacity, max decoded that fits in maxRequestSize when set).
+func (c *DNSPacketConn) effectiveSendCapacity() int {
+	capByName := nameCapacity(c.domain)
+	if c.maxRequestSize <= 0 {
+		return capByName
+	}
+	capByMTU := c.maxDecodedPayloadForMaxWire(c.maxRequestSize)
+	if capByMTU < capByName {
+		return capByMTU
+	}
+	return capByName
+}
+
 // buildUpstreamPayload builds raw payload with compact framing:
 //   - ClientID(8) + mode byte. Mode: 0 = poll (no data); 1–223 = single packet of that length; 224+ = legacy (224+nPad, nPad bytes, then [1-byte len + packet]*).
 //     For poll (no data), random bytes are appended so each query name differs (avoids DNS/resolver cache).
@@ -358,8 +436,13 @@ func (c *DNSPacketConn) buildUpstreamPayload(packets [][]byte) []byte {
 }
 
 // send encodes payload in the question name (Base36, 0-9a-v) for public resolvers; no EDNS.
-func (c *DNSPacketConn) send(transport net.PacketConn, packets [][]byte, addr net.Addr) error {
-	capacity := nameCapacity(c.domain)
+// When maxRespOverride > 0 or maxReqOverride > 0 (e.g. from ResolverPool.NextSendMTU), this
+// send uses that resolver's MTU: OPT Class = maxRespOverride, payload capped by maxReqOverride.
+func (c *DNSPacketConn) send(transport net.PacketConn, packets [][]byte, addr net.Addr, maxRespOverride, maxReqOverride int) error {
+	capacity := c.effectiveSendCapacity()
+	if maxReqOverride > 0 {
+		capacity = c.maxDecodedPayloadForMaxWire(maxReqOverride)
+	}
 	decoded := c.buildUpstreamPayload(packets)
 	for len(decoded) > capacity && len(packets) > 1 {
 		// Stash last packet and try again with fewer.
@@ -371,37 +454,13 @@ func (c *DNSPacketConn) send(transport net.PacketConn, packets [][]byte, addr ne
 		c.QueuePacketConn.Stash(packets[0], addr)
 		decoded = c.buildUpstreamPayload(nil)
 	}
-	encoded := make([]byte, base36EncodedLen(len(decoded)))
-	base36Encode(encoded, decoded)
-	// Server decodes case-insensitively for QNAME randomization
-	labels := chunks(encoded, maxLabelLen)
-	labels = append(labels, c.domain...)
-	name, err := dns.NewName(labels)
+	buf, err := c.buildQueryWire(decoded, maxRespOverride)
 	if err != nil {
 		return err
 	}
-	var id uint16
-	binary.Read(rand.Reader, binary.BigEndian, &id)
-	optClass := uint16(4096)
-	if c.maxResponseSize > 0 {
-		optClass = uint16(c.maxResponseSize)
-		if optClass < 512 {
-			optClass = 512
-		}
-	}
-	query := &dns.Message{
-		ID:    id,
-		Flags: 0x0100,
-		Question: []dns.Question{
-			{Name: name, Type: dns.RRTypeTXT, Class: dns.ClassIN},
-		},
-		Additional: []dns.RR{
-			{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: optClass, TTL: 0, Data: []byte{}},
-		},
-	}
-	buf, err := query.WireFormat()
-	if err != nil {
-		return err
+	// Assign random ID for this query (buildQueryWire uses 0).
+	if len(buf) >= 2 {
+		rand.Read(buf[0:2])
 	}
 	_, err = transport.WriteTo(buf, addr)
 	return err
@@ -606,7 +665,8 @@ func ExplainProbeResponseFailure(buf []byte, domain dns.Name) string {
 	return ""
 }
 
-// sendLoop batches packets into the question name (limited by nameCapacity). Also sends polling queries when idle.
+// sendLoop batches packets into the question name (limited by effectiveSendCapacity or,
+// when using ResolverPool, by the next resolver's MTU). Also sends polling queries when idle.
 // Poll timing can be overridden with DNSTT_POLL_INIT_MS and DNSTT_POLL_MAX_MS (e.g. 500/2000 for conservative resolvers).
 func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error {
 	initPoll, maxPoll := initPollDelay, maxPollDelay
@@ -622,14 +682,23 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 	}
 	pollDelay := initPoll
 	pollTimer := time.NewTimer(pollDelay)
-	capacity := nameCapacity(c.domain)
-	overhead := 8 + 1 + numPadding
-	payloadLimit := capacity - overhead
-	if payloadLimit < 0 {
-		payloadLimit = 0
-	}
 	var sendFailures int
 	for {
+		// Per-send MTU: when using ResolverPool, use the next resolver's limits so the server gets the right response size and we don't exceed that resolver's request MTU.
+		var maxRespOverride, maxReqOverride int
+		capacity := c.effectiveSendCapacity()
+		if pool, ok := transport.(*ResolverPool); ok {
+			maxRespOverride, maxReqOverride = pool.NextSendMTU()
+			if maxReqOverride > 0 {
+				capacity = c.maxDecodedPayloadForMaxWire(maxReqOverride)
+			}
+		}
+		overhead := 8 + 1 + numPadding
+		payloadLimit := capacity - overhead
+		if payloadLimit < 0 {
+			payloadLimit = 0
+		}
+
 		var packets [][]byte
 		outgoing := c.QueuePacketConn.OutgoingQueue(addr)
 		unstash := c.QueuePacketConn.Unstash(addr)
@@ -698,7 +767,7 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 		}
 		pollTimer.Reset(pollDelay)
 
-		if err := c.send(transport, packets, addr); err != nil {
+		if err := c.send(transport, packets, addr, maxRespOverride, maxReqOverride); err != nil {
 			sendFailures++
 			if sendFailures >= rateLimitBackoffThreshold {
 				pollDelay = time.Duration(float64(pollDelay) * rateLimitBackoffMultiplier)

@@ -33,7 +33,7 @@ func TestSessionManagerNoDeadlock(t *testing.T) {
 
 	remoteAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:1")
 	domain, _ := dns.ParseName("t.test.invalid")
-	dnsConn := NewDNSPacketConn(pconn, remoteAddr, domain, 0)
+	dnsConn := NewDNSPacketConn(pconn, remoteAddr, domain, 0, 0)
 
 	privkey, err := noise.GeneratePrivkey()
 	if err != nil {
@@ -134,7 +134,7 @@ func TestRunLifecycle(t *testing.T) {
 
 	remoteAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:1")
 	// dnsConn wraps pconn; we pass it directly to run().
-	dnsConn := NewDNSPacketConn(pconn, remoteAddr, domain, 0)
+	dnsConn := NewDNSPacketConn(pconn, remoteAddr, domain, 0, 0)
 
 	runDone := make(chan error, 1)
 	go func() {
@@ -193,7 +193,7 @@ func TestDNSPacketConnSendRecv(t *testing.T) {
 	domain, _ := dns.ParseName("t.test.invalid")
 	serverAddr := serverConn.LocalAddr()
 
-	dnsPC := NewDNSPacketConn(clientUDP, serverAddr, domain, 0)
+	dnsPC := NewDNSPacketConn(clientUDP, serverAddr, domain, 0, 0)
 	defer dnsPC.Close()
 
 	// Write a small packet to the DNSPacketConn — it should encode it as a DNS query.
@@ -252,7 +252,7 @@ func TestOpenStreamRecreatesSession(t *testing.T) {
 	mtu := maxPacketSize
 
 	remoteAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:1")
-	dnsConn := NewDNSPacketConn(pconn, remoteAddr, domain, 0)
+	dnsConn := NewDNSPacketConn(pconn, remoteAddr, domain, 0, 0)
 	defer dnsConn.Close()
 
 	sm := newSessionManager(pubkey, domain, turbotunnel.DummyAddr{}, dnsConn, mtu)

@@ -140,6 +140,12 @@ type ResolverPool struct {
 	// rrIndex is the next round-robin index; accessed atomically.
 	rrIndex uint64
 
+	// sendMu guards pendingSend. NextSendMTU picks an endpoint and stores it here;
+	// the next WriteTo sends to that same endpoint so the query (built with that
+	// endpoint's MTU) goes to the correct resolver.
+	sendMu      sync.Mutex
+	pendingSend *poolEndpoint
+
 	recvCh    chan recvResult
 	done      chan struct{}
 	closeOnce sync.Once
@@ -495,9 +501,41 @@ func (rp *ResolverPool) MinMaxRequestSize(defaultReq int) int {
 	return min
 }
 
-// WriteTo implements net.PacketConn. addr is ignored; the pool picks a resolver.
-func (rp *ResolverPool) WriteTo(p []byte, addr net.Addr) (int, error) {
+// NextSendMTU returns the max response size and max request size for the endpoint
+// that will be used for the next WriteTo. The caller must build the query with
+// those limits (OPT Class = max response, query wire size ≤ max request) and
+// then call WriteTo; the same endpoint will be used. Used so each resolver gets
+// queries sized to its own MTU and the server gets the correct response size.
+func (rp *ResolverPool) NextSendMTU() (maxResponseSize, maxRequestSize int) {
+	rp.sendMu.Lock()
 	ep := rp.pickEndpoint()
+	if ep == nil {
+		rp.sendMu.Unlock()
+		return 0, 0
+	}
+	rp.pendingSend = ep
+	maxResp, maxReq := ep.getMaxSizes()
+	rp.sendMu.Unlock()
+	if maxResp <= 0 {
+		maxResp = 4096
+	}
+	if maxReq <= 0 {
+		maxReq = 4096
+	}
+	return maxResp, maxReq
+}
+
+// WriteTo implements net.PacketConn. addr is ignored; the pool picks a resolver.
+// If NextSendMTU was called just before this, the same endpoint is used so the
+// query (built with that endpoint's MTU) is sent to the correct resolver.
+func (rp *ResolverPool) WriteTo(p []byte, addr net.Addr) (int, error) {
+	rp.sendMu.Lock()
+	ep := rp.pendingSend
+	rp.pendingSend = nil
+	if ep == nil {
+		ep = rp.pickEndpoint()
+	}
+	rp.sendMu.Unlock()
 	if ep == nil {
 		return 0, fmt.Errorf("resolverpool: no endpoints available")
 	}

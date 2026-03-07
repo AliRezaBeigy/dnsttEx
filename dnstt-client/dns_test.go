@@ -131,7 +131,7 @@ func TestPollPayloadNoise(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseName: %v", err)
 	}
-	conn := NewDNSPacketConn(pconn, pconn.LocalAddr(), domain, 0)
+	conn := NewDNSPacketConn(pconn, pconn.LocalAddr(), domain, 0, 0)
 	defer conn.Close()
 	p1 := conn.buildUpstreamPayload(nil)
 	p2 := conn.buildUpstreamPayload(nil)
@@ -141,5 +141,76 @@ func TestPollPayloadNoise(t *testing.T) {
 	// Poll payload must be clientID(8) + 0 + noise(6) = at least 15 bytes
 	if len(p1) < 9+probeNoiseLen || len(p2) < 9+probeNoiseLen {
 		t.Errorf("poll payload too short: %d, %d (want >= %d)", len(p1), len(p2), 9+probeNoiseLen)
+	}
+}
+
+// TestEffectiveSendCapacityRespectsMTU verifies that when maxRequestSize is set,
+// effectiveSendCapacity caps payload so the resulting query wire size does not exceed it.
+func TestEffectiveSendCapacityRespectsMTU(t *testing.T) {
+	pconn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket: %v", err)
+	}
+	defer pconn.Close()
+	domain, err := dns.ParseName("mtu.test.")
+	if err != nil {
+		t.Fatalf("ParseName: %v", err)
+	}
+	// Use a small max request size (wire MTU). Capacity should be capped so built query fits.
+	maxRequestSize := 120
+	conn := NewDNSPacketConn(pconn, pconn.LocalAddr(), domain, 4096, maxRequestSize)
+	defer conn.Close()
+
+	capacity := conn.effectiveSendCapacity()
+	if capacity <= 0 {
+		t.Fatalf("effectiveSendCapacity() = %d, want > 0", capacity)
+	}
+	// Build a payload of exactly that capacity (poll-style: clientID + 0 + padding to fill).
+	decoded := make([]byte, capacity)
+	decoded[0] = 0 // mode poll; rest can be zero for size measurement
+	wire, err := conn.buildQueryWire(decoded, 0)
+	if err != nil {
+		t.Fatalf("buildQueryWire: %v", err)
+	}
+	if len(wire) > maxRequestSize {
+		t.Errorf("query wire size %d exceeds maxRequestSize %d (capacity used %d)", len(wire), maxRequestSize, capacity)
+	}
+}
+
+// TestBuildQueryWireUsesOptMaxResp verifies that buildQueryWire(decoded, optMaxResp)
+// sets the OPT RR Class (max response size) to optMaxResp when optMaxResp > 0.
+func TestBuildQueryWireUsesOptMaxResp(t *testing.T) {
+	pconn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket: %v", err)
+	}
+	defer pconn.Close()
+	domain, err := dns.ParseName("opt.test.")
+	if err != nil {
+		t.Fatalf("ParseName: %v", err)
+	}
+	conn := NewDNSPacketConn(pconn, pconn.LocalAddr(), domain, 0, 0)
+	defer conn.Close()
+
+	decoded := conn.buildUpstreamPayload(nil)
+	for _, wantClass := range []int{512, 1024, 2048, 4096} {
+		wire, err := conn.buildQueryWire(decoded, wantClass)
+		if err != nil {
+			t.Fatalf("buildQueryWire(_, %d): %v", wantClass, err)
+		}
+		msg, err := dns.MessageFromWireFormat(wire)
+		if err != nil {
+			t.Fatalf("MessageFromWireFormat: %v", err)
+		}
+		var optClass uint16
+		for _, rr := range msg.Additional {
+			if rr.Type == dns.RRTypeOPT {
+				optClass = rr.Class
+				break
+			}
+		}
+		if optClass != uint16(wantClass) {
+			t.Errorf("OPT Class = %d, want %d", optClass, wantClass)
+		}
 	}
 }

@@ -630,7 +630,7 @@ func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration) {
 	// Client MTU: how big can our query be and still get a PONG? (Independent of response size—
 	// many paths allow larger requests but truncate responses, so we probe both.)
 	// DNS limits the question name to 255 octets, so max query wire size is ~282; we only probe up to that.
-	clientSizes := []int{64, 128, 192, 256, 280}
+	clientSizes := []int{128, 192, 256, 280}
 	clientMTU := 0
 	if dnsttDebug() {
 		log.Printf("DNSTT_DEBUG: MTU phase 2 %s: testing max request (query) size (client→server)", ep.name)
@@ -971,12 +971,12 @@ Known TLS fingerprints for -utls are:
 	// Build the transport pconn.
 	var remoteAddr net.Addr
 	var pconn net.PacketConn
-	var effectiveMaxResponse int
+	var effectiveMaxResponse, effectiveMaxRequest int
 
 	if len(endpoints) == 1 {
 		// Single resolver: keep current behavior. Close probeConn so the probe
 		// socket is not leaked (pool is not used, so it would never be closed).
-		effectiveMaxResponse, _ = endpoints[0].getMaxSizes()
+		effectiveMaxResponse, effectiveMaxRequest = endpoints[0].getMaxSizes()
 		if effectiveMaxResponse <= 0 {
 			effectiveMaxResponse = 4096
 		}
@@ -995,13 +995,14 @@ Known TLS fingerprints for -utls are:
 		pconn = pool
 		remoteAddr = turbotunnel.DummyAddr{}
 		effectiveMaxResponse = pool.MinMaxResponseSize(4096)
+		effectiveMaxRequest = pool.MinMaxRequestSize(0)
 		log.Printf("Using %d resolver(s), policy: %q", len(endpoints), resolverPolicy)
 	}
 	if clientMTUFlag > 0 && (effectiveMaxResponse <= 0 || clientMTUFlag < effectiveMaxResponse) {
 		effectiveMaxResponse = clientMTUFlag
 	}
 
-	pconn = NewDNSPacketConn(pconn, remoteAddr, domain, effectiveMaxResponse)
+	pconn = NewDNSPacketConn(pconn, remoteAddr, domain, effectiveMaxResponse, effectiveMaxRequest)
 	err = run(pubkey, domain, localAddr, remoteAddr, pconn)
 	if err != nil {
 		log.Fatal(err)
