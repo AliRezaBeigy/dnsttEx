@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/flate"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"dnsttEx/dns"
@@ -27,7 +29,7 @@ const (
 	numPadding        = 0
 	numPaddingForPoll = 8
 
-	initPollDelay       = 500 * time.Millisecond
+	initPollDelay       = 2 * time.Second
 	maxPollDelay        = 2 * time.Second
 	pollDelayMultiplier = 2.0
 	pollLimit           = 16
@@ -579,51 +581,90 @@ func VerifyMTUProbeResponse(buf []byte, domain dns.Name, responseSize int) bool 
 // the question name is limited to 255 octets (RFC 1035), so header(12)+name(255)+type(2)+class(2)+OPT(11) ≈ 282.
 const maxProbeRequestWireSize = 282
 
+// probeRequestWireSize returns the wire size of a PING probe query with the given raw payload length.
+// Used to find the minimum padding so the probe is exactly >= minRequestSize.
+func probeRequestWireSize(domain dns.Name, rawLen int) (int, error) {
+	if rawLen <= 0 {
+		return 0, fmt.Errorf("rawLen must be positive")
+	}
+	dummy := make([]byte, rawLen)
+	encoded := make([]byte, base36EncodedLen(len(dummy)))
+	base36Encode(encoded, dummy)
+	labels := chunks(encoded, maxLabelLen)
+	labels = append(labels, domain...)
+	name, err := dns.NewName(labels)
+	if err != nil {
+		return 0, err
+	}
+	query := &dns.Message{
+		ID:    0,
+		Flags: 0x0100,
+		Question: []dns.Question{
+			{Name: name, Type: dns.RRTypeTXT, Class: dns.ClassIN},
+		},
+		Additional: []dns.RR{
+			{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: 0, Data: []byte{}},
+		},
+	}
+	wire, err := query.WireFormat()
+	if err != nil {
+		return 0, err
+	}
+	return len(wire), nil
+}
+
 // BuildProbeMessageWithRequestSize builds a PING probe whose wire size is at least minRequestSize
-// bytes (for client MTU discovery). Padding is added in the question name until the packet is large enough.
+// bytes (for client MTU discovery). The minimum padding needed is added so the query is just
+// >= minRequestSize (we don't overshoot), giving an accurate probe for that request size.
 // minRequestSize must be <= maxProbeRequestWireSize or the name would exceed 255 octets.
 func BuildProbeMessageWithRequestSize(domain dns.Name, clientID turbotunnel.ClientID, minRequestSize int) ([]byte, error) {
 	if minRequestSize > maxProbeRequestWireSize {
 		return nil, fmt.Errorf("minRequestSize %d exceeds max DNS query size %d (name limited to 255 octets)", minRequestSize, maxProbeRequestWireSize)
 	}
-	raw := make([]byte, 9+probeNoiseLen)
+	baseLen := 9 + probeNoiseLen // clientID(8) + PING(1) + noise(6)
+	// Binary search for the smallest raw payload length such that wire size >= minRequestSize.
+	lo, hi := baseLen, 256
+	for lo+1 < hi {
+		mid := (lo + hi) / 2
+		wireLen, err := probeRequestWireSize(domain, mid)
+		if err != nil {
+			hi = mid
+			continue
+		}
+		if wireLen >= minRequestSize {
+			hi = mid
+		} else {
+			lo = mid
+		}
+	}
+	padLen := hi - baseLen
+	raw := make([]byte, baseLen+padLen)
 	copy(raw, clientID[:])
 	raw[8] = probeModePING
 	if _, err := rand.Read(raw[9:]); err != nil {
 		return nil, err
 	}
-	for {
-		encoded := make([]byte, base36EncodedLen(len(raw)))
-		base36Encode(encoded, raw)
-		labels := chunks(encoded, maxLabelLen)
-		labels = append(labels, domain...)
-		name, err := dns.NewName(labels)
-		if err != nil {
-			return nil, err
-		}
-		query := &dns.Message{
-			ID:    0,
-			Flags: 0x0100,
-			Question: []dns.Question{
-				{Name: name, Type: dns.RRTypeTXT, Class: dns.ClassIN},
-			},
-			Additional: []dns.RR{
-				{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: 0, Data: []byte{}},
-			},
-		}
-		wire, err := query.WireFormat()
-		if err != nil {
-			return nil, err
-		}
-		if len(wire) >= minRequestSize {
-			binary.Read(rand.Reader, binary.BigEndian, &query.ID)
-			return query.WireFormat()
-		}
-		// Add padding (about 40 raw bytes → ~64 encoded → ~70 wire bytes per iteration)
-		extra := make([]byte, 48)
-		rand.Read(extra)
-		raw = append(raw, extra...)
+	encoded := make([]byte, base36EncodedLen(len(raw)))
+	base36Encode(encoded, raw)
+	labels := chunks(encoded, maxLabelLen)
+	labels = append(labels, domain...)
+	name, err := dns.NewName(labels)
+	if err != nil {
+		return nil, err
 	}
+	var id uint16
+	binary.Read(rand.Reader, binary.BigEndian, &id)
+	query := &dns.Message{
+		ID:    id,
+		Flags: 0x0100,
+		Question: []dns.Question{
+			{Name: name, Type: dns.RRTypeTXT, Class: dns.ClassIN},
+		},
+		Additional: []dns.RR{
+			{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: 0, Data: []byte{}},
+		},
+	}
+	return query.WireFormat()
 }
 
 // ProbeResponsePONG is the exact payload the server must return for a PING health check.
@@ -667,6 +708,17 @@ func ExplainProbeResponseFailure(buf []byte, domain dns.Name) string {
 
 // sendLoop batches packets into the question name (limited by effectiveSendCapacity or,
 // when using ResolverPool, by the next resolver's MTU). Also sends polling queries when idle.
+//
+// What we send when no TCP client is connected:
+//   - Session handshake: When the session starts, KCP + Noise + smux perform their handshake.
+//     They write many small segments to the tunnel; each segment becomes an outgoing packet.
+//     sendLoop drains the outgoing queue as fast as it can, so you see a burst of DNS queries
+//     (each carrying one or a few KCP segments) until the handshake completes. That burst is
+//     normal and can be thousands of queries in the first second.
+//   - Idle polls: When the outgoing queue is empty, we send one empty "poll" query per
+//     pollDelay (initPollDelay 500ms, or DNSTT_POLL_INIT_MS). Polls give the server a
+//     query to respond to and keep the tunnel alive.
+//
 // Poll timing can be overridden with DNSTT_POLL_INIT_MS and DNSTT_POLL_MAX_MS (e.g. 500/2000 for conservative resolvers).
 func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error {
 	initPoll, maxPoll := initPollDelay, maxPollDelay
