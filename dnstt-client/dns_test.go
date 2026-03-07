@@ -214,3 +214,31 @@ func TestBuildQueryWireUsesOptMaxResp(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildProbeMessageWithRequestSizeMinPadding verifies that we add the minimum
+// padding needed to reach minRequestSize (no arbitrary 48-byte chunks that overshoot).
+func TestBuildProbeMessageWithRequestSizeMinPadding(t *testing.T) {
+	domain, err := dns.ParseName("mtu.test.")
+	if err != nil {
+		t.Fatalf("ParseName: %v", err)
+	}
+	var clientID turbotunnel.ClientID
+	for i := range clientID {
+		clientID[i] = byte(i)
+	}
+	for _, minRequestSize := range []int{128, 192, 256} {
+		wire, err := BuildProbeMessageWithRequestSize(domain, clientID, minRequestSize)
+		if err != nil {
+			t.Fatalf("BuildProbeMessageWithRequestSize(_, _, %d): %v", minRequestSize, err)
+		}
+		if len(wire) < minRequestSize {
+			t.Errorf("minRequestSize %d: wire size %d < minRequestSize", minRequestSize, len(wire))
+		}
+		// We should not overshoot by a large margin (old code added 48 bytes at a time).
+		// Base36 expansion is ~8/5, so a few raw bytes can add ~10–20 wire bytes; allow some slack.
+		maxReasonable := minRequestSize + 80
+		if len(wire) > maxReasonable {
+			t.Errorf("minRequestSize %d: wire size %d >> %d (overshoot; expected minimal padding)", minRequestSize, len(wire), maxReasonable)
+		}
+	}
+}

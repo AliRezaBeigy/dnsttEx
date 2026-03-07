@@ -630,7 +630,7 @@ func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration) {
 	// Client MTU: how big can our query be and still get a PONG? (Independent of response size—
 	// many paths allow larger requests but truncate responses, so we probe both.)
 	// DNS limits the question name to 255 octets, so max query wire size is ~282; we only probe up to that.
-	clientSizes := []int{128, 192, 256, 280}
+	clientSizes := []int{128, 160, 192, 256, 280}
 	clientMTU := 0
 	if dnsttDebug() {
 		log.Printf("DNSTT_DEBUG: MTU phase 2 %s: testing max request (query) size (client→server)", ep.name)
@@ -656,8 +656,10 @@ func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration) {
 		n, _, err := ep.probeConn.ReadFrom(buf)
 		ep.probeConn.SetDeadline(time.Time{})
 		responseLen := 0
+		var responseRcode int
 		if err == nil {
 			if resp, parseErr := dns.MessageFromWireFormat(buf[:n]); parseErr == nil {
+				responseRcode = int(resp.Rcode())
 				if p := dnsResponsePayload(&resp, domain); p != nil {
 					responseLen = len(p)
 				}
@@ -668,7 +670,14 @@ func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration) {
 			if err != nil {
 				log.Printf("DNSTT_DEBUG: MTU probe %s: response error (request size %d): %v", ep.name, size, err)
 			} else {
-				log.Printf("DNSTT_DEBUG: MTU probe %s: response payload %d bytes (request size %d), PONG ok=%v", ep.name, responseLen, size, ok)
+				rcodeStr := "NOERROR"
+				if responseRcode != dns.RcodeNoError {
+					rcodeStr = fmt.Sprintf("RCODE %d (e.g. NXDOMAIN=3)", responseRcode)
+				}
+				log.Printf("DNSTT_DEBUG: MTU probe %s: response %s, payload %d bytes (request size %d), PONG ok=%v", ep.name, rcodeStr, responseLen, size, ok)
+				if !ok && responseRcode != dns.RcodeNoError && clientMTU > 0 {
+					log.Printf("DNSTT_DEBUG: MTU probe %s: path or resolver rejects request size %d (returned %s); max request size is %d bytes", ep.name, size, rcodeStr, clientMTU)
+				}
 				log.Printf("DNSTT_DEBUG: MTU probe %s: testing request size %d bytes, PONG response (hex):\n%s", ep.name, size, dnsttDebugHexDump(buf[:n], 0))
 			}
 		}
