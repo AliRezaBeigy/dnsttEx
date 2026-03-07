@@ -529,6 +529,79 @@ func scanResolvers(endpoints []*poolEndpoint, domain dns.Name, timeout time.Dura
 	return passed
 }
 
+// discoverMTU finds the max response size (server MTU) and max request size (client MTU)
+// that work for this resolver by sending PING probes with increasing sizes until no answer.
+// Results are stored on the endpoint.
+func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration) {
+	if ep.probeConn == nil {
+		return
+	}
+	probeID := turbotunnel.NewClientID()
+
+	// Server MTU: increase response size until no answer.
+	serverSizes := []int{512, 1024, 1232, 1452, 2048, 4096}
+	serverMTU := 0
+	for _, size := range serverSizes {
+		msg, err := BuildMTUProbeMessage(domain, probeID, size)
+		if err != nil {
+			continue
+		}
+		ep.probeConn.SetDeadline(time.Now().Add(timeout))
+		_, err = ep.probeConn.WriteTo(msg, ep.addr)
+		if err != nil {
+			ep.probeConn.SetDeadline(time.Time{})
+			break
+		}
+		buf := make([]byte, 4096)
+		n, _, err := ep.probeConn.ReadFrom(buf)
+		ep.probeConn.SetDeadline(time.Time{})
+		if err != nil {
+			break
+		}
+		if VerifyMTUProbeResponse(buf[:n], domain, size) {
+			serverMTU = size
+		} else {
+			break
+		}
+	}
+	if serverMTU == 0 {
+		serverMTU = 512 // safe default
+	}
+
+	// Client MTU: increase request size until no PONG answer.
+	clientSizes := []int{512, 768, 1024, 1280, 1500, 2048, 2500, 3000, 4096}
+	clientMTU := 0
+	for _, size := range clientSizes {
+		msg, err := BuildProbeMessageWithRequestSize(domain, probeID, size)
+		if err != nil {
+			continue
+		}
+		ep.probeConn.SetDeadline(time.Now().Add(timeout))
+		_, err = ep.probeConn.WriteTo(msg, ep.addr)
+		if err != nil {
+			ep.probeConn.SetDeadline(time.Time{})
+			break
+		}
+		buf := make([]byte, 4096)
+		n, _, err := ep.probeConn.ReadFrom(buf)
+		ep.probeConn.SetDeadline(time.Time{})
+		if err != nil {
+			break
+		}
+		if VerifyProbeResponse(buf[:n], domain) {
+			clientMTU = size
+		} else {
+			break
+		}
+	}
+	if clientMTU == 0 {
+		clientMTU = 512
+	}
+
+	ep.setMaxSizes(serverMTU, clientMTU)
+	log.Printf("MTU discovery %s: server=%d client=%d", ep.name, serverMTU, clientMTU)
+}
+
 func main() {
 	// If no command-line arguments are given, try to read options from
 	// environment variables, for compatibility with shadowsocks plugins.
@@ -631,6 +704,7 @@ func main() {
 	var utlsDistribution string
 	var resolverPolicy string
 	var doScan bool
+	var clientMTUFlag int
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
@@ -679,6 +753,8 @@ Known TLS fingerprints for -utls are:
 		"resolver selection policy when multiple resolvers are used: round-robin, least-ping, weighted-traffic")
 	flag.BoolVar(&doScan, "scan", false,
 		"pre-start scan: test each resolver and keep only those that receive a valid server response")
+	flag.IntVar(&clientMTUFlag, "mtu", 0,
+		"cap max DNS response size in bytes (0 = use discovered per-resolver limit)")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.LUTC)
@@ -800,13 +876,23 @@ Known TLS fingerprints for -utls are:
 		endpoints = passed
 	}
 
+	// MTU discovery: find max response and request size per resolver (PING with increasing size until no answer).
+	for _, ep := range endpoints {
+		discoverMTU(ep, domain, 8*time.Second)
+	}
+
 	// Build the transport pconn.
 	var remoteAddr net.Addr
 	var pconn net.PacketConn
+	var effectiveMaxResponse int
 
 	if len(endpoints) == 1 {
 		// Single resolver: keep current behavior. Close probeConn so the probe
 		// socket is not leaked (pool is not used, so it would never be closed).
+		effectiveMaxResponse, _ = endpoints[0].getMaxSizes()
+		if effectiveMaxResponse <= 0 {
+			effectiveMaxResponse = 4096
+		}
 		if endpoints[0].probeConn != nil {
 			endpoints[0].probeConn.Close()
 			endpoints[0].probeConn = nil
@@ -821,10 +907,14 @@ Known TLS fingerprints for -utls are:
 		pool := NewResolverPool(endpoints, resolverPolicy, probeBuilder, probeVerify)
 		pconn = pool
 		remoteAddr = turbotunnel.DummyAddr{}
+		effectiveMaxResponse = pool.MinMaxResponseSize(4096)
 		log.Printf("using %d resolver(s) with policy %q", len(endpoints), resolverPolicy)
 	}
+	if clientMTUFlag > 0 && (effectiveMaxResponse <= 0 || clientMTUFlag < effectiveMaxResponse) {
+		effectiveMaxResponse = clientMTUFlag
+	}
 
-	pconn = NewDNSPacketConn(pconn, remoteAddr, domain)
+	pconn = NewDNSPacketConn(pconn, remoteAddr, domain, effectiveMaxResponse)
 	err = run(pubkey, domain, localAddr, remoteAddr, pconn)
 	if err != nil {
 		log.Fatal(err)

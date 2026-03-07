@@ -53,11 +53,18 @@ type poolEndpoint struct {
 	addr      net.Addr
 	name      string // human-readable label
 
-	mu         sync.Mutex // guards healthy, lastRTT, failStreak, ranked
+	mu         sync.Mutex // guards healthy, lastRTT, failStreak, ranked, maxResponseSize, maxRequestSize
 	healthy    bool
 	lastRTT    time.Duration
 	ranked     bool // true once we have at least one RTT measurement
 	failStreak int
+
+	// maxResponseSize is the max UDP response size that works through this resolver (server MTU).
+	// 0 means unknown; discovery will set it or use a default.
+	maxResponseSize int
+	// maxRequestSize is the max request (query) size that works to this resolver (client MTU).
+	// 0 means unknown.
+	maxRequestSize int
 
 	// bytesPassed counts bytes received from this endpoint (weighted-traffic).
 	// Accessed only with atomic operations.
@@ -95,6 +102,22 @@ func (e *poolEndpoint) markUnhealthy() {
 func (e *poolEndpoint) snapshot() (healthy, ranked bool, rtt time.Duration) {
 	e.mu.Lock()
 	healthy, ranked, rtt = e.healthy, e.ranked, e.lastRTT
+	e.mu.Unlock()
+	return
+}
+
+// setMaxSizes sets the discovered MTU limits for this resolver (guarded by mu).
+func (e *poolEndpoint) setMaxSizes(maxResp, maxReq int) {
+	e.mu.Lock()
+	e.maxResponseSize = maxResp
+	e.maxRequestSize = maxReq
+	e.mu.Unlock()
+}
+
+// getMaxSizes returns the current max response and request sizes (guarded by mu).
+func (e *poolEndpoint) getMaxSizes() (maxResp, maxReq int) {
+	e.mu.Lock()
+	maxResp, maxReq = e.maxResponseSize, e.maxRequestSize
 	e.mu.Unlock()
 	return
 }
@@ -419,6 +442,50 @@ func (rp *ResolverPool) pickEndpoint() *poolEndpoint {
 	// Fix #7: atomic increment; no pool-level mutex needed.
 	idx := atomic.AddUint64(&rp.rrIndex, 1) - 1
 	return candidates[idx%uint64(len(candidates))].ep
+}
+
+// MinMaxResponseSize returns the minimum of all endpoints' maxResponseSize (server MTU).
+// Used so the client can set OPT Class and the server caps responses. Returns defaultResp if any endpoint has 0.
+func (rp *ResolverPool) MinMaxResponseSize(defaultResp int) int {
+	if defaultResp <= 0 {
+		defaultResp = 4096
+	}
+	min := 0
+	for _, ep := range rp.endpoints {
+		r, _ := ep.getMaxSizes()
+		if r == 0 {
+			return defaultResp
+		}
+		if min == 0 || r < min {
+			min = r
+		}
+	}
+	if min == 0 {
+		return defaultResp
+	}
+	return min
+}
+
+// MinMaxRequestSize returns the minimum of all endpoints' maxRequestSize (client MTU).
+// Returns defaultReq if any endpoint has 0.
+func (rp *ResolverPool) MinMaxRequestSize(defaultReq int) int {
+	if defaultReq <= 0 {
+		defaultReq = 4096
+	}
+	min := 0
+	for _, ep := range rp.endpoints {
+		_, req := ep.getMaxSizes()
+		if req == 0 {
+			return defaultReq
+		}
+		if min == 0 || req < min {
+			min = req
+		}
+	}
+	if min == 0 {
+		return defaultReq
+	}
+	return min
 }
 
 // WriteTo implements net.PacketConn. addr is ignored; the pool picks a resolver.

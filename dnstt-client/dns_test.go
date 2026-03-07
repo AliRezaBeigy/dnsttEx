@@ -131,7 +131,7 @@ func TestPollPayloadNoise(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseName: %v", err)
 	}
-	conn := NewDNSPacketConn(pconn, pconn.LocalAddr(), domain)
+	conn := NewDNSPacketConn(pconn, pconn.LocalAddr(), domain, 0)
 	defer conn.Close()
 	p1 := conn.buildUpstreamPayload(nil)
 	p2 := conn.buildUpstreamPayload(nil)

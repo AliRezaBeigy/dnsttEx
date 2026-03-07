@@ -3,6 +3,7 @@
 package integration_test
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"log"
@@ -211,6 +212,69 @@ func newTunnelHarnessWithRelay(t testing.TB, serverBin, clientBin string) (*coun
 		h.Teardown()
 	})
 	return relay, h
+}
+
+// udpRelay is the interface used by harnesses that sit client and server (counting or truncating).
+type udpRelay interface {
+	Addr() string
+	Close()
+}
+
+// makeRelayFunc creates a relay given the server UDP address (so the relay can forward to the server).
+type makeRelayFunc func(serverAddr string) udpRelay
+
+// newTunnelHarnessWithRelayAndStderr is like newTunnelHarnessWithRelay but uses
+// makeRelay(serverAddr) to create the relay after the server is started, and
+// captures client stderr into stderrBuf so tests can parse e.g. "MTU discovery ... server=512 client=512".
+func newTunnelHarnessWithRelayAndStderr(t testing.TB, serverBin, clientBin string, makeRelay makeRelayFunc, stderrBuf *bytes.Buffer) *tunnelHarness {
+	t.Helper()
+	h := &tunnelHarness{
+		serverBin: serverBin,
+		clientBin: clientBin,
+		domain:    "t.test.invalid",
+	}
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("echo listen: %v", err)
+	}
+	h.echoLn = echoLn
+	go runEchoServer(echoLn)
+	privkey, err := noise.GeneratePrivkey()
+	if err != nil {
+		t.Fatalf("GeneratePrivkey: %v", err)
+	}
+	h.privkeyHex = noise.EncodeKey(privkey)
+	h.pubkeyHex = noise.EncodeKey(noise.PubkeyFromPrivkey(privkey))
+	h.dnsUDPAddr = allocFreeUDPAddr(t)
+	h.serverCmd = exec.Command(serverBin,
+		"-udp", h.dnsUDPAddr,
+		"-privkey", h.privkeyHex,
+		h.domain,
+		echoLn.Addr().String(),
+	)
+	h.serverCmd.Stderr = os.Stderr
+	if err := h.serverCmd.Start(); err != nil {
+		t.Fatalf("start server: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	relay := makeRelay(h.dnsUDPAddr)
+	h.ClientAddr = allocFreeTCPAddr(t)
+	h.clientCmd = exec.Command(clientBin,
+		"-udp", relay.Addr(),
+		"-pubkey", h.pubkeyHex,
+		h.domain,
+		h.ClientAddr,
+	)
+	h.clientCmd.Stderr = stderrBuf
+	if err := h.clientCmd.Start(); err != nil {
+		t.Fatalf("start client: %v", err)
+	}
+	waitTCP(t, h.ClientAddr, 20*time.Second)
+	t.Cleanup(func() {
+		relay.Close()
+		h.Teardown()
+	})
+	return h
 }
 
 // newTunnelHarnessWithRelayAndDNSLog is like newTunnelHarnessWithRelay but
@@ -536,7 +600,84 @@ func (r *countingUDPRelay) loop() {
 	}
 }
 
-// Tunnel EDNS option codes (same as dnstt-client/dnstt-server).
+// truncatingUDPRelay is a UDP relay that limits server→client response size to
+// maxResponseSize (e.g. 512 to simulate 512-byte-only resolvers). Used for MTU discovery tests.
+type truncatingUDPRelay struct {
+	ln              *net.UDPConn
+	serverConn      *net.UDPConn
+	serverAddr      *net.UDPAddr
+	maxResponseSize int
+	sent            atomic.Int64
+	received        atomic.Int64
+	mu              sync.Mutex
+	clientAddr      *net.UDPAddr
+}
+
+func newTruncatingUDPRelay(t testing.TB, serverAddrStr string, maxResponseSize int) *truncatingUDPRelay {
+	t.Helper()
+	serverAddr, err := net.ResolveUDPAddr("udp", serverAddrStr)
+	if err != nil {
+		t.Fatalf("resolve server addr: %v", err)
+	}
+	ln, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("truncating relay listen: %v", err)
+	}
+	serverConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		ln.Close()
+		t.Fatalf("truncating relay server conn: %v", err)
+	}
+	r := &truncatingUDPRelay{
+		ln: ln, serverConn: serverConn, serverAddr: serverAddr,
+		maxResponseSize: maxResponseSize,
+	}
+	buf := make([]byte, 4096)
+	go func() {
+		buf2 := make([]byte, 4096)
+		for {
+			n, _, err := serverConn.ReadFromUDP(buf2)
+			if err != nil {
+				return
+			}
+			r.received.Add(int64(n))
+			r.mu.Lock()
+			addr := r.clientAddr
+			r.mu.Unlock()
+			if addr != nil {
+				toSend := buf2[:n]
+				if n > r.maxResponseSize {
+					toSend = buf2[:r.maxResponseSize]
+					if len(toSend) >= 3 {
+						toSend[2] |= 0x02 // TC = 1
+					}
+				}
+				r.ln.WriteToUDP(toSend, addr)
+			}
+		}
+	}()
+	go func() {
+		for {
+			n, addr, err := r.ln.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			r.sent.Add(int64(n))
+			r.mu.Lock()
+			r.clientAddr = addr
+			r.mu.Unlock()
+			r.serverConn.WriteToUDP(buf[:n], r.serverAddr)
+		}
+	}()
+	return r
+}
+
+func (r *truncatingUDPRelay) Addr() string { return r.ln.LocalAddr().String() }
+
+func (r *truncatingUDPRelay) Close() {
+	r.ln.Close()
+	r.serverConn.Close()
+}
 const (
 	ednsOptionUpstream   = 0xFF00 // client → server payload
 	ednsOptionDownstream = 0xFF01 // server → client payload

@@ -556,7 +556,8 @@ type record struct {
 	Addr            net.Addr
 	ClientID        turbotunnel.ClientID
 	MaxResponseSize int  // max UDP response size for this request (min of requester EDNS and server -mtu)
-	PongResponse    bool // true: health-check PING; send payload "PONG" only
+	PongResponse    bool // true: health-check PING; send payload "PONG" or PongPayloadSize bytes
+	PongPayloadSize int  // when > 0, response payload is this many bytes (for MTU discovery); else literal "PONG"
 }
 
 // --- Fallback NAT logic for non-DNS packets ---
@@ -760,10 +761,21 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 		if n == len(clientID) && len(body) >= 1 {
 			first := body[0]
 			if first == probeModePING {
-				// Health-check PING: respond with PONG only; don't touch tunnel.
+				// Health-check PING: respond with PONG, or with N bytes of padding for MTU discovery.
+				// If body has 2 more bytes (big-endian), they request response payload size N.
+				pongSize := 0
+				if len(body) >= 3 {
+					pongSize = int(body[1])<<8 | int(body[2])
+					if pongSize > maxRespSize {
+						pongSize = maxRespSize
+					}
+					if pongSize > maxUDPPayload {
+						pongSize = maxUDPPayload
+					}
+				}
 				if resp != nil {
 					select {
-					case ch <- &record{Resp: resp, Addr: addr, ClientID: clientID, MaxResponseSize: maxRespSize, PongResponse: true}:
+					case ch <- &record{Resp: resp, Addr: addr, ClientID: clientID, MaxResponseSize: maxRespSize, PongResponse: true, PongPayloadSize: pongSize}:
 					default:
 						log.Printf("sendLoop channel full, dropping PONG response")
 					}
@@ -837,6 +849,10 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 		}
 
 		if rec.Resp.Rcode() == dns.RcodeNoError && len(rec.Resp.Question) == 1 {
+			maxSize := rec.MaxResponseSize
+			if maxSize <= 0 {
+				maxSize = maxUDPPayload
+			}
 			// Downstream in TXT Answer so 8.8.8.8 and other public resolvers work (they don't strip TXT).
 			rec.Resp.Answer = []dns.RR{
 				{
@@ -847,14 +863,48 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 					Data:  nil,
 				},
 			}
+			// Per-request limit using actual question name so 512-byte responses always fit.
+			maxPayloadForReq, minimalWireSize := computeMaxPayloadForResponse(rec, maxSize)
+			if minimalWireSize > maxSize {
+				// Minimal response (empty payload) already exceeds maxSize; send valid TC=1 (no answer) if it fits.
+				tcResp := &dns.Message{
+					ID:       rec.Resp.ID,
+					Flags:    rec.Resp.Flags | 0x02, // TC = 1
+					Question: rec.Resp.Question,
+					Answer:   nil,
+					Additional: rec.Resp.Additional,
+				}
+				tcBuf, err := tcResp.WireFormat()
+				if err == nil && len(tcBuf) <= maxSize {
+					_, _ = dnsConn.WriteTo(tcBuf, rec.Addr)
+				}
+				continue
+			}
 
 			if rec.PongResponse {
-				// Health-check PING: respond with literal "PONG" only.
-				rec.Resp.Answer[0].Data = dns.EncodeRDataTXT([]byte("PONG"))
+				// Health-check PING: respond with literal "PONG" or with N bytes (MTU discovery).
+				// For MTU discovery, size the response to exactly MaxResponseSize when possible
+				// so the client can verify the path delivered that size (detects truncation/broken DNS).
+				if rec.PongPayloadSize > 0 {
+					pongN, _ := computePongPayloadForTargetWireSize(rec, maxSize)
+					if pongN == 0 {
+						pongN = maxPayloadForReq
+						if rec.PongPayloadSize < pongN {
+							pongN = rec.PongPayloadSize
+						}
+					}
+					rec.Resp.Answer[0].Data = dns.EncodeRDataTXT(make([]byte, pongN))
+				} else {
+					pongEnc := dns.EncodeRDataTXT([]byte("PONG"))
+					if minimalWireSize+len(pongEnc) <= maxSize {
+						rec.Resp.Answer[0].Data = pongEnc
+					} else {
+						rec.Resp.Answer[0].Data = dns.EncodeRDataTXT([]byte{})
+					}
+				}
 			} else {
 				var payload bytes.Buffer
-				// Use per-request limit so 512-only resolvers still get responses (smaller TXT).
-				limit := computeMaxEncodedPayload(rec.MaxResponseSize)
+				limit := maxPayloadForReq
 				if limit > maxEncodedPayload {
 					limit = maxEncodedPayload
 				}
@@ -896,11 +946,12 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 						break
 					}
 
-					limit -= 2 + len(p)
-					if payload.Len() > 0 && limit < 0 {
+					packetSize := 2 + len(p)
+					if limit < packetSize {
 						ttConn.Stash(p, rec.ClientID)
 						break
 					}
+					limit -= packetSize
 					if int(uint16(len(p))) != len(p) {
 						panic(len(p))
 					}
@@ -921,16 +972,15 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 			log.Printf("resp WireFormat: %v", err)
 			continue
 		}
-		// Truncate if necessary (per-request limit; 512-only resolvers get smaller responses).
-		// https://tools.ietf.org/html/rfc1035#section-4.1.1
+		// Do not truncate: cutting the buffer produces invalid DNS (client gets unexpected EOF).
+		// We cap payload size when building (PONG and tunnel) so the response should fit.
 		maxSize := rec.MaxResponseSize
 		if maxSize <= 0 {
 			maxSize = maxUDPPayload
 		}
 		if len(buf) > maxSize {
-			log.Printf("truncating response of %d bytes to max of %d", len(buf), maxSize)
-			buf = buf[:maxSize]
-			buf[2] |= 0x02 // TC = 1
+			log.Printf("response of %d bytes exceeds max %d; dropping to avoid invalid truncation", len(buf), maxSize)
+			continue
 		}
 
 		// Now we actually send the message as a UDP packet.
@@ -948,6 +998,78 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 		}
 	}
 	return nil
+}
+
+// computeMaxPayloadForResponse returns the maximum payload bytes (for Answer TXT
+// RDATA) that fit in maxSize for this specific response (actual question name),
+// and the minimal wire size (response with empty payload). If minimal wire size
+// already exceeds maxSize, maxPayload is 0. Temporarily mutates rec.Resp.Answer[0].Data.
+func computeMaxPayloadForResponse(rec *record, maxSize int) (maxPayload int, minimalWireSize int) {
+	if len(rec.Resp.Answer) == 0 {
+		return 0, 0
+	}
+	resp := rec.Resp
+	resp.Answer[0].Data = dns.EncodeRDataTXT([]byte{})
+	buf, err := resp.WireFormat()
+	resp.Answer[0].Data = nil
+	if err != nil {
+		return 0, 0
+	}
+	minimalWireSize = len(buf)
+	if minimalWireSize > maxSize {
+		return 0, minimalWireSize
+	}
+	low, high := 0, 32768
+	for low+1 < high {
+		mid := (low + high) / 2
+		resp.Answer[0].Data = dns.EncodeRDataTXT(make([]byte, mid))
+		buf, err = resp.WireFormat()
+		resp.Answer[0].Data = nil
+		if err != nil {
+			return 0, minimalWireSize
+		}
+		if len(buf) <= maxSize {
+			low = mid
+		} else {
+			high = mid
+		}
+	}
+	return low, minimalWireSize
+}
+
+// computePongPayloadForTargetWireSize returns the PONG payload size N such that
+// the response wire size equals targetWireSize (for MTU discovery so the client
+// can verify the path delivered that size). If exact match is not possible, returns
+// the N that yields the largest wire size <= targetWireSize. Temporarily mutates
+// rec.Resp.Answer[0].Data.
+func computePongPayloadForTargetWireSize(rec *record, targetWireSize int) (pongPayload int, exact bool) {
+	maxPayload, minimalWireSize := computeMaxPayloadForResponse(rec, targetWireSize)
+	if minimalWireSize > targetWireSize || maxPayload == 0 {
+		return 0, false
+	}
+	// Binary search for N such that wire size == targetWireSize.
+	low, high := 0, maxPayload+1
+	var bestN int
+	for low <= high {
+		mid := (low + high) / 2
+		rec.Resp.Answer[0].Data = dns.EncodeRDataTXT(make([]byte, mid))
+		buf, err := rec.Resp.WireFormat()
+		rec.Resp.Answer[0].Data = nil
+		if err != nil {
+			return 0, false
+		}
+		n := len(buf)
+		if n == targetWireSize {
+			return mid, true
+		}
+		if n < targetWireSize {
+			bestN = mid
+			low = mid + 1
+		} else {
+			high = mid - 1
+		}
+	}
+	return bestN, false
 }
 
 // computeMaxEncodedPayload computes the maximum amount of downstream TXT RR

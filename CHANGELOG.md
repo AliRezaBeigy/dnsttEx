@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-03-07
+
+### Added
+
+- **Per-resolver MTU discovery** — At client startup (after optional `-scan`), the client discovers for each resolver: (1) **server MTU**: max DNS response size that still gets through (PING with increasing response size until no answer); (2) **client MTU**: max request size that still gets a PONG (PING with increasing request size until no answer). Results are stored per endpoint and the client requests that the server cap responses via OPT Class so resolvers that only support small packets (e.g. 512 bytes) work without manual tuning.
+- **Client `-mtu N`** — Cap the maximum DNS response size in bytes. When set, overrides the discovered limit so the client never asks the server for responses larger than N (0 = use discovered per-resolver limit).
+
+### Changed
+
+- **Server PING handling** — PING probes may optionally include a 2-byte requested response size (big-endian). When present, the server responds with that many bytes of payload instead of the literal "PONG", so the client can probe which response sizes the resolver allows.
+
 ## [1.1.1] - 2026-03-07
 
 ### Added
@@ -56,7 +67,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/AliRezaBeigy/dnsttEx/releases/tag/v1.0.0

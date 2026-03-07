@@ -108,8 +108,9 @@ func base36DecodedLen(n int) int { return n * 5 / 8 }
 // be correlated. When sending a query, we generate a random ID, and when
 // receiving a response, we ignore the ID.
 type DNSPacketConn struct {
-	clientID turbotunnel.ClientID
-	domain   dns.Name
+	clientID        turbotunnel.ClientID
+	domain          dns.Name
+	maxResponseSize int // max UDP response size to request (OPT Class); 0 = 4096
 	// Sending on pollChan permits sendLoop to send an empty polling query.
 	// sendLoop also does its own polling according to a time schedule.
 	pollChan chan struct{}
@@ -122,13 +123,15 @@ type DNSPacketConn struct {
 // NewDNSPacketConn creates a new DNSPacketConn. transport, through its WriteTo
 // and ReadFrom methods, handles the actual sending and receiving the DNS
 // messages encoded by DNSPacketConn. addr is the address to be passed to
-// transport.WriteTo whenever a message needs to be sent.
-func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name) *DNSPacketConn {
+// transport.WriteTo whenever a message needs to be sent. maxResponseSize is the
+// max response size to request from the server (OPT Class); 0 means 4096.
+func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name, maxResponseSize int) *DNSPacketConn {
 	// Generate a new random ClientID.
 	clientID := turbotunnel.NewClientID()
 	c := &DNSPacketConn{
 		clientID:        clientID,
 		domain:          domain,
+		maxResponseSize: maxResponseSize,
 		pollChan:        make(chan struct{}, pollLimit),
 		QueuePacketConn: turbotunnel.NewQueuePacketConn(clientID, 0),
 	}
@@ -367,6 +370,13 @@ func (c *DNSPacketConn) send(transport net.PacketConn, packets [][]byte, addr ne
 	}
 	var id uint16
 	binary.Read(rand.Reader, binary.BigEndian, &id)
+	optClass := uint16(4096)
+	if c.maxResponseSize > 0 {
+		optClass = uint16(c.maxResponseSize)
+		if optClass < 512 {
+			optClass = 512
+		}
+	}
 	query := &dns.Message{
 		ID:    id,
 		Flags: 0x0100,
@@ -374,7 +384,7 @@ func (c *DNSPacketConn) send(transport net.PacketConn, packets [][]byte, addr ne
 			{Name: name, Type: dns.RRTypeTXT, Class: dns.ClassIN},
 		},
 		Additional: []dns.RR{
-			{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: 0, Data: []byte{}},
+			{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: optClass, TTL: 0, Data: []byte{}},
 		},
 	}
 	buf, err := query.WireFormat()
@@ -437,6 +447,114 @@ func BuildProbeMessage(domain dns.Name, clientID turbotunnel.ClientID) ([]byte, 
 		},
 	}
 	return query.WireFormat()
+}
+
+// BuildMTUProbeMessage builds a PING probe that asks the server to respond with a payload of
+// responseSize bytes (for MTU discovery). Payload: clientID(8) + PING(1) + size_hi(1) + size_lo(1) + noise.
+// OPT Class in the query is set to responseSize so the server caps the response.
+func BuildMTUProbeMessage(domain dns.Name, clientID turbotunnel.ClientID, responseSize int) ([]byte, error) {
+	if responseSize < 0 || responseSize > 65535 {
+		responseSize = 512
+	}
+	// Payload: clientID(8) + PING(1) + size_hi(1) + size_lo(1) + noise
+	raw := make([]byte, 9+2+probeNoiseLen)
+	copy(raw, clientID[:])
+	raw[8] = probeModePING
+	raw[9] = byte(responseSize >> 8)
+	raw[10] = byte(responseSize)
+	if _, err := rand.Read(raw[11:]); err != nil {
+		return nil, err
+	}
+	encoded := make([]byte, base36EncodedLen(len(raw)))
+	base36Encode(encoded, raw)
+	labels := chunks(encoded, maxLabelLen)
+	labels = append(labels, domain...)
+	name, err := dns.NewName(labels)
+	if err != nil {
+		return nil, err
+	}
+	var id uint16
+	binary.Read(rand.Reader, binary.BigEndian, &id)
+	optClass := uint16(responseSize)
+	if optClass < 512 {
+		optClass = 512 // RFC 6891
+	}
+	query := &dns.Message{
+		ID:    id,
+		Flags: 0x0100,
+		Question: []dns.Question{
+			{Name: name, Type: dns.RRTypeTXT, Class: dns.ClassIN},
+		},
+		Additional: []dns.RR{
+			{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: optClass, TTL: 0, Data: []byte{}},
+		},
+	}
+	return query.WireFormat()
+}
+
+// VerifyMTUProbeResponse checks that we received a valid PONG and the response size
+// is at least the requested size (allowing small tolerance for DNS TXT encoding).
+// The server sizes MTU-probe responses to the requested size so we can verify the
+// path delivered that many bytes; significantly less may indicate truncation or
+// broken DNS and must not be accepted as MTU success.
+func VerifyMTUProbeResponse(buf []byte, domain dns.Name, responseSize int) bool {
+	// Allow tolerance for TXT chunking (1 byte per 255 payload bytes); reject clear truncation.
+	tolerance := 16
+	if responseSize/255 > tolerance {
+		tolerance = responseSize / 255
+	}
+	if len(buf) < responseSize-tolerance {
+		return false
+	}
+	resp, err := dns.MessageFromWireFormat(buf)
+	if err != nil {
+		return false
+	}
+	payload := dnsResponsePayload(&resp, domain)
+	return payload != nil
+}
+
+// BuildProbeMessageWithRequestSize builds a PING probe whose wire size is at least minRequestSize
+// bytes (for client MTU discovery). Padding is added in the question name until the packet is large enough.
+func BuildProbeMessageWithRequestSize(domain dns.Name, clientID turbotunnel.ClientID, minRequestSize int) ([]byte, error) {
+	raw := make([]byte, 9+probeNoiseLen)
+	copy(raw, clientID[:])
+	raw[8] = probeModePING
+	if _, err := rand.Read(raw[9:]); err != nil {
+		return nil, err
+	}
+	for {
+		encoded := make([]byte, base36EncodedLen(len(raw)))
+		base36Encode(encoded, raw)
+		labels := chunks(encoded, maxLabelLen)
+		labels = append(labels, domain...)
+		name, err := dns.NewName(labels)
+		if err != nil {
+			return nil, err
+		}
+		query := &dns.Message{
+			ID:    0,
+			Flags: 0x0100,
+			Question: []dns.Question{
+				{Name: name, Type: dns.RRTypeTXT, Class: dns.ClassIN},
+			},
+			Additional: []dns.RR{
+				{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: 0, Data: []byte{}},
+			},
+		}
+		wire, err := query.WireFormat()
+		if err != nil {
+			return nil, err
+		}
+		if len(wire) >= minRequestSize {
+			binary.Read(rand.Reader, binary.BigEndian, &query.ID)
+			return query.WireFormat()
+		}
+		// Add padding (about 40 raw bytes → ~64 encoded → ~70 wire bytes per iteration)
+		extra := make([]byte, 48)
+		rand.Read(extra)
+		raw = append(raw, extra...)
+	}
 }
 
 // ProbeResponsePONG is the exact payload the server must return for a PING health check.
