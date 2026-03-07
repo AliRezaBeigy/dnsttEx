@@ -412,17 +412,38 @@ download_server() {
     local bin_name="dnsttEx-server-${ASSET_SUFFIX}"
     local dest="${INSTALL_DIR}/dnsttEx-server"
     local tmp="/tmp/${bin_name}"
-    if [[ -f "$dest" ]]; then
-        print_status "dnsttEx-server already at $dest"
-        return 0
+    local need_restart=false
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        need_restart=true
     fi
+
     print_status "Downloading dnsttEx-server from GitHub releases..."
     if ! curl -sSLf -o "$tmp" "${RELEASE_BASE}/${bin_name}"; then
         print_error "Download failed: ${RELEASE_BASE}/${bin_name}"
     fi
     chmod +x "$tmp"
+
+    if [[ -f "$dest" ]]; then
+        local current_checksum new_checksum
+        current_checksum=$(sha256sum "$dest" | cut -d' ' -f1)
+        new_checksum=$(sha256sum "$tmp" | cut -d' ' -f1)
+        if [[ "$current_checksum" == "$new_checksum" ]]; then
+            print_status "dnsttEx-server already up to date at $dest"
+            rm -f "$tmp"
+            return 0
+        fi
+        print_status "New version available. Updating binary..."
+    else
+        print_status "Installing dnsttEx-server..."
+    fi
+
     mv "$tmp" "$dest"
     print_status "Installed $dest"
+
+    if [[ "$need_restart" == true ]]; then
+        print_status "Restarting $SERVICE_NAME to use new binary..."
+        systemctl restart "$SERVICE_NAME"
+    fi
 }
 
 create_user_and_dirs() {
