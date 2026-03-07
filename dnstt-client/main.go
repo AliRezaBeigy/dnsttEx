@@ -521,7 +521,7 @@ func scanResolvers(endpoints []*poolEndpoint, domain dns.Name, timeout time.Dura
 				passed = append(passed, ep) // Fix #3: use ep, not endpoints[i]
 				mu.Unlock()
 			} else {
-				log.Printf("scan: %s bad response", ep.name)
+				log.Printf("scan: %s bad response: %s", ep.name, ExplainProbeResponseFailure(buf[:n], domain))
 			}
 		}()
 	}

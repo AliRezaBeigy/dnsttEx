@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-03-07
+
+### Fixed
+- **Fix wrong pong response** — distinguish MTU probe (9-byte body) from simple PING (7-byte) for PONG response
+
 ## [1.2.0] - 2026-03-07
 
 ### Added
@@ -67,7 +72,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.0.0...v1.1.0

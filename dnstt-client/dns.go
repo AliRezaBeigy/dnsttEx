@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -563,12 +564,37 @@ var ProbeResponsePONG = []byte("PONG")
 // VerifyProbeResponse checks that a raw DNS wire-format response is a valid
 // PONG to our PING: RcodeNoError, question under domain, and payload equals "PONG".
 func VerifyProbeResponse(buf []byte, domain dns.Name) bool {
+	return ExplainProbeResponseFailure(buf, domain) == ""
+}
+
+// ExplainProbeResponseFailure returns why a response is not a valid PONG; empty string means valid.
+// Used by -scan to log why a resolver was rejected (e.g. "payload len 1155, expected PONG").
+func ExplainProbeResponseFailure(buf []byte, domain dns.Name) string {
 	resp, err := dns.MessageFromWireFormat(buf)
 	if err != nil {
-		return false
+		return "parse error: " + err.Error()
+	}
+	if resp.Flags&0x8000 == 0 {
+		return "not a response (QR=0)"
+	}
+	rcode := resp.Flags & 0x000f
+	if rcode != dns.RcodeNoError {
+		return fmt.Sprintf("rcode %d (expected no error)", rcode)
+	}
+	if len(resp.Question) != 1 {
+		return "wrong number of questions"
+	}
+	if _, ok := resp.Question[0].Name.TrimSuffix(domain); !ok {
+		return "question name not under domain"
 	}
 	payload := dnsResponsePayload(&resp, domain)
-	return payload != nil && bytes.Equal(payload, ProbeResponsePONG)
+	if payload == nil {
+		return "no TXT answer or EDNS payload under domain"
+	}
+	if !bytes.Equal(payload, ProbeResponsePONG) {
+		return fmt.Sprintf("payload len %d (expected PONG); resolver may be forwarding to wrong server", len(payload))
+	}
+	return ""
 }
 
 // sendLoop batches packets into the question name (limited by nameCapacity). Also sends polling queries when idle.

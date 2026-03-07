@@ -762,9 +762,11 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			first := body[0]
 			if first == probeModePING {
 				// Health-check PING: respond with PONG, or with N bytes of padding for MTU discovery.
-				// If body has 2 more bytes (big-endian), they request response payload size N.
+				// Only treat body[1:3] as requested size when it's an MTU probe (client sends
+				// 2 size bytes + noise = 9 bytes total). Simple PING (scan/health) sends only
+				// noise (7 bytes); body[1:3] would be noise and must not be interpreted as size.
 				pongSize := 0
-				if len(body) >= 3 {
+				if len(body) >= 9 {
 					pongSize = int(body[1])<<8 | int(body[2])
 					if pongSize > maxRespSize {
 						pongSize = maxRespSize
