@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -28,8 +27,8 @@ const (
 	numPadding        = 0
 	numPaddingForPoll = 8
 
-	initPollDelay       = 50 * time.Millisecond
-	maxPollDelay        = 500 * time.Millisecond
+	initPollDelay       = 500 * time.Millisecond
+	maxPollDelay        = 2 * time.Second
 	pollDelayMultiplier = 2.0
 	pollLimit           = 16
 
@@ -258,6 +257,22 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 			continue
 		}
 
+		rcode := resp.Flags & 0x000f
+		if rcode != dns.RcodeNoError {
+			// Server or path returned an error (e.g. NXDOMAIN / No such name). Often happens when
+			// the server rejects the query (wrong domain, decode failed, payload too short).
+			qName := ""
+			if len(resp.Question) >= 1 {
+				qName = resp.Question[0].Name.String()
+			}
+			rcodeStr := "error"
+			if rcode == dns.RcodeNameError {
+				rcodeStr = "NXDOMAIN (No such name)"
+			}
+			log.Printf("DNS response %s (rcode %d) for query %s — check server logs for reason", rcodeStr, rcode, qName)
+			continue
+		}
+
 		payload := dnsResponsePayload(&resp, c.domain)
 
 		// Pull out the packets contained in the payload.
@@ -273,10 +288,6 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 			nPackets++
 			c.QueuePacketConn.QueueIncoming(p, addr)
 		}
-		if os.Getenv("DNSTT_DEBUG") != "" && len(payload) > 0 {
-			log.Printf("[client] received payload %d bytes (%d packets)", len(payload), nPackets)
-		}
-
 		// If the payload contained one or more packets, permit sendLoop
 		// to poll immediately. ACKs on received data will effectively
 		// serve as another stream of polls whose rate is proportional
@@ -315,7 +326,7 @@ func chunks(p []byte, n int) [][]byte {
 
 // buildUpstreamPayload builds raw payload with compact framing:
 //   - ClientID(8) + mode byte. Mode: 0 = poll (no data); 1–223 = single packet of that length; 224+ = legacy (224+nPad, nPad bytes, then [1-byte len + packet]*).
-//   For poll (no data), random bytes are appended so each query name differs (avoids DNS/resolver cache).
+//     For poll (no data), random bytes are appended so each query name differs (avoids DNS/resolver cache).
 func (c *DNSPacketConn) buildUpstreamPayload(packets [][]byte) []byte {
 	var buf bytes.Buffer
 	buf.Write(c.clientID[:])
@@ -392,23 +403,13 @@ func (c *DNSPacketConn) send(transport net.PacketConn, packets [][]byte, addr ne
 	if err != nil {
 		return err
 	}
-	if os.Getenv("DNSTT_DEBUG") != "" {
-		if len(packets) > 0 {
-			log.Printf("[client] send name payload %d bytes (%d packets)", len(decoded), len(packets))
-		}
-		hexLen := 64
-		if len(buf) < hexLen {
-			hexLen = len(buf)
-		}
-		log.Printf("[client] send to %s wire=%d id=%d hex=%s", addr, len(buf), query.ID, hex.EncodeToString(buf[:hexLen]))
-	}
 	_, err = transport.WriteTo(buf, addr)
 	return err
 }
 
 // Probe mode bytes (first byte of payload after clientID).
 const (
-	probeModePoll = 0   // normal idle poll
+	probeModePoll = 0    // normal idle poll
 	probeModePING = 0xFF // health-check PING; server must respond with PONG
 )
 
@@ -515,9 +516,17 @@ func VerifyMTUProbeResponse(buf []byte, domain dns.Name, responseSize int) bool 
 	return payload != nil
 }
 
+// maxProbeRequestWireSize is the maximum DNS query wire size we can build for client MTU probes:
+// the question name is limited to 255 octets (RFC 1035), so header(12)+name(255)+type(2)+class(2)+OPT(11) ≈ 282.
+const maxProbeRequestWireSize = 282
+
 // BuildProbeMessageWithRequestSize builds a PING probe whose wire size is at least minRequestSize
 // bytes (for client MTU discovery). Padding is added in the question name until the packet is large enough.
+// minRequestSize must be <= maxProbeRequestWireSize or the name would exceed 255 octets.
 func BuildProbeMessageWithRequestSize(domain dns.Name, clientID turbotunnel.ClientID, minRequestSize int) ([]byte, error) {
+	if minRequestSize > maxProbeRequestWireSize {
+		return nil, fmt.Errorf("minRequestSize %d exceeds max DNS query size %d (name limited to 255 octets)", minRequestSize, maxProbeRequestWireSize)
+	}
 	raw := make([]byte, 9+probeNoiseLen)
 	copy(raw, clientID[:])
 	raw[8] = probeModePING

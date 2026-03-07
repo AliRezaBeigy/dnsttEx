@@ -11,8 +11,8 @@ import (
 	"time"
 )
 
-// mtuDiscoveryLogPattern matches "MTU discovery 127.0.0.1:12345: server=4096 client=512".
-var mtuDiscoveryLogPattern = regexp.MustCompile(`MTU discovery .* server=(\d+) client=(\d+)`)
+// mtuDiscoveryLogPattern matches "MTU discovery: 127.0.0.1:12345 → max response 4096 bytes, max request 512 bytes".
+var mtuDiscoveryLogPattern = regexp.MustCompile(`MTU discovery: .* → max response (\d+) bytes, max request (\d+) bytes`)
 
 // parseMTUDiscoveryFromStderr reads stderrBuf and returns (serverMTU, clientMTU, true) if a line matches.
 // Returns (0, 0, false) if not found.

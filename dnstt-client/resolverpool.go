@@ -13,12 +13,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	utls "github.com/refraction-networking/utls"
 	"dnsttEx/turbotunnel"
+
+	utls "github.com/refraction-networking/utls"
 )
 
 const (
-	healthCheckInterval = 15 * time.Second
+	healthCheckInterval = 60 * time.Second
 	healthCheckTimeout  = 7 * time.Second
 	// After this many consecutive probe failures, mark endpoint unhealthy.
 	healthCheckFailThreshold = 2
@@ -341,10 +342,16 @@ func (rp *ResolverPool) probeEndpoint(ep *poolEndpoint, probeBuilder func() ([]b
 		}
 		return
 	}
+	if dnsttDebug() {
+		log.Printf("DNSTT_DEBUG: health PING query %s (hex):\n%s", ep.name, dnsttDebugHexDump(msg, 0))
+	}
 
 	buf := make([]byte, 4096)
 	n, _, err := ep.probeConn.ReadFrom(buf)
 	ep.probeConn.SetDeadline(time.Time{})
+	if dnsttDebug() && err == nil {
+		log.Printf("DNSTT_DEBUG: health PONG response %s (hex):\n%s", ep.name, dnsttDebugHexDump(buf[:n], 0))
+	}
 	if err != nil {
 		if ep.recordFailure() {
 			log.Printf("resolverpool: endpoint %s marked unhealthy (probe timeout: %v)", ep.name, err)
