@@ -126,7 +126,7 @@ func TestResponseFor(t *testing.T) {
 		}
 	})
 
-	t.Run("non-TXT QTYPE returns NXDOMAIN", func(t *testing.T) {
+	t.Run("non-TXT QTYPE returns NOERROR (so resolver retries with TXT)", func(t *testing.T) {
 		query := &dns.Message{
 			ID:    3,
 			Flags: 0x0100,
@@ -137,12 +137,15 @@ func TestResponseFor(t *testing.T) {
 				{Type: dns.RRTypeOPT, Class: 4096, Data: []byte{}},
 			},
 		}
-		resp, _, _ := responseFor(query, domain)
+		resp, payload, _ := responseFor(query, domain)
 		if resp == nil {
 			t.Fatal("expected non-nil response for A query")
 		}
-		if resp.Rcode() != dns.RcodeNameError {
-			t.Errorf("expected NXDOMAIN, got %d", resp.Rcode())
+		if resp.Rcode() != dns.RcodeNoError {
+			t.Errorf("expected NOERROR (resolver may retry with TXT), got %d", resp.Rcode())
+		}
+		if payload != nil {
+			t.Errorf("expected nil payload for non-TXT query, got %d bytes", len(payload))
 		}
 	})
 
@@ -191,8 +194,8 @@ func TestResponseFor(t *testing.T) {
 		}
 	})
 
-	t.Run("query without EDNS option 0xFF00 returns NXDOMAIN", func(t *testing.T) {
-		// Valid subdomain but OPT has no our option (or payload too short).
+	t.Run("query without EDNS option 0xFF00 and short name returns NOERROR", func(t *testing.T) {
+		// Minimized QNAME (e.g. "t.domain"): no EDNS payload, name decodes to < 9 bytes; return NOERROR so resolver retries with full name.
 		labels := append([][]byte{[]byte("t")}, domain...)
 		name, _ := dns.NewName(labels)
 		query := &dns.Message{
@@ -205,12 +208,15 @@ func TestResponseFor(t *testing.T) {
 				{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: 0, Data: []byte{}},
 			},
 		}
-		resp, _, _ := responseFor(query, domain)
+		resp, payload, _ := responseFor(query, domain)
 		if resp == nil {
 			t.Fatal("expected non-nil response")
 		}
-		if resp.Rcode() != dns.RcodeNameError {
-			t.Errorf("expected NXDOMAIN when OPT has no 0xFF00, got %d", resp.Rcode())
+		if resp.Rcode() != dns.RcodeNoError {
+			t.Errorf("expected NOERROR (minimized QNAME), got %d", resp.Rcode())
+		}
+		if payload != nil {
+			t.Errorf("expected nil payload for short/minimized name, got %d bytes", len(payload))
 		}
 	})
 
