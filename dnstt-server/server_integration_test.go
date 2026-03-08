@@ -429,6 +429,104 @@ func TestRecvLoopInjectsPackets(t *testing.T) {
 	}
 }
 
+// TestPongResponseSize verifies that when the client sends a PING requesting N bytes
+// (MTU probe), the server responds with exactly N bytes of payload (capped by what fits).
+func TestPongResponseSize(t *testing.T) {
+	domain, err := dns.ParseName("t.test.invalid")
+	if err != nil {
+		t.Fatalf("ParseName: %v", err)
+	}
+
+	dnsConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer dnsConn.Close()
+
+	clientConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer clientConn.Close()
+
+	ttConn := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, 5*time.Minute)
+	defer ttConn.Close()
+
+	ch := make(chan *record, 64)
+	done := make(chan error, 1)
+	go func() {
+		done <- recvLoop(domain, dnsConn, ttConn, ch, nil)
+	}()
+
+	// PING with requested response size 5: clientID(8) + 0xFF + size_hi(1) + size_lo(1) + 6 noise = 17 bytes.
+	clientID := turbotunnel.NewClientID()
+	payload := make([]byte, 8+1+2+6)
+	copy(payload[:8], clientID[:])
+	payload[8] = probeModePING
+	payload[9] = 0
+	payload[10] = 5
+	for i := 11; i < len(payload); i++ {
+		payload[i] = byte(i)
+	}
+
+	query, err := buildTunnelQuery(payload, domain)
+	if err != nil {
+		t.Fatalf("buildTunnelQuery: %v", err)
+	}
+	wireQuery, err := query.WireFormat()
+	if err != nil {
+		t.Fatalf("WireFormat: %v", err)
+	}
+	_, err = clientConn.WriteTo(wireQuery, dnsConn.LocalAddr())
+	if err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+
+	var rec *record
+	select {
+	case rec = <-ch:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for PONG record")
+	}
+
+	if rec == nil || !rec.PongResponse {
+		t.Fatalf("expected PongResponse record, got %+v", rec)
+	}
+	if rec.PongPayloadSize != 5 {
+		t.Fatalf("PongPayloadSize = %d, want 5", rec.PongPayloadSize)
+	}
+
+	// Simulate sendLoop: set up Answer then compute max payload (computeMaxPayloadForResponse requires Answer).
+	if len(rec.Resp.Question) != 1 {
+		t.Fatalf("expected one question, got %d", len(rec.Resp.Question))
+	}
+	rec.Resp.Answer = []dns.RR{
+		{
+			Name:  rec.Resp.Question[0].Name,
+			Type:  rec.Resp.Question[0].Type,
+			Class: rec.Resp.Question[0].Class,
+			TTL:   responseTTL,
+			Data:  nil,
+		},
+	}
+	maxPayloadForReq, _ := computeMaxPayloadForResponse(rec, 512)
+	pongN := rec.PongPayloadSize
+	if pongN > maxPayloadForReq {
+		pongN = maxPayloadForReq
+	}
+	data := dns.EncodeRDataTXT(make([]byte, pongN))
+	decoded, err := dns.DecodeRDataTXT(data)
+	if err != nil {
+		t.Fatalf("DecodeRDataTXT: %v", err)
+	}
+	if len(decoded) != 5 {
+		t.Errorf("PONG payload length = %d, want 5 (client requested 5 bytes)", len(decoded))
+	}
+
+	dnsConn.Close()
+	<-done
+}
+
 // isClosedError returns true if err indicates a closed network connection,
 // which is expected when dnsConn is closed while recvLoop is blocked on ReadFrom.
 func isClosedError(err error) bool {

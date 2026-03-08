@@ -870,15 +870,12 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 
 			if rec.PongResponse {
 				// Health-check PING: respond with literal "PONG" or with N bytes (MTU discovery).
-				// For MTU discovery, size the response to exactly MaxResponseSize when possible
-				// so the client can verify the path delivered that size (detects truncation/broken DNS).
+				// When the client requests N bytes (PongPayloadSize), send exactly N bytes of payload
+				// (capped by maxPayloadForReq so the response fits), so the client can verify the path.
 				if rec.PongPayloadSize > 0 {
-					pongN, _ := computePongPayloadForTargetWireSize(rec, maxSize)
-					if pongN == 0 {
+					pongN := rec.PongPayloadSize
+					if pongN > maxPayloadForReq {
 						pongN = maxPayloadForReq
-						if rec.PongPayloadSize < pongN {
-							pongN = rec.PongPayloadSize
-						}
 					}
 					rec.Resp.Answer[0].Data = dns.EncodeRDataTXT(make([]byte, pongN))
 					if os.Getenv("DNSTT_DEBUG") != "" {
