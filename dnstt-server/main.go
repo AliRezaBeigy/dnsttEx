@@ -521,9 +521,9 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte, int
 		return resp, nil, effectiveMaxResponse
 	}
 
+	// Resolvers may probe with A/AAAA (QTYPE minimization) or send minimized QNAME; return NOERROR
+	// with no answer so they retry with TXT or full name instead of giving up with NXDOMAIN.
 	if question.Type != dns.RRTypeTXT {
-		resp.Flags |= dns.RcodeNameError
-		log.Printf("NXDOMAIN: QTYPE not TXT (got %d) for %s", question.Type, question.Name)
 		return resp, nil, effectiveMaxResponse
 	}
 
@@ -545,15 +545,13 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte, int
 		encoded := bytes.Join(prefix, nil)
 		decoded := make([]byte, base36DecodedLen(len(encoded)))
 		if err := base36Decode(decoded, encoded); err != nil {
-			resp.Flags |= dns.RcodeNameError
-			log.Printf("NXDOMAIN: Base36 decode failed for name prefix (user data in query name): %v", err)
+			// Minimized QNAME (e.g. 68a.e.markop.ir): resolver sent partial name; return NOERROR so it retries with full name.
 			return resp, nil, effectiveMaxResponse
 		}
 		payload = decoded
 	}
 	if len(payload) < 9 {
-		resp.Flags |= dns.RcodeNameError
-		log.Printf("NXDOMAIN: payload too short (%d bytes, need 9 for ClientID+mode) for %s", len(payload), question.Name)
+		// Short prefix / minimized QNAME: not enough for ClientID+mode; return NOERROR so resolver retries with full name.
 		return resp, nil, effectiveMaxResponse
 	}
 
