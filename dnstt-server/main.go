@@ -49,7 +49,6 @@ package main
 
 import (
 	"bytes"
-	"compress/flate"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -77,9 +76,6 @@ const (
 	downstreamEDNSOptionCode = 0xFF01
 	// Health-check probe: client sends payload with mode byte 0xFF (PING), server responds with "PONG".
 	probeModePING = 0xFF
-	// Compressed handshake: body is 0xFE + uint16(decompressedLen) + flate-compressed body.
-	compressedModeByte  = 0xFE
-	maxDecompressedBody = 65535
 )
 
 const (
@@ -731,19 +727,6 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 		var clientID turbotunnel.ClientID
 		n = copy(clientID[:], payload)
 		body := payload[n:]
-		// Decompress handshake payload if client sent compressed form (0xFE + len + flate).
-		if n == len(clientID) && len(body) >= 3 && body[0] == compressedModeByte {
-			decompressedLen := int(binary.BigEndian.Uint16(body[1:3]))
-			if decompressedLen > 0 && decompressedLen <= maxDecompressedBody && len(body) > 3 {
-				decompressed := make([]byte, decompressedLen)
-				r := flate.NewReader(bytes.NewReader(body[3:]))
-				nRead, err := io.ReadFull(r, decompressed)
-				r.Close()
-				if err == nil && nRead == decompressedLen {
-					body = decompressed
-				}
-			}
-		}
 		if n == len(clientID) && len(body) >= 1 {
 			first := body[0]
 			if first == probeModePING {

@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"compress/flate"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -12,6 +11,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -29,8 +29,10 @@ const (
 	numPadding        = 0
 	numPaddingForPoll = 8
 
-	initPollDelay       = 2 * time.Second
-	maxPollDelay        = 2 * time.Second
+	initPollDelay    = 2 * time.Second
+	maxPollDelay     = 2 * time.Second
+	initSendCoalesce = 2 * time.Second
+
 	pollDelayMultiplier = 2.0
 	pollLimit           = 16
 
@@ -42,11 +44,11 @@ const (
 	rateLimitBackoffThreshold  = 3
 	rateLimitBackoffMultiplier = 2.0
 
-	// handshakeCompressMaxSends: for the first this many sends that contain data,
-	// we try to compress the payload (KCP/Noise/smux handshake burst). 0 = disabled.
-	handshakeCompressMaxSends = 256
-	compressedModeByte        = 0xFE // mode byte meaning "body is flate-compressed"
-	maxDecompressedBody       = 65535
+	// nxdomainRetryMax: when we receive NXDOMAIN, re-queue the last data batch and retry up to this many times before giving up.
+	nxdomainRetryMax = 3
+
+	// defaultMaxInFlight: max data queries sent without having received a response (backpressure). Override with DNSTT_MAX_INFLIGHT.
+	defaultMaxInFlight = 20
 )
 
 // Base36 uses 0-9a-v (32 of 36 symbols); 5 bits/symbol so expansion = 8/5, same as Base32.
@@ -123,8 +125,19 @@ type DNSPacketConn struct {
 	// Sending on pollChan permits sendLoop to send an empty polling query.
 	// sendLoop also does its own polling according to a time schedule.
 	pollChan chan struct{}
-	// handshakeSendsRemain: number of data sends left for which we try compression (atomic).
-	handshakeSendsRemain int32
+	// pendingRetryMu protects pendingRetry and pendingRetryCount (NXDOMAIN retry).
+	pendingRetryMu    sync.Mutex
+	pendingRetry      [][]byte // copy of last sent data batch, for re-queue on NXDOMAIN
+	pendingRetryCount int      // number of times we've re-queued this batch due to NXDOMAIN
+	// Stats for periodic report (DNSTT_STATS=1 or DNSTT_DEBUG): atomics, reset every second.
+	statsQueriesSent     atomic.Uint64
+	statsTunnelBytesSent atomic.Uint64
+	statsPollsSent       atomic.Uint64
+	statsResponsesRecv     atomic.Uint64 // responses that contained tunnel payload
+	statsTunnelBytesRecv   atomic.Uint64
+	statsResponsesRecvTotal atomic.Uint64 // any DNS response received (to see empty vs none)
+	// inFlightChan: cap N = max data queries in flight; acquire before send, release on any response (backpressure).
+	inFlightChan chan struct{}
 	// QueuePacketConn is the direct receiver of ReadFrom and WriteTo calls.
 	// recvLoop and sendLoop take the messages out of the receive and send
 	// queues and actually put them on the network.
@@ -141,14 +154,24 @@ type DNSPacketConn struct {
 func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name, maxResponseSize, maxRequestSize int) *DNSPacketConn {
 	// Generate a new random ClientID.
 	clientID := turbotunnel.NewClientID()
+	maxInFlight := defaultMaxInFlight
+	if s := os.Getenv("DNSTT_MAX_INFLIGHT"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			maxInFlight = n
+		}
+	}
+	inFlightChan := make(chan struct{}, maxInFlight)
+	for i := 0; i < maxInFlight; i++ {
+		inFlightChan <- struct{}{}
+	}
 	c := &DNSPacketConn{
-		clientID:              clientID,
-		domain:                domain,
-		maxResponseSize:       maxResponseSize,
-		maxRequestSize:        maxRequestSize,
-		pollChan:              make(chan struct{}, pollLimit),
-		handshakeSendsRemain:  handshakeCompressMaxSends,
-		QueuePacketConn:       turbotunnel.NewQueuePacketConn(clientID, 0),
+		clientID:             clientID,
+		domain:               domain,
+		maxResponseSize:      maxResponseSize,
+		maxRequestSize:       maxRequestSize,
+		pollChan:         make(chan struct{}, pollLimit),
+		inFlightChan:     inFlightChan,
+		QueuePacketConn:     turbotunnel.NewQueuePacketConn(clientID, 0),
 	}
 	go func() {
 		err := c.recvLoop(transport)
@@ -162,7 +185,27 @@ func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name, 
 			log.Printf("sendLoop: %v", err)
 		}
 	}()
+	if os.Getenv("DNSTT_STATS") != "" || os.Getenv("DNSTT_DEBUG") != "" {
+		go c.statsReportLoop()
+	}
 	return c
+}
+
+// statsReportLoop logs send/recv stats every second to diagnose bursts (DNSTT_STATS=1 or DNSTT_DEBUG).
+func (c *DNSPacketConn) statsReportLoop() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		q := c.statsQueriesSent.Swap(0)
+		txBytes := c.statsTunnelBytesSent.Swap(0)
+		polls := c.statsPollsSent.Swap(0)
+		rxTotal := c.statsResponsesRecvTotal.Swap(0)
+		rxWithPayload := c.statsResponsesRecv.Swap(0)
+		rxBytes := c.statsTunnelBytesRecv.Swap(0)
+		dataQueries := q - polls
+		log.Printf("DNSTT_STATS: last 1s — sent %d queries (%d data, %d polls) %d bytes tunnel | recv %d DNS (%d with payload) %d bytes tunnel",
+			q, dataQueries, polls, txBytes, rxTotal, rxWithPayload, rxBytes)
+	}
 }
 
 // dnsResponsePayload extracts downstream payload. Prefers TXT Answer (works with
@@ -271,11 +314,16 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 			log.Printf("MessageFromWireFormat: %v", err)
 			continue
 		}
+		c.statsResponsesRecvTotal.Add(1)
+		// Release one in-flight slot so sendLoop can send more (backpressure).
+		select {
+		case c.inFlightChan <- struct{}{}:
+		default:
+		}
 
 		rcode := resp.Flags & 0x000f
 		if rcode != dns.RcodeNoError {
-			// Server or path returned an error (e.g. NXDOMAIN / No such name). Often happens when
-			// the server rejects the query (wrong domain, decode failed, payload too short).
+			// Server or path returned an error (e.g. NXDOMAIN). Re-queue last data batch and retry up to nxdomainRetryMax times.
 			qName := ""
 			if len(resp.Question) >= 1 {
 				qName = resp.Question[0].Name.String()
@@ -284,7 +332,24 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 			if rcode == dns.RcodeNameError {
 				rcodeStr = "NXDOMAIN (No such name)"
 			}
-			log.Printf("DNS response %s (rcode %d) for query %s — check server logs for reason", rcodeStr, rcode, qName)
+			c.pendingRetryMu.Lock()
+			if c.pendingRetry != nil && c.pendingRetryCount < nxdomainRetryMax {
+				for _, p := range c.pendingRetry {
+					c.WriteTo(p, addr)
+				}
+				c.pendingRetryCount++
+				retryNum := c.pendingRetryCount
+				c.pendingRetryMu.Unlock()
+				log.Printf("DNS response %s (rcode %d) for query %s — retrying (%d/%d)", rcodeStr, rcode, qName, retryNum, nxdomainRetryMax)
+			} else {
+				if c.pendingRetry != nil && c.pendingRetryCount >= nxdomainRetryMax {
+					log.Printf("DNS response %s (rcode %d) for query %s — gave up after %d retries", rcodeStr, rcode, qName, nxdomainRetryMax)
+					c.pendingRetry = nil
+				} else {
+					log.Printf("DNS response %s (rcode %d) for query %s — check server logs for reason", rcodeStr, rcode, qName)
+				}
+				c.pendingRetryMu.Unlock()
+			}
 			continue
 		}
 
@@ -293,15 +358,19 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 		// Pull out the packets contained in the payload.
 		r := bytes.NewReader(payload)
 		any := false
-		nPackets := 0
+		var recvBytes uint64
 		for {
 			p, err := nextPacket(r)
 			if err != nil {
 				break
 			}
 			any = true
-			nPackets++
+			recvBytes += uint64(len(p))
 			c.QueuePacketConn.QueueIncoming(p, addr)
+		}
+		if any {
+			c.statsResponsesRecv.Add(1)
+			c.statsTunnelBytesRecv.Add(recvBytes)
 		}
 		// If the payload contained one or more packets, permit sendLoop
 		// to poll immediately. ACKs on received data will effectively
@@ -446,36 +515,6 @@ func (c *DNSPacketConn) buildUpstreamPayload(packets [][]byte) []byte {
 	return buf.Bytes()
 }
 
-// compressHandshakeBody flate-compresses body and returns clientID(8) + 0xFE + uint16(len(body)) + compressed,
-// or nil if compression is not beneficial or fails. Caller must ensure len(body) <= maxDecompressedBody.
-func (c *DNSPacketConn) compressHandshakeBody(body []byte) []byte {
-	if len(body) == 0 || len(body) > maxDecompressedBody {
-		return nil
-	}
-	var compressed bytes.Buffer
-	w, err := flate.NewWriter(&compressed, flate.BestSpeed)
-	if err != nil {
-		return nil
-	}
-	if _, err := w.Write(body); err != nil {
-		w.Close()
-		return nil
-	}
-	if err := w.Close(); err != nil {
-		return nil
-	}
-	// Only use if smaller: 8 + 1 + 2 + len(compressed) < 8 + len(body) => 3 + len(compressed) < len(body)
-	if 3+compressed.Len() >= len(body) {
-		return nil
-	}
-	out := make([]byte, 8+1+2+compressed.Len())
-	copy(out, c.clientID[:])
-	out[8] = compressedModeByte
-	binary.BigEndian.PutUint16(out[9:11], uint16(len(body)))
-	copy(out[11:], compressed.Bytes())
-	return out
-}
-
 // send encodes payload in the question name (Base36, 0-9a-v) for public resolvers; no EDNS.
 // When maxRespOverride > 0 or maxReqOverride > 0 (e.g. from ResolverPool.NextSendMTU), this
 // send uses that resolver's MTU: OPT Class = maxRespOverride, payload capped by maxReqOverride.
@@ -495,26 +534,39 @@ func (c *DNSPacketConn) send(transport net.PacketConn, packets [][]byte, addr ne
 		c.QueuePacketConn.Stash(packets[0], addr)
 		decoded = c.buildUpstreamPayload(nil)
 	}
-	// Optionally use compressed form for handshake-phase data sends.
-	if len(packets) > 0 && atomic.LoadInt32(&c.handshakeSendsRemain) > 0 {
-		if len(decoded) > 8 {
-			body := decoded[8:]
-			if compressed := c.compressHandshakeBody(body); compressed != nil && len(compressed) <= capacity {
-				decoded = compressed
-				atomic.AddInt32(&c.handshakeSendsRemain, -1)
+	maxReq := c.maxRequestSize
+	if maxReqOverride > 0 {
+		maxReq = maxReqOverride
+	}
+	for {
+		buf, err := c.buildQueryWire(decoded, maxRespOverride)
+		if err != nil {
+			return err
+		}
+		sendAnyway := len(packets) == 0 && len(decoded) <= 9+probeNoiseLen // minimal poll payload
+		if maxReq <= 0 || len(buf) <= maxReq || sendAnyway {
+			if dnsttDebug() && len(packets) > 0 {
+				log.Printf("DNSTT_DEBUG: send: query wire %d bytes (max request %d)", len(buf), maxReq)
 			}
+			if len(buf) >= 2 {
+				rand.Read(buf[0:2])
+			}
+			_, err = transport.WriteTo(buf, addr)
+			return err
+		}
+		// Built query exceeds path MTU; reduce payload and retry.
+		if len(packets) <= 1 {
+			if len(packets) == 1 {
+				c.QueuePacketConn.Stash(packets[0], addr)
+			}
+			decoded = c.buildUpstreamPayload(nil)
+			packets = nil
+		} else {
+			c.QueuePacketConn.Stash(packets[len(packets)-1], addr)
+			packets = packets[:len(packets)-1]
+			decoded = c.buildUpstreamPayload(packets)
 		}
 	}
-	buf, err := c.buildQueryWire(decoded, maxRespOverride)
-	if err != nil {
-		return err
-	}
-	// Assign random ID for this query (buildQueryWire uses 0).
-	if len(buf) >= 2 {
-		rand.Read(buf[0:2])
-	}
-	_, err = transport.WriteTo(buf, addr)
-	return err
 }
 
 // Probe mode bytes (first byte of payload after clientID).
@@ -769,8 +821,9 @@ func ExplainProbeResponseFailure(buf []byte, domain dns.Name) string {
 //     query to respond to and keep the tunnel alive.
 //
 // Poll timing can be overridden with DNSTT_POLL_INIT_MS and DNSTT_POLL_MAX_MS (e.g. 500/2000 for conservative resolvers).
+// DNSTT_SEND_COALESCE_MS: when > 0, wait up to this many ms for more packets before sending (reduces query burst; 0 = send immediately).
 func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error {
-	initPoll, maxPoll := initPollDelay, maxPollDelay
+	initPoll, maxPoll, sendCoalesce := initPollDelay, maxPollDelay, initSendCoalesce
 	if s := os.Getenv("DNSTT_POLL_INIT_MS"); s != "" {
 		if ms, err := strconv.Atoi(s); err == nil && ms > 0 {
 			initPoll = time.Duration(ms) * time.Millisecond
@@ -779,6 +832,11 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 	if s := os.Getenv("DNSTT_POLL_MAX_MS"); s != "" {
 		if ms, err := strconv.Atoi(s); err == nil && ms > 0 {
 			maxPoll = time.Duration(ms) * time.Millisecond
+		}
+	}
+	if s := os.Getenv("DNSTT_SEND_COALESCE_MS"); s != "" {
+		if ms, err := strconv.Atoi(s); err == nil && ms >= 0 {
+			sendCoalesce = time.Duration(ms) * time.Millisecond
 		}
 	}
 	pollDelay := initPoll
@@ -849,8 +907,48 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 					packets = append(packets, p)
 					used += 1 + len(p)
 				default:
-					goto done
+					if sendCoalesce == 0 {
+						goto done
+					}
+					break
 				}
+			}
+			// Optional coalescing: when nothing was immediately available, wait up to sendCoalesce for more packets.
+			if sendCoalesce > 0 && used < payloadLimit {
+				coalesceTimer := time.NewTimer(sendCoalesce)
+				for used < payloadLimit {
+					select {
+					case p := <-unstash:
+						if 1+len(p) > payloadLimit-used {
+							c.QueuePacketConn.Stash(p, addr)
+							if !coalesceTimer.Stop() {
+								select {
+								case <-coalesceTimer.C:
+								default:
+								}
+							}
+							goto done
+						}
+						packets = append(packets, p)
+						used += 1 + len(p)
+					case p := <-outgoing:
+						if 1+len(p) > payloadLimit-used {
+							c.QueuePacketConn.Stash(p, addr)
+							if !coalesceTimer.Stop() {
+								select {
+								case <-coalesceTimer.C:
+								default:
+								}
+							}
+							goto done
+						}
+						packets = append(packets, p)
+						used += 1 + len(p)
+					case <-coalesceTimer.C:
+						goto done
+					}
+				}
+				coalesceTimer.Stop()
 			}
 		done:
 		}
@@ -868,7 +966,33 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 		}
 		pollTimer.Reset(pollDelay)
 
+		if dnsttDebug() {
+			if len(packets) > 0 {
+				tunnelBytes := 0
+				for _, p := range packets {
+					tunnelBytes += len(p)
+				}
+				log.Printf("DNSTT_DEBUG: sendLoop: sending query with %d packet(s), %d bytes tunnel data", len(packets), tunnelBytes)
+			} else {
+				log.Printf("DNSTT_DEBUG: sendLoop: sending poll (idle)")
+			}
+		}
+		if len(packets) > 0 {
+			c.pendingRetryMu.Lock()
+			c.pendingRetry = make([][]byte, len(packets))
+			for i, p := range packets {
+				c.pendingRetry[i] = make([]byte, len(p))
+				copy(c.pendingRetry[i], p)
+			}
+			c.pendingRetryCount = 0
+			c.pendingRetryMu.Unlock()
+			// Backpressure: don't send more data until we've received some responses.
+			<-c.inFlightChan
+		}
 		if err := c.send(transport, packets, addr, maxRespOverride, maxReqOverride); err != nil {
+			if len(packets) > 0 {
+				select { case c.inFlightChan <- struct{}{}: default: }
+			}
 			sendFailures++
 			if sendFailures >= rateLimitBackoffThreshold {
 				pollDelay = time.Duration(float64(pollDelay) * rateLimitBackoffMultiplier)
@@ -885,6 +1009,16 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 			if pollDelay > initPoll {
 				pollDelay = initPoll
 			}
+			if len(packets) == 0 {
+				c.statsPollsSent.Add(1)
+			} else {
+				tunnelBytes := uint64(0)
+				for _, p := range packets {
+					tunnelBytes += uint64(len(p))
+				}
+				c.statsTunnelBytesSent.Add(tunnelBytes)
+			}
+			c.statsQueriesSent.Add(1)
 		}
 	}
 }
