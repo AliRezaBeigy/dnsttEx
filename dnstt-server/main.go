@@ -506,6 +506,14 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte, int
 	}
 	resp.Flags |= 0x0400 // AA = 1
 
+	// QNAME minimization (RFC 7816/RFC 9156): resolvers may send only the zone name
+	// (e.g. mnm.e.example.come) to discover authority, then send the full name. If we
+	// return NXDOMAIN for the zone apex, the resolver may give up. Return NOERROR
+	// with no payload so the resolver continues (e.g. retries with full name).
+	if len(prefix) == 0 {
+		return resp, nil, effectiveMaxResponse
+	}
+
 	if query.Opcode() != 0 {
 		// We don't support OPCODE != QUERY.
 		resp.Flags |= dns.RcodeNotImplemented
@@ -790,7 +798,8 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			}
 		} else {
 			// Payload too short (no full ClientID) or no mode byte (8 bytes only).
-			if resp != nil && resp.Rcode() == dns.RcodeNoError {
+			// When payload is nil we may have returned NOERROR for zone-apex / QNAME-minimized query; do not overwrite.
+			if payload != nil && resp != nil && resp.Rcode() == dns.RcodeNoError {
 				resp.Flags |= dns.RcodeNameError
 				log.Printf("NXDOMAIN: payload too short for ClientID+mode (payload %d bytes) query %s", len(payload), query.Question[0].Name)
 			}
