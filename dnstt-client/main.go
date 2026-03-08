@@ -59,6 +59,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -74,7 +75,11 @@ import (
 )
 
 // smux streams will be closed after this much time without receiving data.
-const idleTimeout = 2 * time.Minute
+const (
+	idleTimeout = 2 * time.Minute
+	// mtuProbeNXDOMAINRetries: when request-size MTU probe gets NXDOMAIN, retry this many times before giving up.
+	mtuProbeNXDOMAINRetries = 3
+)
 
 // dnsttDebug returns true when DNSTT_DEBUG is set (for verbose PING/PONG and MTU discovery logs).
 func dnsttDebug() bool { return os.Getenv("DNSTT_DEBUG") != "" }
@@ -194,6 +199,14 @@ func (sm *sessionManager) createSessionUnlocked() (*kcp.UDPSession, io.ReadWrite
 		2,  // resend=2: fast retransmit after 2 ACK gaps (0 = disabled)
 		1,  // nc=1: congestion window off
 	)
+	// DNS can take many seconds to respond; set minimum RTO so we don't retransmit too soon and burst.
+	kcpMinRTO := uint32(15000) // 15 sec default
+	if s := os.Getenv("DNSTT_KCP_MIN_RTO_MS"); s != "" {
+		if ms, err := strconv.ParseUint(s, 10, 32); err == nil {
+			kcpMinRTO = uint32(ms)
+		}
+	}
+	conn.SetMinRTO(kcpMinRTO)
 	conn.SetWindowSize(512, 512) // was QueueSize/2=64; larger window for high-latency DNS
 	if rc := conn.SetMtu(sm.mtu); !rc {
 		conn.Close()
@@ -393,15 +406,10 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 	}
 	log.Printf("Tunnel MTU: %d bytes (max payload per DNS response)", mtu)
 
-	// Create session manager
+	// Create session manager. Session (KCP + Noise + smux) is created lazily on
+	// first TCP connection via getSession(), so no handshake burst when no app is connected.
 	sm := newSessionManager(pubkey, domain, remoteAddr, pconn, mtu)
 	defer sm.closeSession()
-
-	// Create initial session
-	err = sm.createSession()
-	if err != nil {
-		return err
-	}
 
 	for {
 		local, err := ln.Accept()
@@ -572,7 +580,7 @@ func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration) {
 	probeID := turbotunnel.NewClientID()
 
 	// Server MTU: how big a response can the path deliver? (server→client)
-	serverSizes := []int{256, 512, 1024, 1232, 1452, 2048, 4096}
+	serverSizes := []int{256, 384, 512, 1024, 1232, 1452, 2048, 4096}
 	serverMTU := 0
 	if dnsttDebug() {
 		log.Printf("DNSTT_DEBUG: MTU phase 1 %s: testing max response size (server→client)", ep.name)
@@ -643,33 +651,37 @@ func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration) {
 		if err != nil {
 			continue
 		}
-		ep.probeConn.SetDeadline(time.Now().Add(timeout))
-		_, err = ep.probeConn.WriteTo(msg, ep.addr)
-		if err != nil {
-			ep.probeConn.SetDeadline(time.Time{})
-			break
-		}
-		if dnsttDebug() {
-			log.Printf("DNSTT_DEBUG: MTU probe %s: testing request size %d bytes, PING query (hex):\n%s", ep.name, size, dnsttDebugHexDump(msg, 0))
-		}
+		var ok bool
+		var n int
 		buf := make([]byte, 4096)
-		n, _, err := ep.probeConn.ReadFrom(buf)
-		ep.probeConn.SetDeadline(time.Time{})
-		responseLen := 0
-		var responseRcode int
-		if err == nil {
+		for attempt := 0; attempt <= mtuProbeNXDOMAINRetries; attempt++ {
+			ep.probeConn.SetDeadline(time.Now().Add(timeout))
+			_, err = ep.probeConn.WriteTo(msg, ep.addr)
+			if err != nil {
+				ep.probeConn.SetDeadline(time.Time{})
+				break
+			}
+			if dnsttDebug() && attempt > 0 {
+				log.Printf("DNSTT_DEBUG: MTU probe %s: request size %d retry %d/%d (previous NXDOMAIN)", ep.name, size, attempt, mtuProbeNXDOMAINRetries)
+			}
+			if dnsttDebug() && attempt == 0 {
+				log.Printf("DNSTT_DEBUG: MTU probe %s: testing request size %d bytes, PING query (hex):\n%s", ep.name, size, dnsttDebugHexDump(msg, 0))
+			}
+			n, _, err = ep.probeConn.ReadFrom(buf)
+			ep.probeConn.SetDeadline(time.Time{})
+			if err != nil {
+				break
+			}
+			responseLen := 0
+			var responseRcode int
 			if resp, parseErr := dns.MessageFromWireFormat(buf[:n]); parseErr == nil {
 				responseRcode = int(resp.Rcode())
 				if p := dnsResponsePayload(&resp, domain); p != nil {
 					responseLen = len(p)
 				}
 			}
-		}
-		ok := err == nil && VerifyProbeResponse(buf[:n], domain)
-		if dnsttDebug() {
-			if err != nil {
-				log.Printf("DNSTT_DEBUG: MTU probe %s: response error (request size %d): %v", ep.name, size, err)
-			} else {
+			ok = VerifyProbeResponse(buf[:n], domain)
+			if dnsttDebug() {
 				rcodeStr := "NOERROR"
 				if responseRcode != dns.RcodeNoError {
 					rcodeStr = fmt.Sprintf("RCODE %d (e.g. NXDOMAIN=3)", responseRcode)
@@ -680,6 +692,13 @@ func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration) {
 				}
 				log.Printf("DNSTT_DEBUG: MTU probe %s: testing request size %d bytes, PONG response (hex):\n%s", ep.name, size, dnsttDebugHexDump(buf[:n], 0))
 			}
+			if ok {
+				break
+			}
+			if responseRcode == dns.RcodeNoError {
+				break
+			}
+			// NXDOMAIN (or other error rcode): retry same probe
 		}
 		if err != nil {
 			break

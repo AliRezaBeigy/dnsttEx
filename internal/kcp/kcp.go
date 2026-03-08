@@ -1054,6 +1054,19 @@ func (kcp *KCP) NoDelay(nodelay, interval, resend, nc int) int {
 	return 0
 }
 
+// SetMinRTO sets the minimum retransmission timeout in milliseconds.
+// Use a large value (e.g. 15000 for DNS) when the underlying transport is slow to respond
+// so KCP does not retransmit too soon and cause a send burst.
+func (kcp *KCP) SetMinRTO(ms uint32) {
+	if ms > IKCP_RTO_MAX {
+		ms = IKCP_RTO_MAX
+	}
+	kcp.rx_minrto = ms
+	if kcp.rx_rto < kcp.rx_minrto {
+		kcp.rx_rto = kcp.rx_minrto
+	}
+}
+
 // WndSize sets maximum window size: sndwnd=32, rcvwnd=32 by default
 func (kcp *KCP) WndSize(sndwnd, rcvwnd int) int {
 	if sndwnd > 0 {

@@ -549,6 +549,13 @@ func (s *UDPSession) SetNoDelay(nodelay, interval, resend, nc int) {
 	s.kcp.NoDelay(nodelay, interval, resend, nc)
 }
 
+// SetMinRTO sets the minimum retransmission timeout in milliseconds (see KCP.SetMinRTO).
+func (s *UDPSession) SetMinRTO(ms uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.kcp.SetMinRTO(ms)
+}
+
 // SetDSCP sets the 6bit DSCP field in IPv4 header, or 8bit Traffic Class in IPv6 header.
 //
 // if the underlying connection has implemented `func SetDSCP(int) error`, SetDSCP() will invoke
