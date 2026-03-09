@@ -817,6 +817,89 @@ func (r *chaosUDPRelay) loop() {
 	}
 }
 
+// truncatingEveryNthUDPRelay truncates every Nth server->client response to
+// simulate malformed DNS packets in transit.
+type truncatingEveryNthUDPRelay struct {
+	ln            *net.UDPConn
+	serverConn    *net.UDPConn
+	serverAddr    *net.UDPAddr
+	truncateEvery int
+	truncateTo    int
+
+	mu         sync.Mutex
+	clientAddr *net.UDPAddr
+
+	serverPackets atomic.Int64
+}
+
+func newTruncatingEveryNthUDPRelay(t testing.TB, serverAddrStr string, truncateEvery, truncateTo int) *truncatingEveryNthUDPRelay {
+	t.Helper()
+	serverAddr, err := net.ResolveUDPAddr("udp", serverAddrStr)
+	if err != nil {
+		t.Fatalf("resolve server addr: %v", err)
+	}
+	ln, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("truncating-nth relay listen: %v", err)
+	}
+	serverConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		ln.Close()
+		t.Fatalf("truncating-nth relay server conn: %v", err)
+	}
+	r := &truncatingEveryNthUDPRelay{
+		ln:            ln,
+		serverConn:    serverConn,
+		serverAddr:    serverAddr,
+		truncateEvery: truncateEvery,
+		truncateTo:    truncateTo,
+	}
+	go r.loop()
+	return r
+}
+
+func (r *truncatingEveryNthUDPRelay) Addr() string { return r.ln.LocalAddr().String() }
+
+func (r *truncatingEveryNthUDPRelay) Close() {
+	r.ln.Close()
+	r.serverConn.Close()
+}
+
+func (r *truncatingEveryNthUDPRelay) loop() {
+	buf := make([]byte, 4096)
+	go func() {
+		buf2 := make([]byte, 4096)
+		for {
+			n, _, err := r.serverConn.ReadFromUDP(buf2)
+			if err != nil {
+				return
+			}
+			seq := int(r.serverPackets.Add(1))
+			r.mu.Lock()
+			clientAddr := r.clientAddr
+			r.mu.Unlock()
+			if clientAddr == nil {
+				continue
+			}
+			toSend := buf2[:n]
+			if r.truncateEvery > 0 && seq%r.truncateEvery == 0 && r.truncateTo > 0 && r.truncateTo < len(toSend) {
+				toSend = buf2[:r.truncateTo]
+			}
+			r.ln.WriteToUDP(toSend, clientAddr)
+		}
+	}()
+	for {
+		n, clientAddr, err := r.ln.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		r.mu.Lock()
+		r.clientAddr = clientAddr
+		r.mu.Unlock()
+		r.serverConn.WriteToUDP(buf[:n], r.serverAddr)
+	}
+}
+
 const (
 	ednsOptionUpstream   = 0xFF00 // client → server payload
 	ednsOptionDownstream = 0xFF01 // server → client payload

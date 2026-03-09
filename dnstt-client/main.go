@@ -859,7 +859,7 @@ func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration) {
 		}
 	}
 	if clientMTU == 0 {
-		clientMTU = 512
+		clientMTU = 128 // safest request-side fallback when probes fail
 	}
 
 	ep.setMaxSizes(serverMTU, clientMTU)
