@@ -20,7 +20,7 @@ func TestConcurrent(t *testing.T) {
 		t.Skip("skipping concurrent test in short mode")
 	}
 
-	h := newTunnelHarness(t, globalServerBin, globalClientBin)
+	h := newTunnelHarness(t, globalServerBin, globalClientBin, nil)
 
 	const (
 		numConns       = 10
@@ -97,7 +97,7 @@ func TestConcurrent(t *testing.T) {
 // smux streams.  Each iteration opens b.N goroutines, sends 4 KB each, and
 // reads the echo back.  Run with small -benchtime=Nx (e.g., -benchtime=5x).
 func BenchmarkConcurrent(b *testing.B) {
-	h := newTunnelHarness(b, globalServerBin, globalClientBin)
+	h := newTunnelHarness(b, globalServerBin, globalClientBin, nil)
 
 	const payloadPerConn = 4 * 1024 // 4 KB
 	b.SetBytes(int64(b.N) * payloadPerConn * 2)
@@ -117,9 +117,24 @@ func BenchmarkConcurrent(b *testing.B) {
 			conn.SetDeadline(time.Now().Add(120 * time.Second))
 
 			payload := make([]byte, payloadPerConn)
+			for j := range payload {
+				payload[j] = byte(id)
+			}
 			recvBuf := make([]byte, payloadPerConn)
-			conn.Write(payload)
-			io.ReadFull(conn, recvBuf)
+			if _, err := conn.Write(payload); err != nil {
+				b.Errorf("conn %d write: %v", id, err)
+				return
+			}
+			if _, err := io.ReadFull(conn, recvBuf); err != nil {
+				b.Errorf("conn %d read: %v", id, err)
+				return
+			}
+			for j, by := range recvBuf {
+				if by != byte(id) {
+					b.Errorf("conn %d byte[%d]=%d want %d", id, j, by, id)
+					return
+				}
+			}
 		}(id)
 	}
 	wg.Wait()

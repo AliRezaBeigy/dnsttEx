@@ -69,6 +69,9 @@ func collectRTTs(t testing.TB, conn net.Conn, n int) []time.Duration {
 		if _, err := io.ReadFull(conn, pong); err != nil {
 			t.Fatalf("collectRTTs read %d: %v", i, err)
 		}
+		if pong[0] != 0x42 {
+			t.Fatalf("collectRTTs read %d: echoed byte %x, want 0x42 (data corruption)", i, pong[0])
+		}
 		rtts = append(rtts, time.Since(start))
 		time.Sleep(10 * time.Millisecond)
 	}

@@ -12,7 +12,7 @@ import (
 // A single persistent TCP connection sends 4 KB chunks and reads them back.
 // b.SetBytes causes go test -bench to report MB/s automatically.
 func BenchmarkThroughput(b *testing.B) {
-	h := newTunnelHarness(b, globalServerBin, globalClientBin)
+	h := newTunnelHarness(b, globalServerBin, globalClientBin, nil)
 	conn := h.dialTunnel(b)
 	defer conn.Close()
 
@@ -36,6 +36,9 @@ func BenchmarkThroughput(b *testing.B) {
 		}
 		if _, err := io.ReadFull(conn, recvBuf); err != nil {
 			b.Fatalf("read: %v", err)
+		}
+		if recvBuf[0] != payload[0] || recvBuf[chunkSize-1] != payload[chunkSize-1] {
+			b.Fatalf("echo data mismatch (corruption)")
 		}
 	}
 

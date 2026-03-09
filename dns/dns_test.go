@@ -547,8 +547,8 @@ func TestEncodeRDataTXT(t *testing.T) {
 	// zero, not an empty slice.
 	p := make([]byte, 0)
 	encoded := EncodeRDataTXT(p)
-	if len(encoded) < 0 {
-		t.Errorf("EncodeRDataTXT(%v) returned %v", p, encoded)
+	if len(encoded) < 1 {
+		t.Errorf("EncodeRDataTXT(%v) returned %v (need at least 1 byte for length octet)", p, encoded)
 	}
 
 	// 255 bytes should be able to be encoded into 256 bytes.
