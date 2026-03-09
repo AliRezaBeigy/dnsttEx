@@ -909,7 +909,10 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 						if 1+len(p) > payloadLimit-used {
 							c.QueuePacketConn.Stash(p, addr)
 							if !coalesceTimer.Stop() {
-								select { case <-coalesceTimer.C: default: }
+								select {
+								case <-coalesceTimer.C:
+								default:
+								}
 							}
 							goto done
 						}
@@ -919,7 +922,10 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 						if 1+len(p) > payloadLimit-used {
 							c.QueuePacketConn.Stash(p, addr)
 							if !coalesceTimer.Stop() {
-								select { case <-coalesceTimer.C: default: }
+								select {
+								case <-coalesceTimer.C:
+								default:
+								}
 							}
 							goto done
 						}
@@ -930,7 +936,10 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 					}
 				}
 				if !coalesceTimer.Stop() {
-					select { case <-coalesceTimer.C: default: }
+					select {
+					case <-coalesceTimer.C:
+					default:
+					}
 				}
 			}
 		done:
