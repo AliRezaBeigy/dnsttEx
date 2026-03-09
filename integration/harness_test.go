@@ -83,11 +83,112 @@ type tunnelHarness struct {
 	echoLn    net.Listener
 }
 
+type realNetworkConfig struct {
+	ServerBind   string
+	ServerTarget string
+	ClientListen string
+}
+
+func realNetworkEnabled() bool {
+	return os.Getenv("DNSTT_REALNET") != ""
+}
+
+func validateUDPBindAddr(t testing.TB, addr string, envName string) {
+	t.Helper()
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		t.Fatalf("%s %q is not a valid UDP address: %v", envName, addr, err)
+	}
+	probeAddr := *udpAddr
+	probeAddr.Port = 0
+	ln, err := net.ListenUDP("udp", &probeAddr)
+	if err != nil {
+		t.Fatalf("%s %q is not bindable on this machine: %v\nUse a local interface address or 0.0.0.0:port for binding, and use DNSTT_REALNET_SERVER_TARGET for the client-facing address.", envName, addr, err)
+	}
+	ln.Close()
+}
+
+func validateTCPListenAddr(t testing.TB, addr string, envName string) {
+	t.Helper()
+	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
+	if err != nil {
+		t.Fatalf("%s %q is not a valid TCP address: %v", envName, addr, err)
+	}
+	probeAddr := *tcpAddr
+	probeAddr.Port = 0
+	ln, err := net.ListenTCP("tcp", &probeAddr)
+	if err != nil {
+		t.Fatalf("%s %q is not listenable on this machine: %v", envName, addr, err)
+	}
+	ln.Close()
+}
+
+func loadRealNetworkConfig(t testing.TB) *realNetworkConfig {
+	t.Helper()
+	if !realNetworkEnabled() {
+		return nil
+	}
+	cfg := &realNetworkConfig{
+		ServerBind:   os.Getenv("DNSTT_REALNET_SERVER_BIND"),
+		ServerTarget: os.Getenv("DNSTT_REALNET_SERVER_TARGET"),
+		ClientListen: os.Getenv("DNSTT_REALNET_CLIENT_LISTEN"),
+	}
+	if cfg.ServerBind == "" {
+		t.Fatal("DNSTT_REALNET=1 requires DNSTT_REALNET_SERVER_BIND")
+	}
+	if cfg.ServerTarget == "" {
+		t.Fatal("DNSTT_REALNET=1 requires DNSTT_REALNET_SERVER_TARGET")
+	}
+	if cfg.ClientListen == "" {
+		cfg.ClientListen = allocFreeTCPAddr(t)
+	}
+	validateUDPBindAddr(t, cfg.ServerBind, "DNSTT_REALNET_SERVER_BIND")
+	validateTCPListenAddr(t, cfg.ClientListen, "DNSTT_REALNET_CLIENT_LISTEN")
+	return cfg
+}
+
+func relayListenUDPAddr(t testing.TB) *net.UDPAddr {
+	t.Helper()
+	addr := "127.0.0.1:0"
+	if realNetworkEnabled() {
+		addr = "0.0.0.0:0"
+	}
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		t.Fatalf("resolve relay listen addr: %v", err)
+	}
+	return udpAddr
+}
+
+func relayAdvertiseAddr(t testing.TB, listenAddr string, serverAddrStr string) string {
+	t.Helper()
+	if !realNetworkEnabled() {
+		return listenAddr
+	}
+	host, _, err := net.SplitHostPort(serverAddrStr)
+	if err != nil {
+		t.Fatalf("split relay server addr: %v", err)
+	}
+	_, port, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		t.Fatalf("split relay listen addr: %v", err)
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func relayUpstreamBindAddr(listenAddr *net.UDPAddr) *net.UDPAddr {
+	if listenAddr == nil {
+		return nil
+	}
+	return &net.UDPAddr{IP: listenAddr.IP, Port: 0, Zone: listenAddr.Zone}
+}
+
 // newTunnelHarness starts a full tunnel stack and waits for it to be ready.
 // Registers t.Cleanup(h.Teardown). If clientEnv is non-nil, the client process
 // is started with those env vars (e.g. DNSTT_SMUX_KEEPALIVE_TIMEOUT for reconnect tests).
 func newTunnelHarness(t testing.TB, serverBin, clientBin string, clientEnv map[string]string) *tunnelHarness {
 	t.Helper()
+	realnet := loadRealNetworkConfig(t)
 
 	h := &tunnelHarness{
 		serverBin: serverBin,
@@ -112,8 +213,15 @@ func newTunnelHarness(t testing.TB, serverBin, clientBin string, clientEnv map[s
 	h.privkeyHex = noise.EncodeKey(privkey)
 	h.pubkeyHex = noise.EncodeKey(pubkey)
 
-	// 3. Free UDP port for DNS server.
-	h.dnsUDPAddr = allocFreeUDPAddr(t)
+	// 3. DNS server bind address.
+	clientResolverAddr := ""
+	if realnet != nil {
+		h.dnsUDPAddr = realnet.ServerBind
+		clientResolverAddr = realnet.ServerTarget
+	} else {
+		h.dnsUDPAddr = allocFreeUDPAddr(t)
+		clientResolverAddr = h.dnsUDPAddr
+	}
 
 	// 4. Start dnstt-server.
 	h.serverCmd = exec.Command(serverBin,
@@ -129,12 +237,16 @@ func newTunnelHarness(t testing.TB, serverBin, clientBin string, clientEnv map[s
 	// Give server time to bind its UDP socket.
 	time.Sleep(300 * time.Millisecond)
 
-	// 5. Free TCP port for client listener.
-	h.ClientAddr = allocFreeTCPAddr(t)
+	// 5. Client listener address.
+	if realnet != nil {
+		h.ClientAddr = realnet.ClientListen
+	} else {
+		h.ClientAddr = allocFreeTCPAddr(t)
+	}
 
 	// 6. Start dnstt-client.
 	h.clientCmd = exec.Command(clientBin,
-		"-udp", h.dnsUDPAddr,
+		"-udp", clientResolverAddr,
 		"-pubkey", h.pubkeyHex,
 		h.domain,
 		h.ClientAddr,
@@ -162,6 +274,7 @@ func newTunnelHarness(t testing.TB, serverBin, clientBin string, clientEnv map[s
 // countingUDPRelay between client and server to measure wire bytes.
 func newTunnelHarnessWithRelay(t testing.TB, serverBin, clientBin string) (*countingUDPRelay, *tunnelHarness) {
 	t.Helper()
+	realnet := loadRealNetworkConfig(t)
 
 	h := &tunnelHarness{
 		serverBin: serverBin,
@@ -184,7 +297,14 @@ func newTunnelHarnessWithRelay(t testing.TB, serverBin, clientBin string) (*coun
 	h.privkeyHex = noise.EncodeKey(privkey)
 	h.pubkeyHex = noise.EncodeKey(pubkey)
 
-	h.dnsUDPAddr = allocFreeUDPAddr(t)
+	clientResolverAddr := ""
+	if realnet != nil {
+		h.dnsUDPAddr = realnet.ServerBind
+		clientResolverAddr = realnet.ServerTarget
+	} else {
+		h.dnsUDPAddr = allocFreeUDPAddr(t)
+		clientResolverAddr = h.dnsUDPAddr
+	}
 
 	h.serverCmd = exec.Command(serverBin,
 		"-udp", h.dnsUDPAddr,
@@ -199,9 +319,18 @@ func newTunnelHarnessWithRelay(t testing.TB, serverBin, clientBin string) (*coun
 	time.Sleep(300 * time.Millisecond)
 
 	// Insert counting relay between client and server.
-	relay := newCountingUDPRelay(t, h.dnsUDPAddr)
+	var relay *countingUDPRelay
+	if realnet != nil {
+		relay = newRealNetworkCountingUDPRelay(t, clientResolverAddr, nil)
+	} else {
+		relay = newCountingUDPRelay(t, h.dnsUDPAddr)
+	}
 
-	h.ClientAddr = allocFreeTCPAddr(t)
+	if realnet != nil {
+		h.ClientAddr = realnet.ClientListen
+	} else {
+		h.ClientAddr = allocFreeTCPAddr(t)
+	}
 	h.clientCmd = exec.Command(clientBin,
 		"-udp", relay.Addr(), // client → relay → server
 		"-pubkey", h.pubkeyHex,
@@ -237,6 +366,7 @@ type makeRelayFunc func(serverAddr string) udpRelay
 // If clientEnv is non-nil, the client process is started with these env vars (in addition to the current process env).
 func newTunnelHarnessWithRelayAndStderr(t testing.TB, serverBin, clientBin string, makeRelay makeRelayFunc, stderrBuf *bytes.Buffer, clientEnv map[string]string) *tunnelHarness {
 	t.Helper()
+	realnet := loadRealNetworkConfig(t)
 	h := &tunnelHarness{
 		serverBin: serverBin,
 		clientBin: clientBin,
@@ -254,7 +384,14 @@ func newTunnelHarnessWithRelayAndStderr(t testing.TB, serverBin, clientBin strin
 	}
 	h.privkeyHex = noise.EncodeKey(privkey)
 	h.pubkeyHex = noise.EncodeKey(noise.PubkeyFromPrivkey(privkey))
-	h.dnsUDPAddr = allocFreeUDPAddr(t)
+	clientResolverAddr := ""
+	if realnet != nil {
+		h.dnsUDPAddr = realnet.ServerBind
+		clientResolverAddr = realnet.ServerTarget
+	} else {
+		h.dnsUDPAddr = allocFreeUDPAddr(t)
+		clientResolverAddr = h.dnsUDPAddr
+	}
 	h.serverCmd = exec.Command(serverBin,
 		"-udp", h.dnsUDPAddr,
 		"-privkey", h.privkeyHex,
@@ -266,8 +403,12 @@ func newTunnelHarnessWithRelayAndStderr(t testing.TB, serverBin, clientBin strin
 		t.Fatalf("start server: %v", err)
 	}
 	time.Sleep(300 * time.Millisecond)
-	relay := makeRelay(h.dnsUDPAddr)
-	h.ClientAddr = allocFreeTCPAddr(t)
+	relay := makeRelay(clientResolverAddr)
+	if realnet != nil {
+		h.ClientAddr = realnet.ClientListen
+	} else {
+		h.ClientAddr = allocFreeTCPAddr(t)
+	}
 	h.clientCmd = exec.Command(clientBin,
 		"-udp", relay.Addr(),
 		"-pubkey", h.pubkeyHex,
@@ -297,6 +438,7 @@ func newTunnelHarnessWithRelayAndStderr(t testing.TB, serverBin, clientBin strin
 // logs each DNS query and response via t.Logf.
 func newTunnelHarnessWithRelayAndDNSLog(t testing.TB, serverBin, clientBin string) (*countingUDPRelay, *tunnelHarness) {
 	t.Helper()
+	realnet := loadRealNetworkConfig(t)
 
 	h := &tunnelHarness{
 		serverBin: serverBin,
@@ -319,7 +461,14 @@ func newTunnelHarnessWithRelayAndDNSLog(t testing.TB, serverBin, clientBin strin
 	h.privkeyHex = noise.EncodeKey(privkey)
 	h.pubkeyHex = noise.EncodeKey(pubkey)
 
-	h.dnsUDPAddr = allocFreeUDPAddr(t)
+	clientResolverAddr := ""
+	if realnet != nil {
+		h.dnsUDPAddr = realnet.ServerBind
+		clientResolverAddr = realnet.ServerTarget
+	} else {
+		h.dnsUDPAddr = allocFreeUDPAddr(t)
+		clientResolverAddr = h.dnsUDPAddr
+	}
 
 	h.serverCmd = exec.Command(serverBin,
 		"-udp", h.dnsUDPAddr,
@@ -333,9 +482,18 @@ func newTunnelHarnessWithRelayAndDNSLog(t testing.TB, serverBin, clientBin strin
 	}
 	time.Sleep(300 * time.Millisecond)
 
-	relay := newCountingUDPRelayWithDNSLog(t, h.dnsUDPAddr, nil) // set nil for now
+	var relay *countingUDPRelay
+	if realnet != nil {
+		relay = newRealNetworkCountingUDPRelay(t, clientResolverAddr, t)
+	} else {
+		relay = newCountingUDPRelayWithDNSLog(t, h.dnsUDPAddr, t)
+	}
 
-	h.ClientAddr = allocFreeTCPAddr(t)
+	if realnet != nil {
+		h.ClientAddr = realnet.ClientListen
+	} else {
+		h.ClientAddr = allocFreeTCPAddr(t)
+	}
 	h.clientCmd = exec.Command(clientBin,
 		"-udp", relay.Addr(),
 		"-pubkey", h.pubkeyHex,
@@ -516,8 +674,10 @@ func TestDataIntegrity(t *testing.T) {
 // It counts raw bytes in both directions for wire-overhead measurement.
 // If dnsLog is set, each DNS packet is parsed and logged (query/response).
 type countingUDPRelay struct {
-	ln         *net.UDPConn // listens for client packets
-	serverAddr *net.UDPAddr // real server address
+	ln              *net.UDPConn // listens for client packets
+	serverAddr      *net.UDPAddr // real server address
+	upstreamBindAddr *net.UDPAddr
+	advertiseAddr   string
 
 	sent     atomic.Int64 // bytes forwarded client → server
 	received atomic.Int64 // bytes forwarded server → client
@@ -537,20 +697,53 @@ func newCountingUDPRelay(t testing.TB, serverAddrStr string) *countingUDPRelay {
 // newCountingUDPRelayWithDNSLog is like newCountingUDPRelay but logs each DNS
 // query and response via tb.Logf when dnsLog is non-nil.
 func newCountingUDPRelayWithDNSLog(t testing.TB, serverAddrStr string, dnsLog testing.TB) *countingUDPRelay {
+	if realNetworkEnabled() {
+		return newRealNetworkCountingUDPRelay(t, serverAddrStr, dnsLog)
+	}
+	return newCountingUDPRelayWithConfig(t, serverAddrStr, dnsLog, "127.0.0.1:0", "")
+}
+
+// newRealNetworkCountingUDPRelay exposes a transparent relay on the same host as
+// serverAddrStr so relay-based tests can still traverse a real interface.
+func newRealNetworkCountingUDPRelay(t testing.TB, serverAddrStr string, dnsLog testing.TB) *countingUDPRelay {
+	t.Helper()
+	host, _, err := net.SplitHostPort(serverAddrStr)
+	if err != nil {
+		t.Fatalf("split real-network relay server target: %v", err)
+	}
+	return newCountingUDPRelayWithConfig(t, serverAddrStr, dnsLog, "0.0.0.0:0", host)
+}
+
+func newCountingUDPRelayWithConfig(t testing.TB, serverAddrStr string, dnsLog testing.TB, listenAddrStr string, advertiseHost string) *countingUDPRelay {
 	t.Helper()
 	serverAddr, err := net.ResolveUDPAddr("udp", serverAddrStr)
 	if err != nil {
 		t.Fatalf("resolve server addr: %v", err)
 	}
-	ln, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	listenAddr, err := net.ResolveUDPAddr("udp", listenAddrStr)
+	if err != nil {
+		t.Fatalf("resolve relay listen addr: %v", err)
+	}
+	ln, err := net.ListenUDP("udp", listenAddr)
 	if err != nil {
 		t.Fatalf("relay listen: %v", err)
 	}
+	advertiseAddr := ln.LocalAddr().String()
+	if advertiseHost != "" {
+		_, port, err := net.SplitHostPort(advertiseAddr)
+		if err != nil {
+			ln.Close()
+			t.Fatalf("split relay listen addr: %v", err)
+		}
+		advertiseAddr = net.JoinHostPort(advertiseHost, port)
+	}
 	r := &countingUDPRelay{
-		ln:         ln,
-		serverAddr: serverAddr,
-		done:       make(chan struct{}),
-		dnsLog:     dnsLog,
+		ln:               ln,
+		serverAddr:       serverAddr,
+		upstreamBindAddr: &net.UDPAddr{IP: listenAddr.IP, Port: 0, Zone: listenAddr.Zone},
+		advertiseAddr:    advertiseAddr,
+		done:             make(chan struct{}),
+		dnsLog:           dnsLog,
 	}
 	go r.loop()
 	return r
@@ -558,6 +751,9 @@ func newCountingUDPRelayWithDNSLog(t testing.TB, serverAddrStr string, dnsLog te
 
 // Addr returns the UDP address clients should send queries to.
 func (r *countingUDPRelay) Addr() string {
+	if r.advertiseAddr != "" {
+		return r.advertiseAddr
+	}
 	return r.ln.LocalAddr().String()
 }
 
@@ -570,7 +766,7 @@ func (r *countingUDPRelay) Close() {
 func (r *countingUDPRelay) loop() {
 	// Single goroutine: receive from ln, forward to server, receive server replies, forward to client.
 	// We use a second UDPConn to talk to the server so we can ReadFrom both directions.
-	serverConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	serverConn, err := net.ListenUDP("udp", r.upstreamBindAddr)
 	if err != nil {
 		return
 	}
@@ -623,6 +819,7 @@ type truncatingUDPRelay struct {
 	ln              *net.UDPConn
 	serverConn      *net.UDPConn
 	serverAddr      *net.UDPAddr
+	advertiseAddr   string
 	maxResponseSize int
 	maxRequestSize  int // 0 = no limit
 	sent            atomic.Int64
@@ -646,17 +843,19 @@ func newTruncatingUDPRelayWithRequestLimit(t testing.TB, serverAddrStr string, m
 	if err != nil {
 		t.Fatalf("resolve server addr: %v", err)
 	}
-	ln, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	listenAddr := relayListenUDPAddr(t)
+	ln, err := net.ListenUDP("udp", listenAddr)
 	if err != nil {
 		t.Fatalf("truncating relay listen: %v", err)
 	}
-	serverConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	serverConn, err := net.ListenUDP("udp", relayUpstreamBindAddr(listenAddr))
 	if err != nil {
 		ln.Close()
 		t.Fatalf("truncating relay server conn: %v", err)
 	}
 	r := &truncatingUDPRelay{
 		ln: ln, serverConn: serverConn, serverAddr: serverAddr,
+		advertiseAddr:   relayAdvertiseAddr(t, ln.LocalAddr().String(), serverAddrStr),
 		maxResponseSize: maxResponseSize,
 		maxRequestSize:  maxRequestSize,
 	}
@@ -704,7 +903,12 @@ func newTruncatingUDPRelayWithRequestLimit(t testing.TB, serverAddrStr string, m
 	return r
 }
 
-func (r *truncatingUDPRelay) Addr() string { return r.ln.LocalAddr().String() }
+func (r *truncatingUDPRelay) Addr() string {
+	if r.advertiseAddr != "" {
+		return r.advertiseAddr
+	}
+	return r.ln.LocalAddr().String()
+}
 
 func (r *truncatingUDPRelay) Close() {
 	r.ln.Close()
@@ -717,6 +921,7 @@ type chaosUDPRelay struct {
 	ln         *net.UDPConn
 	serverConn *net.UDPConn
 	serverAddr *net.UDPAddr
+	advertiseAddr string
 
 	mu         sync.Mutex
 	clientAddr *net.UDPAddr
@@ -736,11 +941,12 @@ func newChaosUDPRelay(t testing.TB, serverAddrStr string, dropClientEvery, dropS
 	if err != nil {
 		t.Fatalf("resolve server addr: %v", err)
 	}
-	ln, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	listenAddr := relayListenUDPAddr(t)
+	ln, err := net.ListenUDP("udp", listenAddr)
 	if err != nil {
 		t.Fatalf("chaos relay listen: %v", err)
 	}
-	serverConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	serverConn, err := net.ListenUDP("udp", relayUpstreamBindAddr(listenAddr))
 	if err != nil {
 		ln.Close()
 		t.Fatalf("chaos relay server conn: %v", err)
@@ -749,6 +955,7 @@ func newChaosUDPRelay(t testing.TB, serverAddrStr string, dropClientEvery, dropS
 		ln:                   ln,
 		serverConn:           serverConn,
 		serverAddr:           serverAddr,
+		advertiseAddr:        relayAdvertiseAddr(t, ln.LocalAddr().String(), serverAddrStr),
 		dropClientEvery:      dropClientEvery,
 		dropServerEvery:      dropServerEvery,
 		duplicateServerEvery: duplicateServerEvery,
@@ -758,7 +965,12 @@ func newChaosUDPRelay(t testing.TB, serverAddrStr string, dropClientEvery, dropS
 	return r
 }
 
-func (r *chaosUDPRelay) Addr() string { return r.ln.LocalAddr().String() }
+func (r *chaosUDPRelay) Addr() string {
+	if r.advertiseAddr != "" {
+		return r.advertiseAddr
+	}
+	return r.ln.LocalAddr().String()
+}
 
 func (r *chaosUDPRelay) Close() {
 	r.ln.Close()
@@ -823,6 +1035,7 @@ type truncatingEveryNthUDPRelay struct {
 	ln            *net.UDPConn
 	serverConn    *net.UDPConn
 	serverAddr    *net.UDPAddr
+	advertiseAddr string
 	truncateEvery int
 	truncateTo    int
 
@@ -838,11 +1051,12 @@ func newTruncatingEveryNthUDPRelay(t testing.TB, serverAddrStr string, truncateE
 	if err != nil {
 		t.Fatalf("resolve server addr: %v", err)
 	}
-	ln, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	listenAddr := relayListenUDPAddr(t)
+	ln, err := net.ListenUDP("udp", listenAddr)
 	if err != nil {
 		t.Fatalf("truncating-nth relay listen: %v", err)
 	}
-	serverConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	serverConn, err := net.ListenUDP("udp", relayUpstreamBindAddr(listenAddr))
 	if err != nil {
 		ln.Close()
 		t.Fatalf("truncating-nth relay server conn: %v", err)
@@ -851,6 +1065,7 @@ func newTruncatingEveryNthUDPRelay(t testing.TB, serverAddrStr string, truncateE
 		ln:            ln,
 		serverConn:    serverConn,
 		serverAddr:    serverAddr,
+		advertiseAddr: relayAdvertiseAddr(t, ln.LocalAddr().String(), serverAddrStr),
 		truncateEvery: truncateEvery,
 		truncateTo:    truncateTo,
 	}
@@ -858,7 +1073,12 @@ func newTruncatingEveryNthUDPRelay(t testing.TB, serverAddrStr string, truncateE
 	return r
 }
 
-func (r *truncatingEveryNthUDPRelay) Addr() string { return r.ln.LocalAddr().String() }
+func (r *truncatingEveryNthUDPRelay) Addr() string {
+	if r.advertiseAddr != "" {
+		return r.advertiseAddr
+	}
+	return r.ln.LocalAddr().String()
+}
 
 func (r *truncatingEveryNthUDPRelay) Close() {
 	r.ln.Close()
