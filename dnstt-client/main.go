@@ -86,6 +86,9 @@ const (
 // dnsttDebug returns true when DNSTT_DEBUG is set (for verbose PING/PONG and MTU discovery logs).
 func dnsttDebug() bool { return os.Getenv("DNSTT_DEBUG") != "" }
 
+// dnsttTrace returns true when DNSTT_TRACE is set (for full path tracing to diagnose failures).
+func dnsttTrace() bool { return os.Getenv("DNSTT_TRACE") != "" }
+
 // mtuProbeTimeout returns the per-probe timeout for MTU discovery. Default 8s.
 // Set DNSTT_MTU_PROBE_TIMEOUT to a duration (e.g. "2s", "1500ms") to use a shorter timeout
 // (e.g. in integration tests where dropped probes would otherwise block 8s).
@@ -428,6 +431,10 @@ type packetConnWithDone interface {
 	Done() <-chan struct{}
 }
 
+type kcpMTUHint interface {
+	KCPMTUHint() int
+}
+
 func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn) error {
 	defer pconn.Close()
 
@@ -448,10 +455,17 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 	if maxPayloadInName < mtu {
 		mtu = maxPayloadInName
 	}
+	if hintConn, ok := pconn.(kcpMTUHint); ok {
+		if hint := hintConn.KCPMTUHint(); hint >= minKCPMTU && hint < mtu {
+			mtu = hint
+		} else if hint > 0 && hint < minKCPMTU && dnsttTrace() {
+			log.Printf("DNSTT_TRACE: client run: ignoring request-path MTU hint %d below KCP minimum %d", hint, minKCPMTU)
+		}
+	}
 	if mtu < minKCPMTU {
 		return fmt.Errorf("tunnel MTU %d bytes is below KCP minimum (%d); use a shorter domain or larger path MTU", mtu, minKCPMTU)
 	}
-	log.Printf("Tunnel MTU: %d bytes (max payload per DNS response)", mtu)
+	log.Printf("Tunnel MTU: %d bytes", mtu)
 
 	// Create session manager. Session (KCP + Noise + smux) is created lazily on
 	// first TCP connection via getSession(), so no handshake burst when no app is connected.
