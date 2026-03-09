@@ -578,7 +578,9 @@ func BuildProbeMessage(domain dns.Name, clientID turbotunnel.ClientID) ([]byte, 
 		return nil, err
 	}
 	var id uint16
-	binary.Read(rand.Reader, binary.BigEndian, &id)
+	if err := binary.Read(rand.Reader, binary.BigEndian, &id); err != nil {
+		return nil, err
+	}
 	query := &dns.Message{
 		ID:    id,
 		Flags: 0x0100,
@@ -616,11 +618,13 @@ func BuildMTUProbeMessage(domain dns.Name, clientID turbotunnel.ClientID, respon
 	if err != nil {
 		return nil, err
 	}
-	var id uint16
-	binary.Read(rand.Reader, binary.BigEndian, &id)
 	optClass := uint16(responseSize)
 	if optClass < 512 {
 		optClass = 512 // RFC 6891
+	}
+	var id uint16
+	if err := binary.Read(rand.Reader, binary.BigEndian, &id); err != nil {
+		return nil, err
 	}
 	query := &dns.Message{
 		ID:    id,
@@ -733,7 +737,9 @@ func BuildProbeMessageWithRequestSize(domain dns.Name, clientID turbotunnel.Clie
 		return nil, err
 	}
 	var id uint16
-	binary.Read(rand.Reader, binary.BigEndian, &id)
+	if err := binary.Read(rand.Reader, binary.BigEndian, &id); err != nil {
+		return nil, err
+	}
 	query := &dns.Message{
 		ID:    id,
 		Flags: 0x0100,
