@@ -502,7 +502,8 @@ func (s *UDPSession) SetWindowSize(sndwnd, rcvwnd int) {
 	s.kcp.WndSize(sndwnd, rcvwnd)
 }
 
-// SetMtu sets the maximum transmission unit(not including UDP header)
+// SetMtu sets the maximum transmission unit(not including UDP header).
+// Returns false if mtu is out of range (KCP requires mtu >= 50 and mtu > IKCP_OVERHEAD).
 func (s *UDPSession) SetMtu(mtu int) bool {
 	if mtu > mtuLimit {
 		return false
@@ -510,7 +511,9 @@ func (s *UDPSession) SetMtu(mtu int) bool {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.kcp.SetMtu(mtu)
+	if s.kcp.SetMtu(mtu) != 0 {
+		return false
+	}
 	return true
 }
 

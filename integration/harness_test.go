@@ -226,7 +226,8 @@ type makeRelayFunc func(serverAddr string) udpRelay
 // newTunnelHarnessWithRelayAndStderr is like newTunnelHarnessWithRelay but uses
 // makeRelay(serverAddr) to create the relay after the server is started, and
 // captures client stderr into stderrBuf so tests can parse e.g. "MTU discovery ... server=512 client=512".
-func newTunnelHarnessWithRelayAndStderr(t testing.TB, serverBin, clientBin string, makeRelay makeRelayFunc, stderrBuf *bytes.Buffer) *tunnelHarness {
+// If clientEnv is non-nil, the client process is started with these env vars (in addition to the current process env).
+func newTunnelHarnessWithRelayAndStderr(t testing.TB, serverBin, clientBin string, makeRelay makeRelayFunc, stderrBuf *bytes.Buffer, clientEnv map[string]string) *tunnelHarness {
 	t.Helper()
 	h := &tunnelHarness{
 		serverBin: serverBin,
@@ -266,6 +267,13 @@ func newTunnelHarnessWithRelayAndStderr(t testing.TB, serverBin, clientBin strin
 		h.ClientAddr,
 	)
 	h.clientCmd.Stderr = stderrBuf
+	if len(clientEnv) > 0 {
+		env := os.Environ()
+		for k, v := range clientEnv {
+			env = append(env, k+"="+v)
+		}
+		h.clientCmd.Env = env
+	}
 	if err := h.clientCmd.Start(); err != nil {
 		t.Fatalf("start client: %v", err)
 	}
@@ -602,18 +610,29 @@ func (r *countingUDPRelay) loop() {
 
 // truncatingUDPRelay is a UDP relay that limits server→client response size to
 // maxResponseSize (e.g. 512 to simulate 512-byte-only resolvers). Used for MTU discovery tests.
+// If maxRequestSize > 0, client→server packets larger than that are dropped so discovery finds that client MTU.
 type truncatingUDPRelay struct {
-	ln              *net.UDPConn
-	serverConn      *net.UDPConn
-	serverAddr      *net.UDPAddr
-	maxResponseSize int
-	sent            atomic.Int64
-	received        atomic.Int64
-	mu              sync.Mutex
-	clientAddr      *net.UDPAddr
+	ln               *net.UDPConn
+	serverConn       *net.UDPConn
+	serverAddr       *net.UDPAddr
+	maxResponseSize  int
+	maxRequestSize   int // 0 = no limit
+	sent             atomic.Int64
+	received         atomic.Int64
+	mu               sync.Mutex
+	clientAddr       *net.UDPAddr
 }
 
+// newTruncatingUDPRelay creates a relay that truncates responses to maxResponseSize.
+// Use newTruncatingUDPRelayWithRequestLimit to also limit request size (client MTU).
 func newTruncatingUDPRelay(t testing.TB, serverAddrStr string, maxResponseSize int) *truncatingUDPRelay {
+	return newTruncatingUDPRelayWithRequestLimit(t, serverAddrStr, maxResponseSize, 0)
+}
+
+// newTruncatingUDPRelayWithRequestLimit creates a relay that truncates responses to maxResponseSize
+// and drops client→server packets larger than maxRequestSize (so MTU discovery finds client MTU = maxRequestSize).
+// Pass maxRequestSize 0 for no request limit.
+func newTruncatingUDPRelayWithRequestLimit(t testing.TB, serverAddrStr string, maxResponseSize, maxRequestSize int) *truncatingUDPRelay {
 	t.Helper()
 	serverAddr, err := net.ResolveUDPAddr("udp", serverAddrStr)
 	if err != nil {
@@ -631,6 +650,7 @@ func newTruncatingUDPRelay(t testing.TB, serverAddrStr string, maxResponseSize i
 	r := &truncatingUDPRelay{
 		ln: ln, serverConn: serverConn, serverAddr: serverAddr,
 		maxResponseSize: maxResponseSize,
+		maxRequestSize:  maxRequestSize,
 	}
 	buf := make([]byte, 4096)
 	go func() {
@@ -662,10 +682,14 @@ func newTruncatingUDPRelay(t testing.TB, serverAddrStr string, maxResponseSize i
 			if err != nil {
 				return
 			}
-			r.sent.Add(int64(n))
 			r.mu.Lock()
 			r.clientAddr = addr
 			r.mu.Unlock()
+			if r.maxRequestSize > 0 && n > r.maxRequestSize {
+				// Drop oversized request so client MTU discovery finds maxRequestSize.
+				continue
+			}
+			r.sent.Add(int64(n))
 			r.serverConn.WriteToUDP(buf[:n], r.serverAddr)
 		}
 	}()

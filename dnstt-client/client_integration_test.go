@@ -5,6 +5,7 @@ package main
 import (
 	"io"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -192,6 +193,11 @@ func TestDNSPacketConnSendRecv(t *testing.T) {
 
 	domain, _ := dns.ParseName("t.test.invalid")
 	serverAddr := serverConn.LocalAddr()
+
+	// Disable send coalescing so the client sends immediately (otherwise sendLoop
+	// waits up to 2s before sending the first batch).
+	os.Setenv("DNSTT_SEND_COALESCE_MS", "0")
+	defer os.Unsetenv("DNSTT_SEND_COALESCE_MS")
 
 	dnsPC := NewDNSPacketConn(clientUDP, serverAddr, domain, 0, 0)
 	defer dnsPC.Close()
