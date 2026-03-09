@@ -242,11 +242,22 @@ func (sm *sessionManager) createSessionUnlocked() (*kcp.UDPSession, io.ReadWrite
 	}
 
 	// Start a smux session on the Noise channel.
+	// Short keepalive so we detect dead servers quickly and reconnect (matches integration test).
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.Version = 2
-	smuxConfig.KeepAliveInterval = 15 * time.Second // send PING every 15s
-	smuxConfig.KeepAliveTimeout = 30 * time.Second  // declare dead after 30s without response (must be ≤ test reconnect window)
-	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024    // default is 65536
+	smuxConfig.KeepAliveInterval = 1 * time.Second // send PING every 15s
+	smuxConfig.KeepAliveTimeout = 3 * time.Second  // declare dead after 30s without response (must be ≤ test reconnect window)
+	if s := os.Getenv("DNSTT_SMUX_KEEPALIVE_INTERVAL"); s != "" {
+		if d, err := time.ParseDuration(s); err == nil && d >= time.Second {
+			smuxConfig.KeepAliveInterval = d
+		}
+	}
+	if s := os.Getenv("DNSTT_SMUX_KEEPALIVE_TIMEOUT"); s != "" {
+		if d, err := time.ParseDuration(s); err == nil && d >= time.Second {
+			smuxConfig.KeepAliveTimeout = d
+		}
+	}
+	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024 // default is 65536
 	sess, err := smux.Client(rw, smuxConfig)
 	if err != nil {
 		rw.Close()

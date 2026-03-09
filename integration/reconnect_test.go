@@ -14,17 +14,16 @@ import (
 // BenchmarkReconnect measures the time from server disruption to the first
 // successful echo on a new session through the same client.
 //
-// The dnstt-client already implements automatic session recreation
-// (sessionManager.createSession) which detects the dead KCP session via the
-// smux keepalive timeout (KeepAliveTimeout=30s) and reconnects automatically.
-// This benchmark measures the end-to-end recovery latency.
+// The client detects a dead session when smux's KeepAliveTimeout fires (no
+// PONG to PING) or when a stream operation fails. Production uses 1s/3s
+// keepalive so recovery takes a few seconds.
 func BenchmarkReconnect(b *testing.B) {
 	b.StopTimer()
 
 	for i := 0; i < b.N; i++ {
 		func() {
 			// Fresh harness per iteration so each reconnect starts clean.
-			h := newTunnelHarness(b, globalServerBin, globalClientBin)
+			h := newTunnelHarness(b, globalServerBin, globalClientBin, nil)
 			defer h.Teardown()
 
 			// Verify the tunnel is working before disruption.
@@ -57,7 +56,7 @@ func BenchmarkReconnect(b *testing.B) {
 			b.StartTimer()
 			restartTime := time.Now()
 
-			const maxWait = 60 * time.Second
+			const maxWait = 15 * time.Second // 3s keepalive + handshake; 15s is ample
 			deadline := time.Now().Add(maxWait)
 			reconnected := false
 
@@ -73,7 +72,7 @@ func BenchmarkReconnect(b *testing.B) {
 				_, rErr := io.ReadFull(c2, pong)
 				c2.Close()
 
-				if wErr == nil && rErr == nil {
+				if wErr == nil && rErr == nil && pong[0] == 0x42 {
 					reconnected = true
 					break
 				}
@@ -91,14 +90,14 @@ func BenchmarkReconnect(b *testing.B) {
 	}
 }
 
-// TestReconnect is a single-shot reconnect test that verifies the client
-// automatically recovers after the server restarts.
+// TestReconnect verifies the client automatically recovers after the server
+// restarts. Recovery is bounded by smux KeepAliveTimeout (production default 3s).
 func TestReconnect(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping reconnect test in short mode")
 	}
 
-	h := newTunnelHarness(t, globalServerBin, globalClientBin)
+	h := newTunnelHarness(t, globalServerBin, globalClientBin, nil)
 
 	// Verify working before disruption.
 	conn := h.dialTunnel(t)
@@ -122,9 +121,9 @@ func TestReconnect(t *testing.T) {
 	}
 	h.serverCmd = newServerCmd
 
-	// Poll until a successful echo is achieved.
+	// Poll until a successful echo is achieved (3s keepalive + handshake; 15s ample).
 	restartTime := time.Now()
-	deadline := time.Now().Add(60 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	reconnected := false
 
 	for time.Now().Before(deadline) {
@@ -139,7 +138,7 @@ func TestReconnect(t *testing.T) {
 		_, rErr := io.ReadFull(c2, pong)
 		c2.Close()
 
-		if wErr == nil && rErr == nil {
+		if wErr == nil && rErr == nil && pong[0] == 0x42 {
 			reconnected = true
 			break
 		}
@@ -148,7 +147,7 @@ func TestReconnect(t *testing.T) {
 
 	elapsed := time.Since(restartTime)
 	if !reconnected {
-		t.Fatal("failed to reconnect within 60s after server restart")
+		t.Fatal("failed to reconnect within 15s after server restart")
 	}
 	t.Logf("Reconnected in %v", elapsed)
 	writeMetricsJSON(t, "reconnect.json", map[string]any{

@@ -34,6 +34,11 @@ func TestParseWeightedList(t *testing.T) {
 				break
 			}
 		}
+		if len(weights) != len(test.expectedWeights) || len(labels) != len(test.expectedLabels) {
+			t.Errorf("%+q: expected len %d/%d, got %d/%d", test.input,
+				len(test.expectedWeights), len(test.expectedLabels), len(weights), len(labels))
+			continue
+		}
 		if i < len(test.expectedWeights) || i < len(test.expectedLabels) {
 			t.Errorf("%+q: expected %v, %v, got %v, %v", test.input,
 				test.expectedWeights, test.expectedLabels, weights, labels)

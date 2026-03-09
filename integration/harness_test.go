@@ -84,8 +84,9 @@ type tunnelHarness struct {
 }
 
 // newTunnelHarness starts a full tunnel stack and waits for it to be ready.
-// Registers t.Cleanup(h.Teardown).
-func newTunnelHarness(t testing.TB, serverBin, clientBin string) *tunnelHarness {
+// Registers t.Cleanup(h.Teardown). If clientEnv is non-nil, the client process
+// is started with those env vars (e.g. DNSTT_SMUX_KEEPALIVE_TIMEOUT for reconnect tests).
+func newTunnelHarness(t testing.TB, serverBin, clientBin string, clientEnv map[string]string) *tunnelHarness {
 	t.Helper()
 
 	h := &tunnelHarness{
@@ -139,6 +140,13 @@ func newTunnelHarness(t testing.TB, serverBin, clientBin string) *tunnelHarness 
 		h.ClientAddr,
 	)
 	h.clientCmd.Stderr = os.Stderr
+	if len(clientEnv) > 0 {
+		env := os.Environ()
+		for k, v := range clientEnv {
+			env = append(env, k+"="+v)
+		}
+		h.clientCmd.Env = env
+	}
 	if err := h.clientCmd.Start(); err != nil {
 		t.Fatalf("start client: %v", err)
 	}
@@ -445,7 +453,7 @@ func pingPong(t testing.TB, conn net.Conn, label string) {
 
 // TestSanity verifies the harness works: starts the full stack and does a 1-byte echo.
 func TestSanity(t *testing.T) {
-	h := newTunnelHarness(t, globalServerBin, globalClientBin)
+	h := newTunnelHarness(t, globalServerBin, globalClientBin, nil)
 	conn := h.dialTunnel(t)
 	defer conn.Close()
 	pingPong(t, conn, "sanity")

@@ -13,7 +13,7 @@ import (
 // polling (initPollDelay=500ms, maxPollDelay=2s), so RTTs are in the
 // hundreds-of-milliseconds range.
 func BenchmarkLatency(b *testing.B) {
-	h := newTunnelHarness(b, globalServerBin, globalClientBin)
+	h := newTunnelHarness(b, globalServerBin, globalClientBin, nil)
 	conn := h.dialTunnel(b)
 	defer conn.Close()
 
@@ -22,15 +22,27 @@ func BenchmarkLatency(b *testing.B) {
 
 	// Warm up: one successful echo before timing starts.
 	conn.SetDeadline(time.Now().Add(30 * time.Second))
-	conn.Write(ping)
-	io.ReadFull(conn, pong)
+	if _, err := conn.Write(ping); err != nil {
+		b.Fatal(err)
+	}
+	if _, err := io.ReadFull(conn, pong); err != nil {
+		b.Fatal(err)
+	}
+	if pong[0] != 0x42 {
+		b.Fatal("warm-up echo byte mismatch")
+	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		start := time.Now()
 		conn.SetDeadline(time.Now().Add(30 * time.Second))
 		conn.Write(ping)
-		io.ReadFull(conn, pong)
+		if _, err := io.ReadFull(conn, pong); err != nil {
+			b.Fatalf("read: %v", err)
+		}
+		if pong[0] != 0x42 {
+			b.Fatalf("echoed byte %x, want 0x42", pong[0])
+		}
 		rtt := time.Since(start)
 		b.ReportMetric(float64(rtt.Milliseconds()), "ms/rtt")
 	}
@@ -43,7 +55,7 @@ func TestLatencyPercentiles(t *testing.T) {
 		t.Skip("skipping percentile test in short mode")
 	}
 
-	h := newTunnelHarness(t, globalServerBin, globalClientBin)
+	h := newTunnelHarness(t, globalServerBin, globalClientBin, nil)
 	conn := h.dialTunnel(t)
 	defer conn.Close()
 

@@ -57,6 +57,9 @@ func TestReadMessage(t *testing.T) {
 func TestMessageRoundTrip(t *testing.T) {
 	for _, messages := range [][][]byte{
 		{},
+		{[]byte("hello")},
+		{[]byte("a"), []byte("b"), []byte("c")},
+		{[]byte(""), []byte("x")},
 	} {
 		var buf bytes.Buffer
 		for _, msg := range messages {
