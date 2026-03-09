@@ -711,6 +711,112 @@ func (r *truncatingUDPRelay) Close() {
 	r.serverConn.Close()
 }
 
+// chaosUDPRelay injects packet loss, delay, and duplication between client and server.
+// It is used to simulate realistic DNS transport faults in integration tests.
+type chaosUDPRelay struct {
+	ln         *net.UDPConn
+	serverConn *net.UDPConn
+	serverAddr *net.UDPAddr
+
+	mu         sync.Mutex
+	clientAddr *net.UDPAddr
+
+	dropClientEvery     int
+	dropServerEvery     int
+	duplicateServerEvery int
+	serverDelay         time.Duration
+
+	clientPackets atomic.Int64
+	serverPackets atomic.Int64
+}
+
+func newChaosUDPRelay(t testing.TB, serverAddrStr string, dropClientEvery, dropServerEvery, duplicateServerEvery int, serverDelay time.Duration) *chaosUDPRelay {
+	t.Helper()
+	serverAddr, err := net.ResolveUDPAddr("udp", serverAddrStr)
+	if err != nil {
+		t.Fatalf("resolve server addr: %v", err)
+	}
+	ln, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("chaos relay listen: %v", err)
+	}
+	serverConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		ln.Close()
+		t.Fatalf("chaos relay server conn: %v", err)
+	}
+	r := &chaosUDPRelay{
+		ln:                   ln,
+		serverConn:           serverConn,
+		serverAddr:           serverAddr,
+		dropClientEvery:      dropClientEvery,
+		dropServerEvery:      dropServerEvery,
+		duplicateServerEvery: duplicateServerEvery,
+		serverDelay:          serverDelay,
+	}
+	go r.loop()
+	return r
+}
+
+func (r *chaosUDPRelay) Addr() string { return r.ln.LocalAddr().String() }
+
+func (r *chaosUDPRelay) Close() {
+	r.ln.Close()
+	r.serverConn.Close()
+}
+
+func (r *chaosUDPRelay) loop() {
+	buf := make([]byte, 4096)
+	go func() {
+		buf2 := make([]byte, 4096)
+		for {
+			n, _, err := r.serverConn.ReadFromUDP(buf2)
+			if err != nil {
+				return
+			}
+			seq := int(r.serverPackets.Add(1))
+			if r.dropServerEvery > 0 && seq%r.dropServerEvery == 0 {
+				continue
+			}
+			r.mu.Lock()
+			clientAddr := r.clientAddr
+			r.mu.Unlock()
+			if clientAddr == nil {
+				continue
+			}
+			payload := append([]byte(nil), buf2[:n]...)
+			send := func(p []byte) {
+				if r.serverDelay > 0 {
+					time.AfterFunc(r.serverDelay, func() {
+						r.ln.WriteToUDP(p, clientAddr)
+					})
+				} else {
+					r.ln.WriteToUDP(p, clientAddr)
+				}
+			}
+			send(payload)
+			if r.duplicateServerEvery > 0 && seq%r.duplicateServerEvery == 0 {
+				dup := append([]byte(nil), payload...)
+				send(dup)
+			}
+		}
+	}()
+	for {
+		n, clientAddr, err := r.ln.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		seq := int(r.clientPackets.Add(1))
+		r.mu.Lock()
+		r.clientAddr = clientAddr
+		r.mu.Unlock()
+		if r.dropClientEvery > 0 && seq%r.dropClientEvery == 0 {
+			continue
+		}
+		r.serverConn.WriteToUDP(buf[:n], r.serverAddr)
+	}
+}
+
 const (
 	ednsOptionUpstream   = 0xFF00 // client → server payload
 	ednsOptionDownstream = 0xFF01 // server → client payload

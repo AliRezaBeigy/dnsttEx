@@ -79,6 +79,9 @@ const (
 	idleTimeout = 2 * time.Minute
 	// mtuProbeNXDOMAINRetries: when request-size MTU probe gets NXDOMAIN, retry this many times before giving up.
 	mtuProbeNXDOMAINRetries = 3
+	// mtuProbeErrorRetries: when an MTU probe times out or hits a transient read/write
+	// error, retry it this many times before treating that size as failed.
+	mtuProbeErrorRetries = 2
 	// minKCPMTU is the minimum MTU KCP accepts (see internal/kcp: SetMtu rejects smaller values).
 	minKCPMTU = 50
 )
@@ -691,41 +694,66 @@ func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration) {
 		if err != nil {
 			continue
 		}
-		ep.probeConn.SetDeadline(time.Now().Add(timeout))
-		_, err = ep.probeConn.WriteTo(msg, ep.addr)
-		if err != nil {
+		expectedName := ""
+		if query, parseErr := dns.MessageFromWireFormat(msg); parseErr == nil && len(query.Question) == 1 {
+			expectedName = query.Question[0].Name.String()
+		}
+		ok := false
+		hadResponse := false
+		for attempt := 0; attempt <= mtuProbeErrorRetries; attempt++ {
+			ep.probeConn.SetDeadline(time.Now().Add(timeout))
+			_, err = ep.probeConn.WriteTo(msg, ep.addr)
+			if err != nil {
+				ep.probeConn.SetDeadline(time.Time{})
+				if dnsttDebug() && attempt < mtuProbeErrorRetries {
+					log.Printf("DNSTT_DEBUG: MTU probe %s: response size %d write error, retry %d/%d: %v", ep.name, size, attempt+1, mtuProbeErrorRetries, err)
+				}
+				continue
+			}
+			if dnsttDebug() && attempt == 0 {
+				log.Printf("DNSTT_DEBUG: MTU probe %s: testing response size %d, PING query (hex):\n%s", ep.name, size, dnsttDebugHexDump(msg, 0))
+			}
+			buf := make([]byte, 4096)
+			n, _, err := ep.probeConn.ReadFrom(buf)
 			ep.probeConn.SetDeadline(time.Time{})
-			break
-		}
-		if dnsttDebug() {
-			log.Printf("DNSTT_DEBUG: MTU probe %s: testing response size %d, PING query (hex):\n%s", ep.name, size, dnsttDebugHexDump(msg, 0))
-		}
-		buf := make([]byte, 4096)
-		n, _, err := ep.probeConn.ReadFrom(buf)
-		ep.probeConn.SetDeadline(time.Time{})
-		responseLen := 0
-		if err == nil {
-			if resp, parseErr := dns.MessageFromWireFormat(buf[:n]); parseErr == nil {
-				if p := dnsResponsePayload(&resp, domain); p != nil {
-					responseLen = len(p)
+			responseLen := 0
+			matchedQuery := false
+			if err == nil {
+				if resp, parseErr := dns.MessageFromWireFormat(buf[:n]); parseErr == nil {
+					if len(resp.Question) == 1 && resp.Question[0].Name.String() == expectedName {
+						matchedQuery = true
+						hadResponse = true
+					}
+					if p := dnsResponsePayload(&resp, domain); p != nil {
+						responseLen = len(p)
+					}
 				}
 			}
-		}
-		ok := err == nil && VerifyMTUProbeResponse(buf[:n], domain, size)
-		if dnsttDebug() {
-			if err != nil {
-				log.Printf("DNSTT_DEBUG: MTU probe %s: response error (requested %d): %v", ep.name, size, err)
-			} else {
-				log.Printf("DNSTT_DEBUG: MTU probe %s: response payload %d bytes (requested %d), ok=%v", ep.name, responseLen, size, ok)
-				log.Printf("DNSTT_DEBUG: MTU probe %s: testing response size %d, PONG response (hex):\n%s", ep.name, size, dnsttDebugHexDump(buf[:n], 0))
+			ok = err == nil && matchedQuery && VerifyMTUProbeResponse(buf[:n], domain, size)
+			if dnsttDebug() {
+				if err != nil {
+					log.Printf("DNSTT_DEBUG: MTU probe %s: response error (requested %d): %v", ep.name, size, err)
+				} else if !matchedQuery {
+					log.Printf("DNSTT_DEBUG: MTU probe %s: ignored stale response while testing response size %d", ep.name, size)
+				} else {
+					log.Printf("DNSTT_DEBUG: MTU probe %s: response payload %d bytes (requested %d), ok=%v", ep.name, responseLen, size, ok)
+					log.Printf("DNSTT_DEBUG: MTU probe %s: testing response size %d, PONG response (hex):\n%s", ep.name, size, dnsttDebugHexDump(buf[:n], 0))
+				}
 			}
-		}
-		if err != nil {
+			if err != nil || !matchedQuery {
+				if attempt < mtuProbeErrorRetries {
+					continue
+				}
+				break
+			}
 			break
 		}
 		if ok {
 			serverMTU = size
 		} else {
+			if !hadResponse && dnsttDebug() {
+				log.Printf("DNSTT_DEBUG: MTU probe %s: giving up on response size %d after %d transient error retries", ep.name, size, mtuProbeErrorRetries)
+			}
 			break
 		}
 	}
@@ -749,18 +777,25 @@ func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration) {
 		if err != nil {
 			continue
 		}
+		expectedName := ""
+		if query, parseErr := dns.MessageFromWireFormat(msg); parseErr == nil && len(query.Question) == 1 {
+			expectedName = query.Question[0].Name.String()
+		}
 		var ok bool
 		var n int
 		buf := make([]byte, 4096)
-		for attempt := 0; attempt <= mtuProbeNXDOMAINRetries; attempt++ {
+		for attempt := 0; attempt <= mtuProbeNXDOMAINRetries+mtuProbeErrorRetries; attempt++ {
 			ep.probeConn.SetDeadline(time.Now().Add(timeout))
 			_, err = ep.probeConn.WriteTo(msg, ep.addr)
 			if err != nil {
 				ep.probeConn.SetDeadline(time.Time{})
-				break
+				if dnsttDebug() && attempt < mtuProbeNXDOMAINRetries+mtuProbeErrorRetries {
+					log.Printf("DNSTT_DEBUG: MTU probe %s: request size %d write error, retry %d/%d: %v", ep.name, size, attempt+1, mtuProbeNXDOMAINRetries+mtuProbeErrorRetries, err)
+				}
+				continue
 			}
 			if dnsttDebug() && attempt > 0 {
-				log.Printf("DNSTT_DEBUG: MTU probe %s: request size %d retry %d/%d (previous NXDOMAIN)", ep.name, size, attempt, mtuProbeNXDOMAINRetries)
+				log.Printf("DNSTT_DEBUG: MTU probe %s: request size %d retry %d/%d", ep.name, size, attempt, mtuProbeNXDOMAINRetries+mtuProbeErrorRetries)
 			}
 			if dnsttDebug() && attempt == 0 {
 				log.Printf("DNSTT_DEBUG: MTU probe %s: testing request size %d bytes, PING query (hex):\n%s", ep.name, size, dnsttDebugHexDump(msg, 0))
@@ -768,35 +803,51 @@ func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration) {
 			n, _, err = ep.probeConn.ReadFrom(buf)
 			ep.probeConn.SetDeadline(time.Time{})
 			if err != nil {
-				break
+				if dnsttDebug() && attempt < mtuProbeNXDOMAINRetries+mtuProbeErrorRetries {
+					log.Printf("DNSTT_DEBUG: MTU probe %s: request size %d read error, retry %d/%d: %v", ep.name, size, attempt+1, mtuProbeNXDOMAINRetries+mtuProbeErrorRetries, err)
+				}
+				continue
 			}
 			responseLen := 0
 			var responseRcode int
+			matchedQuery := false
 			if resp, parseErr := dns.MessageFromWireFormat(buf[:n]); parseErr == nil {
+				if len(resp.Question) == 1 && resp.Question[0].Name.String() == expectedName {
+					matchedQuery = true
+				}
 				responseRcode = int(resp.Rcode())
 				if p := dnsResponsePayload(&resp, domain); p != nil {
 					responseLen = len(p)
 				}
 			}
-			ok = VerifyProbeResponse(buf[:n], domain)
+			ok = matchedQuery && VerifyProbeResponse(buf[:n], domain)
 			if dnsttDebug() {
 				rcodeStr := "NOERROR"
 				if responseRcode != dns.RcodeNoError {
 					rcodeStr = fmt.Sprintf("RCODE %d (e.g. NXDOMAIN=3)", responseRcode)
 				}
-				log.Printf("DNSTT_DEBUG: MTU probe %s: response %s, payload %d bytes (request size %d), PONG ok=%v", ep.name, rcodeStr, responseLen, size, ok)
+				if !matchedQuery {
+					log.Printf("DNSTT_DEBUG: MTU probe %s: ignored stale response while testing request size %d", ep.name, size)
+				} else {
+					log.Printf("DNSTT_DEBUG: MTU probe %s: response %s, payload %d bytes (request size %d), PONG ok=%v", ep.name, rcodeStr, responseLen, size, ok)
+				}
 				if !ok && responseRcode != dns.RcodeNoError && clientMTU > 0 {
 					log.Printf("DNSTT_DEBUG: MTU probe %s: path or resolver rejects request size %d (returned %s); max request size is %d bytes", ep.name, size, rcodeStr, clientMTU)
 				}
-				log.Printf("DNSTT_DEBUG: MTU probe %s: testing request size %d bytes, PONG response (hex):\n%s", ep.name, size, dnsttDebugHexDump(buf[:n], 0))
+				if matchedQuery {
+					log.Printf("DNSTT_DEBUG: MTU probe %s: testing request size %d bytes, PONG response (hex):\n%s", ep.name, size, dnsttDebugHexDump(buf[:n], 0))
+				}
 			}
 			if ok {
 				break
 			}
+			if !matchedQuery {
+				continue
+			}
 			if responseRcode == dns.RcodeNoError {
 				break
 			}
-			// NXDOMAIN (or other error rcode): retry same probe
+			// NXDOMAIN (or other error rcode): retry same probe.
 		}
 		if err != nil {
 			break
