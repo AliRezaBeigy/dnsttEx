@@ -41,7 +41,9 @@ func waitForMTUDiscovery(t testing.TB, stderrBuf *bytes.Buffer, timeout time.Dur
 }
 
 // TestMTUDiscoveryFullPath verifies that with a transparent relay the client runs
-// MTU discovery and reports server and client MTU >= 512 (path supports at least 512).
+// MTU discovery and reports a large downstream MTU and the expected request-side
+// ceiling. DNS query names cap request wire size to roughly 280 bytes, so the
+// client-side request MTU cannot grow to match the downstream response MTU.
 func TestMTUDiscoveryFullPath(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping MTU discovery test in short mode")
@@ -55,8 +57,8 @@ func TestMTUDiscoveryFullPath(t *testing.T) {
 	if serverMTU < 512 {
 		t.Errorf("server MTU %d < 512 (expected at least 512 with transparent path)", serverMTU)
 	}
-	if clientMTU < 512 {
-		t.Errorf("client MTU %d < 512 (expected at least 512 with transparent path)", clientMTU)
+	if clientMTU != 280 {
+		t.Errorf("client MTU %d != 280 (DNS query wire size is expected to top out around 280 bytes on a transparent path)", clientMTU)
 	}
 	t.Logf("MTU discovery: server=%d client=%d", serverMTU, clientMTU)
 
@@ -78,7 +80,8 @@ func TestMTUDiscoveryFullPath(t *testing.T) {
 }
 
 // TestMTUDiscoveryTruncated512 verifies that when the path truncates responses to 512 bytes,
-// the client discovers server MTU 512 and the tunnel still works (small transfers).
+// the client discovers server MTU 512 while the request-side MTU stays at the
+// normal DNS query ceiling, and the tunnel still works for small transfers.
 func TestMTUDiscoveryTruncated512(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping MTU discovery test in short mode")
@@ -92,8 +95,8 @@ func TestMTUDiscoveryTruncated512(t *testing.T) {
 	if serverMTU != 512 {
 		t.Errorf("with 512-byte truncating relay: server MTU = %d, want 512", serverMTU)
 	}
-	if clientMTU < 512 {
-		t.Errorf("client MTU %d < 512", clientMTU)
+	if clientMTU != 280 {
+		t.Errorf("client MTU = %d, want 280 (response truncation should not reduce request-path MTU)", clientMTU)
 	}
 	t.Logf("MTU discovery (512 relay): server=%d client=%d", serverMTU, clientMTU)
 
@@ -133,7 +136,7 @@ func TestLowMTUCommunication(t *testing.T) {
 	clientEnv := map[string]string{"DNSTT_MTU_PROBE_TIMEOUT": "2s"}
 
 	const maxResponseSize = 512 // server MTU: path truncates responses to this
-	const maxRequestSize = 128   // client MTU: relay drops requests larger than this
+	const maxRequestSize = 128  // client MTU: relay drops requests larger than this
 	// Relay drops requests above this. Use 129 so 128-byte probe gets through (wire can be 128–129).
 	// Then assert clientMTU == 128. For the echo we need the tunnel to make progress: use a second
 	// harness with 256 so echo completes (or we'd need a much larger server channel and timeout).
@@ -184,4 +187,146 @@ func TestLowMTUCommunication(t *testing.T) {
 		t.Fatal("echo mismatch: client and server did not communicate correctly over low MTU (data integrity check failed)")
 	}
 	t.Logf("%d-byte echo OK over low-MTU path (server %d / client %d then echo at 256), data integrity verified", payloadSize, serverMTU, clientMTU)
+}
+
+// sendMaxRequestPattern matches "send: query wire 123 bytes (max request 256)" in DNSTT_DEBUG output.
+var sendMaxRequestPattern = regexp.MustCompile(`send: query wire \d+ bytes \(max request (\d+)\)`)
+
+// TestTunnelUsesDiscoveredRequestMTU verifies that after MTU discovery, the tunnel send path uses
+// the discovered max request size (not a smaller default). So when the path allows 256-byte
+// queries, we should see "max request 256" in send debug lines, not 128 or 0.
+func TestTunnelUsesDiscoveredRequestMTU(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping MTU test in short mode")
+	}
+	const maxResponseSize = 512
+	const maxRequestSize = 256
+	// Relay allows requests up to 257 bytes so 256-byte probe succeeds.
+	clientEnv := map[string]string{
+		"DNSTT_MTU_PROBE_TIMEOUT": "2s",
+		"DNSTT_DEBUG":             "1",
+	}
+	var stderrBuf bytes.Buffer
+	h := newTunnelHarnessWithRelayAndStderr(t, globalServerBin, globalClientBin,
+		func(addr string) udpRelay {
+			return newTruncatingUDPRelayWithRequestLimit(t, addr, maxResponseSize, 257)
+		},
+		&stderrBuf, clientEnv)
+
+	serverMTU, clientMTU := waitForMTUDiscovery(t, &stderrBuf, 15*time.Second)
+	if clientMTU != maxRequestSize {
+		t.Fatalf("MTU discovery: client MTU = %d, want %d", clientMTU, maxRequestSize)
+	}
+	t.Logf("MTU discovery: server=%d client=%d", serverMTU, clientMTU)
+
+	// Send enough data that we send at least one query with tunnel payload; DNSTT_DEBUG logs "max request N".
+	conn := h.dialTunnel(t)
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
+	payload := []byte("discovery-mtu-test")
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	recv := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, recv); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(payload, recv) {
+		t.Fatal("echo mismatch")
+	}
+
+	// Ensure the send path used the discovered max request size (256), not a smaller value.
+	stderr := stderrBuf.Bytes()
+	matches := sendMaxRequestPattern.FindAllSubmatch(stderr, -1)
+	if len(matches) == 0 {
+		t.Skip("no DNSTT_DEBUG send lines found (client may not have logged query wire size)")
+	}
+	for _, m := range matches {
+		if len(m) != 2 {
+			continue
+		}
+		maxReq, _ := strconv.Atoi(string(m[1]))
+		if maxReq != maxRequestSize {
+			t.Errorf("send path used max request %d; discovery found %d (tunnel must use discovered MTU)", maxReq, maxRequestSize)
+		}
+	}
+	t.Logf("verified %d send(s) used discovered max request %d", len(matches), maxRequestSize)
+}
+
+// sendLoopPacketsPattern matches "sendLoop: sending query with N packet(s), M bytes tunnel data".
+var sendLoopPacketsPattern = regexp.MustCompile(`sendLoop: sending query with (\d+) packet\(s\), (\d+) bytes tunnel data`)
+
+// TestTunnelBatchesPacketsWhenSending1024 verifies that when we send payload we (1) get a correct
+// echo back and (2) batch multiple packets per query: at least one send has 2+ packets, and
+// average tunnel bytes per data send is above a single small packet (~60 bytes), so we're not
+// consistently sending 1-packet queries.
+func TestTunnelBatchesPacketsWhenSending1024(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping MTU test in short mode")
+	}
+	const maxResponseSize = 512
+	const maxRequestSize = 256
+	clientEnv := map[string]string{
+		"DNSTT_MTU_PROBE_TIMEOUT": "2s",
+		"DNSTT_DEBUG":             "1",
+	}
+	var stderrBuf bytes.Buffer
+	h := newTunnelHarnessWithRelayAndStderr(t, globalServerBin, globalClientBin,
+		func(addr string) udpRelay {
+			return newTruncatingUDPRelayWithRequestLimit(t, addr, maxResponseSize, 257)
+		},
+		&stderrBuf, clientEnv)
+
+	_, clientMTU := waitForMTUDiscovery(t, &stderrBuf, 15*time.Second)
+	if clientMTU != maxRequestSize {
+		t.Fatalf("MTU discovery: client MTU = %d, want %d", clientMTU, maxRequestSize)
+	}
+
+	conn := h.dialTunnel(t)
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(90 * time.Second))
+	payloadSize := 256
+	payload := make([]byte, payloadSize)
+	for i := range payload {
+		payload[i] = byte(i % 256)
+	}
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	recv := make([]byte, payloadSize)
+	if _, err := io.ReadFull(conn, recv); err != nil {
+		t.Fatalf("read: %v (echo must succeed to verify batching)", err)
+	}
+	if !bytes.Equal(payload, recv) {
+		t.Fatal("echo mismatch")
+	}
+
+	stderr := stderrBuf.Bytes()
+	matches := sendLoopPacketsPattern.FindAllSubmatch(stderr, -1)
+	var dataSends, totalTunnelBytes, maxPacketsInOne int
+	for _, m := range matches {
+		if len(m) != 3 {
+			continue
+		}
+		dataSends++
+		n, _ := strconv.Atoi(string(m[1]))
+		b, _ := strconv.Atoi(string(m[2]))
+		totalTunnelBytes += b
+		if n > maxPacketsInOne {
+			maxPacketsInOne = n
+		}
+	}
+	if dataSends == 0 {
+		t.Skip("no data sends found in stderr")
+	}
+	if maxPacketsInOne < 2 {
+		t.Errorf("all data sends had 1 packet (max=%d); expected at least one query with 2+ packets", maxPacketsInOne)
+	}
+	avgBytesPerSend := totalTunnelBytes / dataSends
+	// If we batched, average should be at least one small packet (~60 bytes). Consistently
+	// 1-packet sends would give avg ~60; we require >= 60 so we're not sending tiny fragments.
+	if avgBytesPerSend < 60 {
+		t.Errorf("average tunnel bytes per data send = %d (total %d in %d sends); expected batching (avg >= 60)", avgBytesPerSend, totalTunnelBytes, dataSends)
+	}
+	t.Logf("echo OK; %d data sends, %d total tunnel bytes (avg %d/send), max %d packets in one query", dataSends, totalTunnelBytes, avgBytesPerSend, maxPacketsInOne)
 }

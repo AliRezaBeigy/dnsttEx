@@ -274,7 +274,7 @@ func newTunnelHarnessWithRelayAndStderr(t testing.TB, serverBin, clientBin strin
 		h.domain,
 		h.ClientAddr,
 	)
-	h.clientCmd.Stderr = stderrBuf
+	h.clientCmd.Stderr = io.MultiWriter(os.Stderr, stderrBuf)
 	if len(clientEnv) > 0 {
 		env := os.Environ()
 		for k, v := range clientEnv {
@@ -620,15 +620,15 @@ func (r *countingUDPRelay) loop() {
 // maxResponseSize (e.g. 512 to simulate 512-byte-only resolvers). Used for MTU discovery tests.
 // If maxRequestSize > 0, client→server packets larger than that are dropped so discovery finds that client MTU.
 type truncatingUDPRelay struct {
-	ln               *net.UDPConn
-	serverConn       *net.UDPConn
-	serverAddr       *net.UDPAddr
-	maxResponseSize  int
-	maxRequestSize   int // 0 = no limit
-	sent             atomic.Int64
-	received         atomic.Int64
-	mu               sync.Mutex
-	clientAddr       *net.UDPAddr
+	ln              *net.UDPConn
+	serverConn      *net.UDPConn
+	serverAddr      *net.UDPAddr
+	maxResponseSize int
+	maxRequestSize  int // 0 = no limit
+	sent            atomic.Int64
+	received        atomic.Int64
+	mu              sync.Mutex
+	clientAddr      *net.UDPAddr
 }
 
 // newTruncatingUDPRelay creates a relay that truncates responses to maxResponseSize.
@@ -710,6 +710,7 @@ func (r *truncatingUDPRelay) Close() {
 	r.ln.Close()
 	r.serverConn.Close()
 }
+
 const (
 	ednsOptionUpstream   = 0xFF00 // client → server payload
 	ednsOptionDownstream = 0xFF01 // server → client payload

@@ -139,6 +139,20 @@ type DNSPacketConn struct {
 	*turbotunnel.QueuePacketConn
 }
 
+// KCPMTUHint returns the largest single tunnel packet that can fit in one DNS
+// query on the current request path, after accounting for DNSPacketConn's
+// clientID/mode framing and any request-size cap discovered by MTU probing.
+func (c *DNSPacketConn) KCPMTUHint() int {
+	hint := c.effectiveSendCapacity() - (8 + 1)
+	if hint < 0 {
+		return 0
+	}
+	if hint > maxPacketSize {
+		hint = maxPacketSize
+	}
+	return hint
+}
+
 // NewDNSPacketConn creates a new DNSPacketConn. transport, through its WriteTo
 // and ReadFrom methods, handles the actual sending and receiving the DNS
 // messages encoded by DNSPacketConn. addr is the address to be passed to
