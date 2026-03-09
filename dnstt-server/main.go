@@ -59,6 +59,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -1160,7 +1161,19 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 		}
 	}()
 
-	ch := make(chan *record, 8192) // large buffer for concurrent connections; sendLoop drains quickly when channel has pending
+	// Send channel size: on slow/censored networks the sendLoop drains slowly, so a larger
+	// buffer reduces "channel full" drops at the cost of memory.
+	sendChanSize := 8192 * 20
+	if s := os.Getenv("DNSTT_SEND_CHANNEL_SIZE"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n >= 1 {
+			const maxSendChanSize = 65536 * 20
+			if n > maxSendChanSize {
+				n = maxSendChanSize
+			}
+			sendChanSize = n
+		}
+	}
+	ch := make(chan *record, sendChanSize)
 	defer close(ch)
 
 	// Create a fallback manager if an address is specified.
