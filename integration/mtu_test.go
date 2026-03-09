@@ -156,7 +156,9 @@ func TestLowMTUCommunication(t *testing.T) {
 		t.Errorf("client MTU = %d, want %d (relay drops requests > %d)", clientMTU, maxRequestSize, relayDropRequestAboveFor128)
 	}
 	t.Logf("MTU discovery: server=%d client=%d", serverMTU, clientMTU)
-	_ = h // first harness kept running for discovery; tear down via t.Cleanup
+	// The first harness is only needed to observe the constrained discovery result.
+	// Tear it down before phase 2 so fixed real-network bind addresses can be reused.
+	h.Teardown()
 
 	// Data integrity: run echo over a path that allows 256-byte requests so the
 	// server send channel does not fill; confirms the same stack works end-to-end with integrity.
@@ -187,6 +189,62 @@ func TestLowMTUCommunication(t *testing.T) {
 		t.Fatal("echo mismatch: client and server did not communicate correctly over low MTU (data integrity check failed)")
 	}
 	t.Logf("%d-byte echo OK over low-MTU path (server %d / client %d then echo at 256), data integrity verified", payloadSize, serverMTU, clientMTU)
+}
+
+// TestLowMTULargeTransferIntegrity verifies end-to-end integrity for a large
+// payload while the client request path is truly constrained to 128 bytes.
+// Unlike TestLowMTUCommunication, this test does not switch to a looser relay.
+func TestLowMTULargeTransferIntegrity(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping low MTU large transfer test in short mode")
+	}
+	// Give the server more room to queue downstream records while the 128-byte
+	// request path drains slowly, otherwise the test can fail due to artificial
+	// queue pressure instead of transport corruption.
+	t.Setenv("DNSTT_SEND_CHANNEL_SIZE", "1310720")
+
+	clientEnv := map[string]string{"DNSTT_MTU_PROBE_TIMEOUT": "2s"}
+	const maxResponseSize = 512
+	const maxRequestSize = 128
+	const relayDropRequestAboveFor128 = 129
+
+	var stderrBuf bytes.Buffer
+	h := newTunnelHarnessWithRelayAndStderr(t, globalServerBin, globalClientBin,
+		func(addr string) udpRelay {
+			return newTruncatingUDPRelayWithRequestLimit(t, addr, maxResponseSize, relayDropRequestAboveFor128)
+		},
+		&stderrBuf, clientEnv)
+
+	serverMTU, clientMTU := waitForMTUDiscovery(t, &stderrBuf, 15*time.Second)
+	if serverMTU != maxResponseSize {
+		t.Errorf("server MTU = %d, want %d (path limits responses to %d)", serverMTU, maxResponseSize, maxResponseSize)
+	}
+	if clientMTU != maxRequestSize {
+		t.Fatalf("client MTU = %d, want %d (relay drops requests > %d)", clientMTU, maxRequestSize, relayDropRequestAboveFor128)
+	}
+	t.Logf("MTU discovery: server=%d client=%d", serverMTU, clientMTU)
+
+	conn := h.dialTunnel(t)
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(180 * time.Second))
+
+	const payloadSize = 16 * 1024
+	payload := make([]byte, payloadSize)
+	for i := range payload {
+		payload[i] = byte(i % 256)
+	}
+	recv := make([]byte, payloadSize)
+
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write large payload over 128-byte request path: %v", err)
+	}
+	if _, err := io.ReadFull(conn, recv); err != nil {
+		t.Fatalf("read large payload over 128-byte request path: %v", err)
+	}
+	if !bytes.Equal(payload, recv) {
+		t.Fatal("large-transfer echo mismatch on 128-byte client MTU path")
+	}
+	t.Logf("large low-MTU transfer OK: %d bytes echoed intact with server=%d client=%d", payloadSize, serverMTU, clientMTU)
 }
 
 // sendMaxRequestPattern matches "send: query wire 123 bytes (max request 256)" in DNSTT_DEBUG output.
