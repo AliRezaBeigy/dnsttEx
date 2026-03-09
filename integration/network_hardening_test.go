@@ -70,3 +70,34 @@ func TestTunnelSurvivesDelayedAndDuplicatedResponses(t *testing.T) {
 		t.Fatal("echo mismatch over delayed/duplicated DNS path")
 	}
 }
+
+func TestTunnelSurvivesOccasionalMalformedResponses(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping malformed-response test in short mode")
+	}
+	clientEnv := map[string]string{"DNSTT_MTU_PROBE_TIMEOUT": "1s"}
+	h := newTunnelHarnessWithRelayAndStderr(t, globalServerBin, globalClientBin,
+		func(addr string) udpRelay {
+			return newTruncatingEveryNthUDPRelay(t, addr, 7, 24)
+		},
+		&bytes.Buffer{}, clientEnv)
+
+	conn := h.dialTunnel(t)
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(60 * time.Second))
+
+	payload := make([]byte, 1024)
+	for i := range payload {
+		payload[i] = byte((i * 17) % 256)
+	}
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write over malformed-response path: %v", err)
+	}
+	recv := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, recv); err != nil {
+		t.Fatalf("read over malformed-response path: %v", err)
+	}
+	if !bytes.Equal(payload, recv) {
+		t.Fatal("echo mismatch over malformed-response DNS path")
+	}
+}
