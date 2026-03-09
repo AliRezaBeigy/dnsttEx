@@ -79,10 +79,30 @@ const (
 	idleTimeout = 2 * time.Minute
 	// mtuProbeNXDOMAINRetries: when request-size MTU probe gets NXDOMAIN, retry this many times before giving up.
 	mtuProbeNXDOMAINRetries = 3
+	// minKCPMTU is the minimum MTU KCP accepts (see internal/kcp: SetMtu rejects smaller values).
+	minKCPMTU = 50
 )
 
 // dnsttDebug returns true when DNSTT_DEBUG is set (for verbose PING/PONG and MTU discovery logs).
 func dnsttDebug() bool { return os.Getenv("DNSTT_DEBUG") != "" }
+
+// mtuProbeTimeout returns the per-probe timeout for MTU discovery. Default 8s.
+// Set DNSTT_MTU_PROBE_TIMEOUT to a duration (e.g. "2s", "1500ms") to use a shorter timeout
+// (e.g. in integration tests where dropped probes would otherwise block 8s).
+func mtuProbeTimeout() time.Duration {
+	s := os.Getenv("DNSTT_MTU_PROBE_TIMEOUT")
+	if s == "" {
+		return 8 * time.Second
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 8 * time.Second
+	}
+	if d < 500*time.Millisecond {
+		d = 500 * time.Millisecond
+	}
+	return d
+}
 
 // dnsttDebugHexDump returns a hex dump of b for DNSTT_DEBUG logs. If len(b) > max, only the first max bytes are shown.
 func dnsttDebugHexDump(b []byte, max int) string {
@@ -140,11 +160,12 @@ type sessionManager struct {
 	pconn      net.PacketConn
 	mtu        int
 
-	mu   sync.RWMutex
-	conn *kcp.UDPSession
-	rw   io.ReadWriteCloser
-	sess *smux.Session
-	conv uint32
+	mu       sync.RWMutex
+	createMu sync.Mutex // serializes createSession so only one full handshake runs
+	conn     *kcp.UDPSession
+	rw       io.ReadWriteCloser
+	sess     *smux.Session
+	conv     uint32
 }
 
 // newSessionManager creates a new session manager.
@@ -208,9 +229,9 @@ func (sm *sessionManager) createSessionUnlocked() (*kcp.UDPSession, io.ReadWrite
 	}
 	conn.SetMinRTO(kcpMinRTO)
 	conn.SetWindowSize(512, 512) // was QueueSize/2=64; larger window for high-latency DNS
-	if rc := conn.SetMtu(sm.mtu); !rc {
+	if !conn.SetMtu(sm.mtu) {
 		conn.Close()
-		panic(rc)
+		return nil, nil, nil, 0, fmt.Errorf("KCP SetMtu(%d) failed (minimum %d)", sm.mtu, minKCPMTU)
 	}
 
 	// Put a Noise channel on top of the KCP conn.
@@ -223,8 +244,8 @@ func (sm *sessionManager) createSessionUnlocked() (*kcp.UDPSession, io.ReadWrite
 	// Start a smux session on the Noise channel.
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.Version = 2
-	smuxConfig.KeepAliveInterval = 60 * time.Second // send PING every 15s
-	smuxConfig.KeepAliveTimeout = 300 * time.Second // declare dead after 30s (was 2 min)
+	smuxConfig.KeepAliveInterval = 15 * time.Second // send PING every 15s
+	smuxConfig.KeepAliveTimeout = 30 * time.Second  // declare dead after 30s without response (must be ≤ test reconnect window)
 	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024    // default is 65536
 	sess, err := smux.Client(rw, smuxConfig)
 	if err != nil {
@@ -237,22 +258,26 @@ func (sm *sessionManager) createSessionUnlocked() (*kcp.UDPSession, io.ReadWrite
 }
 
 // createSession closes any existing session and establishes a new one.
-// Caller must NOT hold sm.mu.
+// Caller must NOT hold sm.mu. createMu ensures only one goroutine runs the
+// full handshake (createSessionUnlocked); concurrent callers block and then
+// use the same session instead of creating duplicates that get discarded.
 func (sm *sessionManager) createSession() error {
-	// Phase 1: close the old session under the write lock.
+	sm.createMu.Lock()
+	defer sm.createMu.Unlock()
+
 	sm.mu.Lock()
+	if sm.sess != nil {
+		sm.mu.Unlock()
+		return nil
+	}
 	sm.closeSessionLocked()
 	sm.mu.Unlock()
 
-	// Phase 2: create new resources without holding any lock.
-	// Multiple concurrent callers are benign: only one will win phase 3.
 	conn, rw, sess, conv, err := sm.createSessionUnlocked()
 	if err != nil {
 		return err
 	}
 
-	// Phase 3: store under the write lock. If another goroutine already
-	// created a session, discard ours and keep theirs.
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	if sm.sess != nil {
@@ -384,6 +409,14 @@ func handle(local *net.TCPConn, sm *sessionManager) error {
 	return err
 }
 
+// packetConnWithDone is implemented by PacketConns that signal when they are closed
+// (e.g. turbotunnel.QueuePacketConn and DNSPacketConn). run() uses it to exit when
+// the tunnel transport is closed.
+type packetConnWithDone interface {
+	net.PacketConn
+	Done() <-chan struct{}
+}
+
 func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn) error {
 	defer pconn.Close()
 
@@ -404,12 +437,52 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 	if maxPayloadInName < mtu {
 		mtu = maxPayloadInName
 	}
+	if mtu < minKCPMTU {
+		return fmt.Errorf("tunnel MTU %d bytes is below KCP minimum (%d); use a shorter domain or larger path MTU", mtu, minKCPMTU)
+	}
 	log.Printf("Tunnel MTU: %d bytes (max payload per DNS response)", mtu)
 
 	// Create session manager. Session (KCP + Noise + smux) is created lazily on
 	// first TCP connection via getSession(), so no handshake burst when no app is connected.
 	sm := newSessionManager(pubkey, domain, remoteAddr, pconn, mtu)
 	defer sm.closeSession()
+
+	if dpc, ok := pconn.(packetConnWithDone); ok {
+		// When pconn is closed (e.g. dnsConn.Close() in tests), exit so run() returns.
+		acceptCh := make(chan net.Conn, 1)
+		go func() {
+			for {
+				local, err := ln.Accept()
+				if err != nil {
+					close(acceptCh)
+					return
+				}
+				select {
+				case acceptCh <- local:
+				case <-dpc.Done():
+					local.Close()
+					close(acceptCh)
+					return
+				}
+			}
+		}()
+		for {
+			select {
+			case <-dpc.Done():
+				return nil
+			case local, ok := <-acceptCh:
+				if !ok {
+					return nil
+				}
+				go func(c net.Conn) {
+					defer c.Close()
+					if err := handle(c.(*net.TCPConn), sm); err != nil {
+						log.Printf("handle: %v", err)
+					}
+				}(local)
+			}
+		}
+	}
 
 	for {
 		local, err := ln.Accept()
@@ -992,8 +1065,9 @@ Known TLS fingerprints for -utls are:
 	}
 
 	// MTU discovery: find max response and request size per resolver (PING with increasing size until no answer).
+	mtuTimeout := mtuProbeTimeout()
 	for _, ep := range endpoints {
-		discoverMTU(ep, domain, 8*time.Second)
+		discoverMTU(ep, domain, mtuTimeout)
 	}
 
 	// Build the transport pconn.

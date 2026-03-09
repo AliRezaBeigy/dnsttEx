@@ -118,6 +118,11 @@ var (
 	// On 2020-04-19, the Quad9 resolver was seen to have a UDP payload size
 	// of 1232. Cloudflare's was 1452, and Google's was 4096.
 	maxUDPPayload = 1280 - 40 - 8
+
+	// minSupportedResponseSize is the smallest DNS response size we support
+	// (worst-case 255-octet name). KCP segment size is capped so one segment
+	// plus length prefix fits in this. 256 is too small for worst-case name.
+	minSupportedResponseSize = 512
 )
 
 // Base36 (0-9a-v, 5 bits/symbol); decode is case-insensitive for QNAME randomization.
@@ -1123,9 +1128,16 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 	// global maximum which no packet will exceed. We choose that maximum to
 	// keep the UDP payload size under maxUDPPayload, even in the worst case
 	// of a maximum-length name in the query's Question section.
+	// Also cap by what fits in minSupportedResponseSize so clients on 512-byte
+	// paths can receive full segments (sendLoop does not fragment; oversized
+	// segments would be stashed and never fit in a 512-byte response).
 	maxEncodedPayload := computeMaxEncodedPayload(maxUDPPayload)
+	maxEncodedForMinResponse := computeMaxEncodedPayload(minSupportedResponseSize)
 	// 2 bytes accounts for a packet length prefix.
 	mtu := maxEncodedPayload - 2
+	if maxEncodedForMinResponse-2 < mtu {
+		mtu = maxEncodedForMinResponse - 2
+	}
 	if mtu < 80 {
 		if mtu < 0 {
 			mtu = 0

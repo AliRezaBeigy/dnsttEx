@@ -154,6 +154,12 @@ func (c *QueuePacketConn) Close() error {
 	return c.closeWithError(nil)
 }
 
+// Done returns a channel that is closed when the QueuePacketConn is closed.
+// Callers can select on Done() to notice shutdown (e.g. to close a listener and exit).
+func (c *QueuePacketConn) Done() <-chan struct{} {
+	return c.closed
+}
+
 // LocalAddr returns the localAddr value that was passed to NewQueuePacketConn.
 func (c *QueuePacketConn) LocalAddr() net.Addr { return c.localAddr }
 
