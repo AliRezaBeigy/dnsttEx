@@ -86,22 +86,30 @@ jobs:
             chmod +x build_assets/dnsttEx-server-${{ env.ASSET_SUFFIX }}${{ env.EXE_EXT }}
           fi
 
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dnsttEx-${{ env.ASSET_SUFFIX }}
+          path: |
+            build_assets/dnsttEx-client-${{ env.ASSET_SUFFIX }}${{ env.EXE_EXT }}
+            build_assets/dnsttEx-server-${{ env.ASSET_SUFFIX }}${{ env.EXE_EXT }}
+          retention-days: 7
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Get tag name
         id: get_tag
         shell: bash
         run: |
-          if [[ "${{ github.event_name }}" == "push" ]]; then
-            TAG=${GITHUB_REF#refs/tags/}
-          elif [[ "${{ github.event_name }}" == "release" ]]; then
-            TAG="${{ github.event.release.tag_name }}"
-          else
-            TAG=${GITHUB_REF#refs/tags/}
-            if [[ -z "$TAG" ]]; then
-              echo "tag=dev" >> $GITHUB_OUTPUT
-              echo "Using tag: dev (workflow_dispatch)"
-              exit 0
-            fi
-          fi
+          TAG=${GITHUB_REF#refs/tags/}
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "Using tag: $TAG"
 
@@ -117,26 +125,20 @@ jobs:
             > release_notes.md
           echo "Release notes extracted for $VERSION"
 
-      - name: Create Release and upload binaries (on push tag)
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release_assets
+          merge-multiple: true
+
+      - name: Create Release and upload binaries
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.get_tag.outputs.tag }}
           name: Release ${{ steps.get_tag.outputs.tag }}
           body_path: release_notes.md
-          files: |
-            build_assets/dnsttEx-client-${{ env.ASSET_SUFFIX }}${{ env.EXE_EXT }}
-            build_assets/dnsttEx-server-${{ env.ASSET_SUFFIX }}${{ env.EXE_EXT }}
+          files: release_assets/*
           draft: false
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: dnsttEx-${{ env.ASSET_SUFFIX }}
-          path: |
-            build_assets/dnsttEx-client-${{ env.ASSET_SUFFIX }}${{ env.EXE_EXT }}
-            build_assets/dnsttEx-server-${{ env.ASSET_SUFFIX }}${{ env.EXE_EXT }}
-          retention-days: 7
