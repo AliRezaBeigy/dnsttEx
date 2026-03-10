@@ -809,6 +809,12 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 	var change, lostSegs, fastRetransSegs, earlyRetransSegs uint64
 	minrto := int32(kcp.interval)
 
+	// Limit total data segments we output per flush so we don't flood the path when
+	// the transport is slow (e.g. DNS with low MTU). Without this, we can output all
+	// unacked segments every flush and overwhelm the path so ACKs never return.
+	const maxDataSegsPerFlush = 8
+	dataSegsThisFlush := 0
+
 	ref := kcp.snd_buf[:len(kcp.snd_buf)] // for bounds check elimination
 	for k := range ref {
 		segment := &ref[k]
@@ -817,25 +823,41 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 			continue
 		}
 		if segment.xmit == 0 { // initial transmit
-			needsend = true
+			if dataSegsThisFlush < maxDataSegsPerFlush {
+				needsend = true
+				dataSegsThisFlush++
+			}
 			segment.rto = kcp.rx_rto
 			segment.resendts = current + segment.rto
 		} else if segment.fastack >= resent { // fast retransmit
-			needsend = true
+			if dataSegsThisFlush < maxDataSegsPerFlush {
+				needsend = true
+				dataSegsThisFlush++
+			}
 			segment.fastack = 0
 			segment.rto = kcp.rx_rto
 			segment.resendts = current + segment.rto
-			change++
-			fastRetransSegs++
+			if needsend {
+				change++
+				fastRetransSegs++
+			}
 		} else if segment.fastack > 0 && newSegsCount == 0 { // early retransmit
-			needsend = true
+			if dataSegsThisFlush < maxDataSegsPerFlush {
+				needsend = true
+				dataSegsThisFlush++
+			}
 			segment.fastack = 0
 			segment.rto = kcp.rx_rto
 			segment.resendts = current + segment.rto
-			change++
-			earlyRetransSegs++
+			if needsend {
+				change++
+				earlyRetransSegs++
+			}
 		} else if _itimediff(current, segment.resendts) >= 0 { // RTO
-			needsend = true
+			if dataSegsThisFlush < maxDataSegsPerFlush {
+				needsend = true
+				dataSegsThisFlush++
+			}
 			if kcp.nodelay == 0 {
 				segment.rto += kcp.rx_rto
 			} else {
@@ -843,7 +865,9 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 			}
 			segment.fastack = 0
 			segment.resendts = current + segment.rto
-			lostSegs++
+			if needsend {
+				lostSegs++
+			}
 		}
 
 		if needsend {
@@ -1005,9 +1029,10 @@ func (kcp *KCP) Check() uint32 {
 	return current + minimal
 }
 
-// SetMtu changes MTU size, default is 1400
+// SetMtu changes MTU size, default is 1400.
+// Minimum is IKCP_OVERHEAD+1 (13) so at least 1 byte of user data fits per segment.
 func (kcp *KCP) SetMtu(mtu int) int {
-	if mtu < 50 || mtu < IKCP_OVERHEAD {
+	if mtu < IKCP_OVERHEAD+1 {
 		return -1
 	}
 

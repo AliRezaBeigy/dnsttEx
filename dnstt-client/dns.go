@@ -122,6 +122,14 @@ type DNSPacketConn struct {
 	// Sending on pollChan permits sendLoop to send an empty polling query.
 	// sendLoop also does its own polling according to a time schedule.
 	pollChan chan struct{}
+	// inFlightCap limits how many data-carrying queries can be in flight
+	// concurrently. sendLoop blocks until inFlightCount < inFlightCap before
+	// sending a data query. recvLoop decrements inFlightCount (floor 0) on
+	// every DNS response and signals inFlightSignal so sendLoop can wake up.
+	// A timeout in sendLoop prevents permanent stall if responses are lost.
+	inFlightCap    int32
+	inFlightCount  atomic.Int32
+	inFlightSignal chan struct{}
 	// pendingRetryMu protects pendingRetry and pendingRetryCount (NXDOMAIN retry).
 	pendingRetryMu    sync.Mutex
 	pendingRetry      [][]byte // copy of last sent data batch, for re-queue on NXDOMAIN
@@ -170,6 +178,27 @@ func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name, 
 		maxRequestSize:  maxRequestSize,
 		pollChan:        make(chan struct{}, pollLimit),
 		QueuePacketConn: turbotunnel.NewQueuePacketConn(clientID, 0),
+	}
+	// Limit concurrent in-flight data queries to avoid flooding the resolver.
+	// Low-MTU paths get a tighter default; normal paths use a generous limit.
+	// Override with DNSTT_INFLIGHT_CAP (0 = no limit).
+	{
+		cap := int32(32)
+		if maxRequestSize > 0 && maxRequestSize <= 256 {
+			cap = 4
+		}
+		if s := os.Getenv("DNSTT_INFLIGHT_CAP"); s != "" {
+			if v, err := strconv.Atoi(s); err == nil && v >= 0 {
+				cap = int32(v)
+			}
+		}
+		if cap > 0 {
+			c.inFlightCap = cap
+			c.inFlightSignal = make(chan struct{}, 1)
+		}
+		if dnsttDebug() {
+			log.Printf("DNSTT_DEBUG: in-flight cap %d (maxRequestSize=%d)", cap, maxRequestSize)
+		}
 	}
 	go func() {
 		err := c.recvLoop(transport)
@@ -364,6 +393,17 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 		if any {
 			c.statsResponsesRecv.Add(1)
 			c.statsTunnelBytesRecv.Add(recvBytes)
+		}
+		// Decrement in-flight counter (floor 0) and wake sendLoop.
+		// Poll responses that arrive when count==0 are harmlessly ignored.
+		if c.inFlightCap > 0 {
+			if cur := c.inFlightCount.Load(); cur > 0 {
+				c.inFlightCount.Add(-1)
+			}
+			select {
+			case c.inFlightSignal <- struct{}{}:
+			default:
+			}
 		}
 		// If the payload contained one or more packets, permit sendLoop
 		// to poll immediately. ACKs on received data will effectively
@@ -883,6 +923,19 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 		}
 
 		if len(packets) > 0 {
+			// Wait until fewer than inFlightCap data queries are outstanding.
+			// Timeout after 10 s to recover from lost responses instead of blocking forever.
+			if c.inFlightCap > 0 {
+				for c.inFlightCount.Load() >= c.inFlightCap {
+					select {
+					case <-c.inFlightSignal:
+					case <-time.After(10 * time.Second):
+						log.Printf("in-flight cap stall: count=%d cap=%d; resetting (responses may have been lost)", c.inFlightCount.Load(), c.inFlightCap)
+						c.inFlightCount.Store(0)
+					}
+				}
+				c.inFlightCount.Add(1)
+			}
 			select {
 			case <-c.pollChan:
 			default:

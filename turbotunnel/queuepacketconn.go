@@ -1,7 +1,9 @@
 package turbotunnel
 
 import (
+	"log"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,6 +42,9 @@ type QueuePacketConn struct {
 	closed    chan struct{}
 	// What error to return when the QueuePacketConn is closed.
 	err atomic.Value
+	// Trace counters when DNSTT_TRACE_QUEUE=1 (enqueues and drops).
+	traceEnqueues atomic.Uint64
+	traceDrops    atomic.Uint64
 }
 
 // NewQueuePacketConn makes a new QueuePacketConn, set to track recent peers
@@ -108,6 +113,9 @@ func (c *QueuePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	}
 }
 
+// traceQueue, when set (DNSTT_TRACE_QUEUE=1), enables logging of WriteTo enqueues and drops.
+var traceQueue = os.Getenv("DNSTT_TRACE_QUEUE") == "1"
+
 // WriteTo queues an outgoing packet for the given address. The queue can later
 // be retrieved using the OutgoingQueue method.
 func (c *QueuePacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
@@ -121,9 +129,22 @@ func (c *QueuePacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	copy(buf, p)
 	select {
 	case c.remotes.SendQueue(addr) <- buf:
+		if traceQueue {
+			n := c.traceEnqueues.Add(1)
+			d := c.traceDrops.Load()
+			if n%5000 == 0 || n == 1 {
+				log.Printf("DNSTT_TRACE_QUEUE: WriteTo enqueued total=%d drops=%d", n, d)
+			}
+		}
 		return len(buf), nil
 	default:
 		// Drop the outgoing packet if the send queue is full.
+		if traceQueue {
+			c.traceDrops.Add(1)
+			n := c.traceEnqueues.Load()
+			d := c.traceDrops.Load()
+			log.Printf("DNSTT_TRACE_QUEUE: WriteTo DROP (queue full) enqueued=%d drops=%d", n, d)
+		}
 		return len(buf), nil
 	}
 }

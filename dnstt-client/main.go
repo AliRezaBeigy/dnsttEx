@@ -82,8 +82,10 @@ const (
 	// mtuProbeErrorRetries: when an MTU probe times out or hits a transient read/write
 	// error, retry it this many times before treating that size as failed.
 	mtuProbeErrorRetries = 2
-	// minKCPMTU is the minimum MTU KCP accepts (see internal/kcp: SetMtu rejects smaller values).
-	minKCPMTU = 50
+	// minKCPMTU is the minimum MTU KCP accepts (IKCP_OVERHEAD+1 = 13).
+	// Low-MTU DNS paths (e.g. 128-byte requests) need MTU as low as ~42
+	// so each KCP segment fits inside one DNS query.
+	minKCPMTU = 13
 )
 
 // dnsttDebug returns true when DNSTT_DEBUG is set (for verbose PING/PONG and MTU discovery logs).
