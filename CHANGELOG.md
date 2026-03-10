@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-03-10
+
+### Added
+
+- **In-band response-size hint (mode byte 0xFE)** — Client embeds the discovered max response size directly in the QNAME payload of poll queries. This survives recursive resolvers (e.g. Google 8.8.8.8) that rewrite the OPT Class field, which previously caused the server to build oversized responses that got truncated on the return path. The server stores the minimum hint per client so responses are safe across all resolvers in a pool.
+
 ## [1.3.1] - 2026-03-10
 
 ### Changed
@@ -103,7 +109,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.3.1...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.3.2...HEAD
+[1.3.1]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.3.1...v1.3.2
 [1.3.1]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.2.0...v1.2.1

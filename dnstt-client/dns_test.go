@@ -133,14 +133,26 @@ func TestPollPayloadNoise(t *testing.T) {
 	}
 	conn := NewDNSPacketConn(pconn, pconn.LocalAddr(), domain, 0, 0)
 	defer conn.Close()
-	p1 := conn.buildUpstreamPayload(nil)
-	p2 := conn.buildUpstreamPayload(nil)
+	p1 := conn.buildUpstreamPayload(nil, 0)
+	p2 := conn.buildUpstreamPayload(nil, 0)
 	if bytes.Equal(p1, p2) {
-		t.Error("buildUpstreamPayload(nil) returned identical payloads twice; poll should include random noise")
+		t.Error("buildUpstreamPayload(nil,0) returned identical payloads twice; poll should include random noise")
 	}
-	// Poll payload must be clientID(8) + 0 + noise(6) = at least 15 bytes
+	// Legacy poll: clientID(8) + 0 + noise(6) = at least 15 bytes
 	if len(p1) < 9+probeNoiseLen || len(p2) < 9+probeNoiseLen {
 		t.Errorf("poll payload too short: %d, %d (want >= %d)", len(p1), len(p2), 9+probeNoiseLen)
+	}
+	// With hint: clientID(8) + 0xFE + hint(2) + noise(6) = at least 17 bytes
+	h1 := conn.buildUpstreamPayload(nil, 512)
+	if len(h1) < 11+probeNoiseLen {
+		t.Errorf("hint-poll payload too short: %d (want >= %d)", len(h1), 11+probeNoiseLen)
+	}
+	if h1[8] != probeModeHintPoll {
+		t.Errorf("hint-poll mode byte = 0x%02x, want 0x%02x", h1[8], probeModeHintPoll)
+	}
+	gotHint := int(h1[9])<<8 | int(h1[10])
+	if gotHint != 512 {
+		t.Errorf("hint-poll response hint = %d, want 512", gotHint)
 	}
 }
 
@@ -192,7 +204,7 @@ func TestBuildQueryWireUsesOptMaxResp(t *testing.T) {
 	conn := NewDNSPacketConn(pconn, pconn.LocalAddr(), domain, 0, 0)
 	defer conn.Close()
 
-	decoded := conn.buildUpstreamPayload(nil)
+	decoded := conn.buildUpstreamPayload(nil, 0)
 	for _, wantClass := range []int{512, 1024, 2048, 4096} {
 		wire, err := conn.buildQueryWire(decoded, wantClass)
 		if err != nil {

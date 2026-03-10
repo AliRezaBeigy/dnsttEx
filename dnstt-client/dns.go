@@ -516,13 +516,24 @@ func (c *DNSPacketConn) effectiveSendCapacity() int {
 }
 
 // buildUpstreamPayload builds raw payload with compact framing:
-//   - ClientID(8) + mode byte. Mode: 0 = poll (no data); 1–223 = single packet of that length; 224+ = legacy (224+nPad, nPad bytes, then [1-byte len + packet]*).
+//   - ClientID(8) + mode byte. Mode: 0 = poll (no data); 0xFE = poll with 2-byte response-size hint;
+//     1–223 = single packet of that length; 224+ = legacy (224+nPad, nPad bytes, then [1-byte len + packet]*).
 //     For poll (no data), random bytes are appended so each query name differs (avoids DNS/resolver cache).
-func (c *DNSPacketConn) buildUpstreamPayload(packets [][]byte) []byte {
+//
+// maxRespHint is the max DNS response size (from MTU discovery) to embed in poll payloads so
+// the server can cap responses even when recursive resolvers rewrite the OPT Class field.
+// Pass 0 to omit the hint (legacy poll).
+func (c *DNSPacketConn) buildUpstreamPayload(packets [][]byte, maxRespHint int) []byte {
 	var buf bytes.Buffer
 	buf.Write(c.clientID[:])
 	if len(packets) == 0 {
-		buf.WriteByte(0) // poll: no data
+		if maxRespHint > 0 && maxRespHint <= 0xFFFF {
+			buf.WriteByte(probeModeHintPoll)
+			buf.WriteByte(byte(maxRespHint >> 8))
+			buf.WriteByte(byte(maxRespHint))
+		} else {
+			buf.WriteByte(0) // legacy poll
+		}
 		noise := make([]byte, probeNoiseLen)
 		if _, err := rand.Read(noise); err == nil {
 			buf.Write(noise)
@@ -552,20 +563,27 @@ func (c *DNSPacketConn) buildUpstreamPayload(packets [][]byte) []byte {
 // When maxRespOverride > 0 or maxReqOverride > 0 (e.g. from ResolverPool.NextSendMTU), this
 // send uses that resolver's MTU: OPT Class = maxRespOverride, payload capped by maxReqOverride.
 func (c *DNSPacketConn) send(transport net.PacketConn, packets [][]byte, addr net.Addr, maxRespOverride, maxReqOverride int) error {
+	// In-band response-size hint: embed in QNAME so the server sees the real
+	// limit even when recursive resolvers rewrite the OPT Class field.
+	respHint := maxRespOverride
+	if respHint <= 0 {
+		respHint = c.maxResponseSize
+	}
+
 	capacity := c.effectiveSendCapacity()
 	if maxReqOverride > 0 {
 		capacity = c.maxDecodedPayloadForMaxWire(maxReqOverride)
 	}
-	decoded := c.buildUpstreamPayload(packets)
+	decoded := c.buildUpstreamPayload(packets, respHint)
 	for len(decoded) > capacity && len(packets) > 1 {
 		// Stash last packet and try again with fewer.
 		c.QueuePacketConn.Stash(packets[len(packets)-1], addr)
 		packets = packets[:len(packets)-1]
-		decoded = c.buildUpstreamPayload(packets)
+		decoded = c.buildUpstreamPayload(packets, respHint)
 	}
 	if len(decoded) > capacity && len(packets) == 1 {
 		c.QueuePacketConn.Stash(packets[0], addr)
-		decoded = c.buildUpstreamPayload(nil)
+		decoded = c.buildUpstreamPayload(nil, respHint)
 	}
 	maxReq := c.maxRequestSize
 	if maxReqOverride > 0 {
@@ -576,7 +594,7 @@ func (c *DNSPacketConn) send(transport net.PacketConn, packets [][]byte, addr ne
 		if err != nil {
 			return err
 		}
-		sendAnyway := len(packets) == 0 && len(decoded) <= 9+probeNoiseLen // minimal poll payload
+		sendAnyway := len(packets) == 0 && len(decoded) <= 11+probeNoiseLen // minimal poll payload (may include 2-byte hint)
 		if maxReq <= 0 || len(buf) <= maxReq || sendAnyway {
 			if dnsttDebug() && len(packets) > 0 {
 				log.Printf("DNSTT_DEBUG: send: query wire %d bytes (max request %d)", len(buf), maxReq)
@@ -592,20 +610,21 @@ func (c *DNSPacketConn) send(transport net.PacketConn, packets [][]byte, addr ne
 			if len(packets) == 1 {
 				c.QueuePacketConn.Stash(packets[0], addr)
 			}
-			decoded = c.buildUpstreamPayload(nil)
+			decoded = c.buildUpstreamPayload(nil, respHint)
 			packets = nil
 		} else {
 			c.QueuePacketConn.Stash(packets[len(packets)-1], addr)
 			packets = packets[:len(packets)-1]
-			decoded = c.buildUpstreamPayload(packets)
+			decoded = c.buildUpstreamPayload(packets, respHint)
 		}
 	}
 }
 
 // Probe mode bytes (first byte of payload after clientID).
 const (
-	probeModePoll = 0    // normal idle poll
-	probeModePING = 0xFF // health-check PING; server must respond with PONG
+	probeModePoll     = 0    // normal idle poll
+	probeModeHintPoll = 0xFE // poll with 2-byte max-response-size hint (survives OPT Class rewriting by resolvers)
+	probeModePING     = 0xFF // health-check PING; server must respond with PONG
 )
 
 // probeNoiseLen is the number of random bytes appended to each PING to avoid

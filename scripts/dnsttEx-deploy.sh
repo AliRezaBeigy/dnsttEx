@@ -169,7 +169,6 @@ save_config() {
     cat > "$CONFIG_FILE" << EOF
 # dnsttEx server config - $(date)
 NS_SUBDOMAIN="$NS_SUBDOMAIN"
-MTU_VALUE="$MTU_VALUE"
 TUNNEL_MODE="$TUNNEL_MODE"
 PRIVATE_KEY_FILE="$PRIVATE_KEY_FILE"
 PUBLIC_KEY_FILE="$PUBLIC_KEY_FILE"
@@ -197,7 +196,6 @@ show_configuration_info() {
     echo ""
     echo -e "${BLUE}Configuration:${NC}"
     echo -e "  Nameserver subdomain: ${YELLOW}$NS_SUBDOMAIN${NC}"
-    echo -e "  MTU: ${YELLOW}$MTU_VALUE${NC}"
     echo -e "  Tunnel mode: ${YELLOW}$TUNNEL_MODE${NC}"
     echo -e "  User: ${YELLOW}$DNSTT_USER${NC}"
     echo -e "  Listen port: ${YELLOW}$DNSTT_PORT${NC} (UDP)"
@@ -374,10 +372,9 @@ check_required_tools() {
 }
 
 get_user_input() {
-    local existing_domain="" existing_mtu="" existing_mode=""
+    local existing_domain="" existing_mode=""
     if load_existing_config; then
         existing_domain="$NS_SUBDOMAIN"
-        existing_mtu="$MTU_VALUE"
         existing_mode="$TUNNEL_MODE"
         print_status "Found existing config: $existing_domain"
     fi
@@ -393,10 +390,6 @@ get_user_input() {
         [[ -n "$NS_SUBDOMAIN" ]] && break
         print_error "Subdomain is required"
     done
-    print_question "MTU (current: ${existing_mtu:-1232}): "
-    read -r MTU_VALUE
-    MTU_VALUE="${MTU_VALUE:-$existing_mtu}"
-    MTU_VALUE="${MTU_VALUE:-1232}"
     echo "Tunnel mode: 1) SOCKS proxy  2) SSH"
     while true; do
         if [[ -n "$existing_mode" ]]; then
@@ -416,7 +409,7 @@ get_user_input() {
             *) print_error "Enter 1 or 2" ;;
         esac
     done
-    print_status "Config: domain=$NS_SUBDOMAIN MTU=$MTU_VALUE mode=$TUNNEL_MODE"
+    print_status "Config: domain=$NS_SUBDOMAIN mode=$TUNNEL_MODE"
 }
 
 download_server() {
@@ -670,7 +663,7 @@ User=$DNSTT_USER
 Group=$DNSTT_USER
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-ExecStart=${INSTALL_DIR}/dnsttEx-server -udp :${DNSTT_PORT} -privkey-file ${PRIVATE_KEY_FILE} -mtu ${MTU_VALUE} ${NS_SUBDOMAIN} 127.0.0.1:${target_port}
+ExecStart=${INSTALL_DIR}/dnsttEx-server -udp :${DNSTT_PORT} -privkey-file ${PRIVATE_KEY_FILE} ${NS_SUBDOMAIN} 127.0.0.1:${target_port}
 Restart=always
 RestartSec=5
 
@@ -697,7 +690,6 @@ print_success_box() {
     echo -e "${GREEN}+============================================================================+${NC}"
     echo ""
     echo -e "  Subdomain:  ${YELLOW}$NS_SUBDOMAIN${NC}"
-    echo -e "  MTU:        ${YELLOW}$MTU_VALUE${NC}"
     echo -e "  Tunnel:     ${YELLOW}$TUNNEL_MODE${NC}"
     echo -e "  Public key: ${YELLOW}$(cat "$PUBLIC_KEY_FILE")${NC}"
     echo ""

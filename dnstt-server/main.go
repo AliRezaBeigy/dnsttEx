@@ -61,6 +61,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"dnsttEx/dns"
@@ -77,6 +78,10 @@ const (
 	downstreamEDNSOptionCode = 0xFF01
 	// Health-check probe: client sends payload with mode byte 0xFF (PING), server responds with "PONG".
 	probeModePING = 0xFF
+	// Poll with in-band response-size hint (mode byte 0xFE): client embeds
+	// its discovered max response size in the QNAME payload so the server
+	// sees it even when recursive resolvers rewrite the OPT Class field.
+	probeModeHintPoll = 0xFE
 )
 
 const (
@@ -104,6 +109,14 @@ var (
 	// timeout budget. Override at runtime with DNSTT_RESPONSE_DELAY (e.g. "200ms").
 	maxResponseDelay = 200 * time.Millisecond
 )
+
+// clientState holds per-client metadata that must survive across queries but
+// should be evicted when the client goes idle. Stored in a TTL cache keyed by
+// ClientID so memory is bounded under high client churn.
+type clientState struct {
+	mu       sync.Mutex   // serializes data collection in sendLoop (TryLock)
+	respHint atomic.Int32 // in-band max response size from MTU discovery; 0 = not yet known
+}
 
 var (
 	// maxUDPPayload is the maximum DNS response size we send.
@@ -707,7 +720,7 @@ func (m *FallbackManager) forwardReplies(proxyConn net.PacketConn, clientAddr ne
 // the incoming DNS queries, and puts them on ttConn's incoming queue. Whenever
 // a query calls for a response, constructs a partial response and passes it to
 // sendLoop over ch. Invalid DNS packets are passed to the FallbackManager.
-func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, fallbackMgr *FallbackManager) error {
+func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, fallbackMgr *FallbackManager, clientCache *ttlcache.Cache[turbotunnel.ClientID, *clientState]) error {
 	for {
 		var buf [4096]byte
 		n, addr, err := dnsConn.ReadFrom(buf[:])
@@ -765,8 +778,36 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 				}
 				continue
 			}
-			// Compact framing: first byte 0 = poll; 1–223 = single packet length; 224+ = legacy (padding then [len+packet]*).
-			if first == 0 {
+			// Compact framing: first byte 0 = poll; 0xFE = poll with response-size hint;
+			// 1–223 = single packet length; 224+ = legacy (padding then [len+packet]*).
+			if first == probeModeHintPoll {
+				// Poll with in-band response-size hint from client MTU discovery.
+				// Store the minimum across all hints for this client so responses
+				// are safe regardless of which resolver they traverse (ResolverPool
+				// rotates queries across resolvers with different truncation limits).
+				if len(body) >= 3 {
+					hint := int32(int(body[1])<<8 | int(body[2]))
+					if hint >= 512 {
+						item := clientCache.Get(clientID)
+						if item == nil {
+							item, _ = clientCache.GetOrSet(clientID, &clientState{})
+						}
+						cs := item.Value()
+						for {
+							old := cs.respHint.Load()
+							if old != 0 && hint >= old {
+								break
+							}
+							if cs.respHint.CompareAndSwap(old, hint) {
+								if os.Getenv("DNSTT_DEBUG") != "" {
+									log.Printf("DNSTT_DEBUG: client %s in-band response hint %d bytes", clientID, hint)
+								}
+								break
+							}
+						}
+					}
+				}
+			} else if first == 0 {
 				// Poll: no packets
 			} else if first >= 1 && first < 224 {
 				// Single packet of length first
@@ -793,10 +834,18 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 				log.Printf("NXDOMAIN: payload too short for ClientID+mode (payload %d bytes) query %s", len(payload), query.Question[0].Name)
 			}
 		}
+		// Apply per-client response-size hint (from in-band MTU discovery).
+		// This caps the response even when the resolver rewrites OPT Class.
+		effectiveMaxResp := maxRespSize
+		if item := clientCache.Get(clientID); item != nil {
+			if h := int(item.Value().respHint.Load()); h > 0 && h < effectiveMaxResp {
+				effectiveMaxResp = h
+			}
+		}
 		// If a response is called for, pass it to sendLoop via the channel.
 		if resp != nil {
 			select {
-			case ch <- &record{Resp: resp, Addr: addr, ClientID: clientID, MaxResponseSize: maxRespSize}:
+			case ch <- &record{Resp: resp, Addr: addr, ClientID: clientID, MaxResponseSize: effectiveMaxResp}:
 			default:
 				// sendLoop is busy; drop this response opportunity.
 				// The client will retry after its poll timer fires.
@@ -810,7 +859,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 // response, it sends on the network immediately. Those that represent a
 // response capable of carrying data, it packs full of as many packets as will
 // fit while keeping the total size under maxEncodedPayload, then sends it.
-func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-chan *record, maxEncodedPayload int, clientLocks *sync.Map) error {
+func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-chan *record, maxEncodedPayload int, clientCache *ttlcache.Cache[turbotunnel.ClientID, *clientState]) error {
 	var nextRec *record
 	for {
 		rec := nextRec
@@ -887,9 +936,12 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 				// single-element stash (which silently drops KCP segments).
 				// Use TryLock to avoid thundering-herd: if another goroutine is
 				// already collecting for this client, send an empty ACK immediately.
-				lockVal, _ := clientLocks.LoadOrStore(rec.ClientID, &sync.Mutex{})
-				mu := lockVal.(*sync.Mutex)
-				if !mu.TryLock() {
+				item := clientCache.Get(rec.ClientID)
+				if item == nil {
+					item, _ = clientCache.GetOrSet(rec.ClientID, &clientState{})
+				}
+				cs := item.Value()
+				if !cs.mu.TryLock() {
 					rec.Resp.Answer[0].Data = dns.EncodeRDataTXT([]byte{0})
 				} else {
 					var payload bytes.Buffer
@@ -948,7 +1000,7 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 						payload.Write(p)
 					}
 					timer.Stop()
-					mu.Unlock()
+					cs.mu.Unlock()
 
 					payloadBytes := payload.Bytes()
 					if len(payloadBytes) == 0 {
@@ -1220,17 +1272,20 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 		}
 	}
 	log.Printf("starting %d sendLoop goroutines", numSendLoops)
-	var clientLocks sync.Map
+	clientCache := ttlcache.New[turbotunnel.ClientID, *clientState](
+		ttlcache.WithTTL[turbotunnel.ClientID, *clientState](idleTimeout * 2),
+	)
+	go clientCache.Start()
 	for i := 0; i < numSendLoops; i++ {
 		go func() {
-			err := sendLoop(dnsConn, ttConn, ch, maxEncodedPayload, &clientLocks)
+			err := sendLoop(dnsConn, ttConn, ch, maxEncodedPayload, clientCache)
 			if err != nil {
 				log.Printf("sendLoop: %v", err)
 			}
 		}()
 	}
 
-	return recvLoop(domain, dnsConn, ttConn, ch, fallbackMgr)
+	return recvLoop(domain, dnsConn, ttConn, ch, fallbackMgr, clientCache)
 }
 
 func main() {
