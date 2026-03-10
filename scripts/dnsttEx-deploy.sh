@@ -579,14 +579,13 @@ DANTE_EOF
 }
 
 free_port_53() {
-    # systemd-resolved's stub listener can occupy 127.0.0.53:53 or 127.0.0.1:53.
-    # The main listener on 0.0.0.0:53 / :::53 is what blocks us.
-    # Disable the stub listener so dnstt-server can bind to :53.
+    # Any process binding to port 53 on any address (including 127.0.0.53,
+    # 127.0.0.54, 0.0.0.0, ::) will prevent dnstt-server from binding :53.
+    # Detect and resolve all conflicts.
+
     if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        local stub_status
-        stub_status=$(resolvectl status 2>/dev/null | grep -i "DNSStubListener" || true)
-        # Check if anything is actually bound to *:53 or 0.0.0.0:53
-        if ss -ulnp 2>/dev/null | grep -qE '(0\.0\.0\.0|:::|\*):53 '; then
+        # systemd-resolved typically binds 127.0.0.53:53 and/or 127.0.0.54:53
+        if ss -ulnp 2>/dev/null | grep -q 'systemd-resolve.*:53 '; then
             print_status "Disabling systemd-resolved stub listener to free port 53..."
             mkdir -p /etc/systemd/resolved.conf.d
             cat > /etc/systemd/resolved.conf.d/no-stub.conf << 'STUBEOF'
@@ -594,24 +593,35 @@ free_port_53() {
 DNSStubListener=no
 STUBEOF
             systemctl restart systemd-resolved
-            # Point /etc/resolv.conf to a real upstream so the server can still resolve DNS
+            sleep 1
+            # Point /etc/resolv.conf to a real upstream so the server itself can still resolve DNS
             if [[ -L /etc/resolv.conf ]] && readlink /etc/resolv.conf | grep -q stub-resolv; then
                 print_status "Updating /etc/resolv.conf to use upstream DNS..."
                 rm -f /etc/resolv.conf
                 echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > /etc/resolv.conf
             fi
+            print_status "systemd-resolved stub listener disabled"
         fi
     fi
-    # Stop bind9/named if running on port 53
+
+    # Stop bind9/named if occupying port 53
     for svc_name in named bind9; do
         if systemctl is-active --quiet "$svc_name" 2>/dev/null; then
-            if ss -ulnp 2>/dev/null | grep -E '(0\.0\.0\.0|:::|\*):53 ' | grep -q "$svc_name"; then
+            if ss -ulnp 2>/dev/null | grep "$svc_name" | grep -q ':53 '; then
                 print_status "Stopping $svc_name which is using port 53..."
                 systemctl stop "$svc_name"
                 systemctl disable "$svc_name"
             fi
         fi
     done
+
+    # Final check: is port 53 still occupied?
+    if ss -ulnp 2>/dev/null | grep -q ':53 '; then
+        local blocking
+        blocking=$(ss -ulnp 2>/dev/null | grep ':53 ' | head -3)
+        print_warning "Port 53 is still in use:\n$blocking"
+        print_warning "dnstt-server may fail to start. Manually stop the process using port 53."
+    fi
 }
 
 create_systemd_service() {
