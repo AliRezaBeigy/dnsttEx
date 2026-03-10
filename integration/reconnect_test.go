@@ -15,15 +15,19 @@ import (
 // successful echo on a new session through the same client.
 //
 // The client detects a dead session when smux's KeepAliveTimeout fires (no
-// PONG to PING) or when a stream operation fails. Production uses 1s/3s
+// PONG to PING) or when a stream operation fails. Tests use fast 1s/3s
 // keepalive so recovery takes a few seconds.
 func BenchmarkReconnect(b *testing.B) {
 	b.StopTimer()
 
+	reconnectEnv := map[string]string{
+		"DNSTT_SMUX_KEEPALIVE_INTERVAL": "1s",
+		"DNSTT_SMUX_KEEPALIVE_TIMEOUT":  "3s",
+	}
 	for i := 0; i < b.N; i++ {
 		func() {
 			// Fresh harness per iteration so each reconnect starts clean.
-			h := newTunnelHarness(b, globalServerBin, globalClientBin, nil)
+			h := newTunnelHarness(b, globalServerBin, globalClientBin, reconnectEnv)
 			defer h.Teardown()
 
 			// Verify the tunnel is working before disruption.
@@ -91,13 +95,17 @@ func BenchmarkReconnect(b *testing.B) {
 }
 
 // TestReconnect verifies the client automatically recovers after the server
-// restarts. Recovery is bounded by smux KeepAliveTimeout (production default 3s).
+// restarts. Uses fast 1s/3s keepalive so detection is quick.
 func TestReconnect(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping reconnect test in short mode")
 	}
 
-	h := newTunnelHarness(t, globalServerBin, globalClientBin, nil)
+	reconnectEnv := map[string]string{
+		"DNSTT_SMUX_KEEPALIVE_INTERVAL": "1s",
+		"DNSTT_SMUX_KEEPALIVE_TIMEOUT":  "3s",
+	}
+	h := newTunnelHarness(t, globalServerBin, globalClientBin, reconnectEnv)
 
 	// Verify working before disruption.
 	conn := h.dialTunnel(t)
