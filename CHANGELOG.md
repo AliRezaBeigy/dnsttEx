@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-03-10
+
+### Added
+
+- **Concurrent MTU probing** — MTU discovery now sends all probe sizes (both server and client directions) concurrently in each round with up to 2 retry rounds, significantly reducing startup time when the pool has many resolvers.
+- **In-flight query management** — Client limits concurrent data-carrying DNS queries in flight to prevent flooding the resolver. Low-MTU paths get a tighter cap (4); normal paths use 32. Configurable via `DNSTT_INFLIGHT_CAP` environment variable (0 = no limit).
+- **NXDOMAIN retry** — When the client receives NXDOMAIN for a data query, it re-queues the last batch and retries up to 3 times before dropping.
+
+### Changed
+
+- **Server returns NOERROR for non-TXT queries** — Instead of NXDOMAIN, the server now returns NOERROR with no payload when resolvers probe with A/AAAA (QTYPE minimization per RFC 7816), allowing them to retry with the correct TXT type.
+- **Server returns NOERROR for QNAME-minimized queries** — Zone-apex and partial-name queries now get NOERROR (no payload) so resolvers continue with the full QNAME instead of giving up on NXDOMAIN.
+- **Server PONG sends exact requested payload** — MTU probe responses now contain exactly the requested number of payload bytes (capped by response size limit), instead of computing a target wire size.
+- **Minimum KCP MTU lowered to 13** — Supports low-MTU DNS paths (e.g. 128-byte request limit) where each KCP segment must fit inside one small DNS query.
+- **Server avoids empty TXT responses** — Sends a 1-byte payload instead of empty TXT so public resolvers (e.g. Google 8.8.8.8) do not reject the response.
+
+### Fixed
+
+- **Low-MTU data transfer** — Fixed data transfers on constrained DNS paths by lowering the minimum KCP MTU and adding in-flight query throttling.
+- **Session management** — Prevented duplicate handshakes and ensured packet connections signal closure properly.
+- **Client DNS transport hardened** — Fixed handling of lossy, reordered, and truncated DNS responses discovered through new chaos-relay integration tests.
+- **Probe creation and MTU discovery** — Fixed probe message construction, client MTU calculation, and server PONG response handling.
+- **Random ID generation** — Properly handle errors from `crypto/rand` when generating DNS probe message IDs.
+
 ## [1.2.1] - 2026-03-07
 
 ### Fixed
@@ -72,7 +96,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.1.0...v1.1.1
