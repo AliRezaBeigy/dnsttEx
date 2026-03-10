@@ -873,7 +873,7 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 					if minimalWireSize+len(pongEnc) <= maxSize {
 						rec.Resp.Answer[0].Data = pongEnc
 					} else {
-						rec.Resp.Answer[0].Data = dns.EncodeRDataTXT([]byte{})
+						rec.Resp.Answer[0].Data = dns.EncodeRDataTXT([]byte{0})
 					}
 					if os.Getenv("DNSTT_DEBUG") != "" {
 						log.Printf("DNSTT_DEBUG: PONG sent (health) payload=4 bytes")
@@ -937,7 +937,16 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 				}
 				timer.Stop()
 
-				rec.Resp.Answer[0].Data = dns.EncodeRDataTXT(payload.Bytes())
+				payloadBytes := payload.Bytes()
+				if len(payloadBytes) == 0 {
+					// Send a 1-byte ACK instead of empty TXT so public resolvers
+					// (e.g. Google 8.8.8.8) that may reject empty TXT responses
+					// still forward the answer. The client safely ignores this:
+					// nextPacket needs ≥2 bytes for the uint16 length prefix, so
+					// 1 byte is parsed as incomplete → EOF → no packets queued.
+					payloadBytes = []byte{0}
+				}
+				rec.Resp.Answer[0].Data = dns.EncodeRDataTXT(payloadBytes)
 			}
 		}
 

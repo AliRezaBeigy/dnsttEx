@@ -297,6 +297,150 @@ func TestResponseFor(t *testing.T) {
 			t.Errorf("payload prefix = %x, want %x", payload[:8], clientID[:])
 		}
 	})
+
+	t.Run("0x20 mixed-case randomization on full name including domain suffix", func(t *testing.T) {
+		clientID := turbotunnel.NewClientID()
+		rawPayload := append(clientID[:], 0) // compact poll: clientID(8) + mode(1) = 9 bytes
+		enc := base36EncodeTest(rawPayload)
+
+		// Apply 0x20-style case randomization to data labels (alternate upper/lower).
+		for i := range enc {
+			if enc[i] >= 'a' && enc[i] <= 'v' && i%2 == 0 {
+				enc[i] -= 32
+			}
+		}
+
+		var labels [][]byte
+		for len(enc) > 0 {
+			n := 63
+			if n > len(enc) {
+				n = len(enc)
+			}
+			labels = append(labels, enc[:n])
+			enc = enc[n:]
+		}
+		// Randomize domain suffix case too (Google DNS randomizes the entire QNAME).
+		domainRand := [][]byte{[]byte("T"), []byte("tEsT"), []byte("InVaLiD")}
+		labels = append(labels, domainRand...)
+		name, err := dns.NewName(labels)
+		if err != nil {
+			t.Fatalf("NewName: %v", err)
+		}
+		query := &dns.Message{
+			ID:    0xABCD,
+			Flags: 0x0010, // CD=1, RD=0 (like Google DNS forwarded query)
+			Question: []dns.Question{
+				{Name: name, Type: dns.RRTypeTXT, Class: dns.ClassIN},
+			},
+			Additional: []dns.RR{
+				{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: 0, Data: []byte{}},
+			},
+		}
+		resp, payload, _ := responseFor(query, domain)
+		if resp == nil || resp.Rcode() != dns.RcodeNoError {
+			rcode := -1
+			if resp != nil {
+				rcode = int(resp.Rcode())
+			}
+			t.Fatalf("expected NoError for 0x20 mixed-case (full name), got rcode %d", rcode)
+		}
+		if len(payload) < 8 || !bytes.Equal(payload[:8], clientID[:]) {
+			t.Errorf("payload prefix = %x, want %x", payload[:8], clientID[:])
+		}
+	})
+
+	t.Run("0x20 wire-format round-trip preserves question name case in response", func(t *testing.T) {
+		clientID := turbotunnel.NewClientID()
+		rawPayload := append(clientID[:], 0) // compact poll
+		enc := base36EncodeTest(rawPayload)
+
+		for i := range enc {
+			if enc[i] >= 'a' && enc[i] <= 'v' && i%2 == 0 {
+				enc[i] -= 32
+			}
+		}
+
+		var labels [][]byte
+		for len(enc) > 0 {
+			n := 63
+			if n > len(enc) {
+				n = len(enc)
+			}
+			labels = append(labels, enc[:n])
+			enc = enc[n:]
+		}
+		domainRand := [][]byte{[]byte("T"), []byte("tEsT"), []byte("InVaLiD")}
+		labels = append(labels, domainRand...)
+		name, err := dns.NewName(labels)
+		if err != nil {
+			t.Fatalf("NewName: %v", err)
+		}
+
+		query := &dns.Message{
+			ID:    0xABCD,
+			Flags: 0x0010,
+			Question: []dns.Question{
+				{Name: name, Type: dns.RRTypeTXT, Class: dns.ClassIN},
+			},
+			Additional: []dns.RR{
+				{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: 0, Data: []byte{}},
+			},
+		}
+
+		queryWire, err := query.WireFormat()
+		if err != nil {
+			t.Fatalf("query WireFormat: %v", err)
+		}
+		parsed, err := dns.MessageFromWireFormat(queryWire)
+		if err != nil {
+			t.Fatalf("MessageFromWireFormat: %v", err)
+		}
+
+		resp, payload, _ := responseFor(&parsed, domain)
+		if resp == nil {
+			t.Fatal("responseFor returned nil")
+		}
+		if resp.Rcode() != dns.RcodeNoError {
+			t.Fatalf("expected RcodeNoError, got %d", resp.Rcode())
+		}
+		if len(payload) < 8 || !bytes.Equal(payload[:8], clientID[:]) {
+			t.Errorf("payload prefix = %x, want %x", payload[:8], clientID[:])
+		}
+
+		resp.Answer = []dns.RR{
+			{
+				Name:  resp.Question[0].Name,
+				Type:  resp.Question[0].Type,
+				Class: resp.Question[0].Class,
+				TTL:   responseTTL,
+				Data:  dns.EncodeRDataTXT([]byte{}),
+			},
+		}
+
+		respWire, err := resp.WireFormat()
+		if err != nil {
+			t.Fatalf("resp WireFormat: %v", err)
+		}
+
+		parsedResp, err := dns.MessageFromWireFormat(respWire)
+		if err != nil {
+			t.Fatalf("parse response WireFormat: %v", err)
+		}
+		if len(parsedResp.Question) != 1 {
+			t.Fatalf("expected 1 question in response, got %d", len(parsedResp.Question))
+		}
+
+		origName := parsed.Question[0].Name
+		respName := parsedResp.Question[0].Name
+		if len(origName) != len(respName) {
+			t.Fatalf("label count mismatch: query=%d resp=%d", len(origName), len(respName))
+		}
+		for i := range origName {
+			if !bytes.Equal(origName[i], respName[i]) {
+				t.Errorf("label %d 0x20 case mismatch: query=%q resp=%q", i, origName[i], respName[i])
+			}
+		}
+	})
 }
 
 // --- TestRecvLoopInjectsPackets ---
