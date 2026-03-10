@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-03-10
+
+### Changed
+
+- **Reduced `maxResponseDelay` from 1s to 500ms** — DNS chains with high intermediate latency (e.g. `.ir` TLD where root→TLD→NS hops consume 200-500ms) were exceeding recursive resolver timeout budgets, causing dropped responses. The lower default keeps total chain time well within limits. Override at runtime with `DNSTT_RESPONSE_DELAY` (e.g. `"200ms"`).
+- **64 parallel sendLoop goroutines** — The server previously used a single goroutine to build and send all DNS responses sequentially; one slow client could block hundreds of others. Now 64 goroutines drain the work channel concurrently, eliminating this bottleneck for production deployments. Configurable via `DNSTT_SEND_LOOPS`.
+
 ## [1.3.0] - 2026-03-10
 
 ### Added
@@ -96,7 +103,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.3.1...HEAD
+[1.3.1]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.1.1...v1.2.0

@@ -579,35 +579,45 @@ DANTE_EOF
 }
 
 free_port_53() {
-    # Any process binding to port 53 on any address (including 127.0.0.53,
-    # 127.0.0.54, 0.0.0.0, ::) will prevent dnstt-server from binding :53.
-    # Detect and resolve all conflicts.
+    # Ensure nothing occupies port 53 so dnstt-server can bind :53.
+    # systemd-resolved's stub listener on 127.0.0.53:53 / 127.0.0.54:53
+    # conflicts with binding to 0.0.0.0:53, so always disable it.
 
-    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        # systemd-resolved typically binds 127.0.0.53:53 and/or 127.0.0.54:53
-        if ss -ulnp 2>/dev/null | grep -q 'systemd-resolve.*:53 '; then
-            print_status "Disabling systemd-resolved stub listener to free port 53..."
-            mkdir -p /etc/systemd/resolved.conf.d
-            cat > /etc/systemd/resolved.conf.d/no-stub.conf << 'STUBEOF'
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null || \
+       ss -ulnp 2>/dev/null | grep ':53 ' | grep -q 'systemd-resolve'; then
+        print_status "Disabling systemd-resolved stub listener to free port 53..."
+
+        # Write the override config before restarting
+        mkdir -p /etc/systemd/resolved.conf.d
+        cat > /etc/systemd/resolved.conf.d/no-stub.conf << 'STUBEOF'
 [Resolve]
 DNSStubListener=no
 STUBEOF
-            systemctl restart systemd-resolved
-            sleep 1
-            # Point /etc/resolv.conf to a real upstream so the server itself can still resolve DNS
-            if [[ -L /etc/resolv.conf ]] && readlink /etc/resolv.conf | grep -q stub-resolv; then
-                print_status "Updating /etc/resolv.conf to use upstream DNS..."
-                rm -f /etc/resolv.conf
-                echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > /etc/resolv.conf
-            fi
-            print_status "systemd-resolved stub listener disabled"
+
+        # Point /etc/resolv.conf to real upstream DNS BEFORE restarting resolved,
+        # because the stub-resolv.conf symlink target will vanish.
+        if [[ -L /etc/resolv.conf ]] || grep -q '127.0.0.53' /etc/resolv.conf 2>/dev/null; then
+            print_status "Updating /etc/resolv.conf to use upstream DNS..."
+            rm -f /etc/resolv.conf
+            echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > /etc/resolv.conf
         fi
+
+        systemctl restart systemd-resolved 2>/dev/null || true
+        sleep 1
+
+        # Verify the stub is gone
+        if ss -ulnp 2>/dev/null | grep ':53 ' | grep -q 'systemd-resolve'; then
+            print_warning "systemd-resolved still on port 53, stopping it..."
+            systemctl stop systemd-resolved 2>/dev/null || true
+            sleep 1
+        fi
+        print_status "systemd-resolved stub listener disabled"
     fi
 
     # Stop bind9/named if occupying port 53
     for svc_name in named bind9; do
         if systemctl is-active --quiet "$svc_name" 2>/dev/null; then
-            if ss -ulnp 2>/dev/null | grep "$svc_name" | grep -q ':53 '; then
+            if ss -ulnp 2>/dev/null | grep ':53 ' | grep -q "$svc_name"; then
                 print_status "Stopping $svc_name which is using port 53..."
                 systemctl stop "$svc_name"
                 systemctl disable "$svc_name"
@@ -615,12 +625,20 @@ STUBEOF
         fi
     done
 
-    # Final check: is port 53 still occupied?
-    if ss -ulnp 2>/dev/null | grep -q ':53 '; then
+    # Final safety check
+    if ss -ulnp 2>/dev/null | grep ':53 ' | grep -qv dnsttEx; then
         local blocking
-        blocking=$(ss -ulnp 2>/dev/null | grep ':53 ' | head -3)
-        print_warning "Port 53 is still in use:\n$blocking"
-        print_warning "dnstt-server may fail to start. Manually stop the process using port 53."
+        blocking=$(ss -ulnp 2>/dev/null | grep ':53 ' | grep -v dnsttEx | head -3)
+        print_warning "Port 53 may still be in use:\n$blocking"
+        print_warning "Attempting to kill remaining processes on port 53..."
+        # Extract PIDs and kill them
+        ss -ulnp 2>/dev/null | grep ':53 ' | grep -v dnsttEx | grep -oP 'pid=\K[0-9]+' | while read -r pid; do
+            if [[ -n "$pid" ]]; then
+                print_status "Killing PID $pid using port 53..."
+                kill "$pid" 2>/dev/null || true
+            fi
+        done
+        sleep 1
     fi
 }
 
@@ -694,10 +712,6 @@ print_success_box() {
 }
 
 main() {
-    if [[ "$0" != "$SCRIPT_INSTALL_PATH" ]] && [[ "$0" != *"dnsttEx-deploy"* ]]; then
-        install_script
-        exec "$SCRIPT_INSTALL_PATH" "$@"
-    fi
     check_for_updates
     handle_menu
     detect_os

@@ -86,21 +86,23 @@ const (
 	// How to set the TTL field in Answer resource records.
 	responseTTL = 60
 
-	// How long we may wait for downstream data before sending an empty
-	// response. If another query comes in while we are waiting, we'll send
-	// an empty response anyway and restart the delay timer for the next
-	// response.
-	//
-	// This number should be less than 2 seconds, which in 2019 was reported
-	// to be the query timeout of the Quad9 DoH server.
-	// https://dnsencryption.info/imc19-doe.html Section 4.2, Finding 2.4
-	maxResponseDelay = 1 * time.Second
-
 	// How long to wait for a TCP connection to upstream to be established.
 	upstreamDialTimeout = 30 * time.Second
 
 	// How long a fallback session can be idle before being torn down.
 	fallbackIdleTimeout = 2 * time.Minute
+)
+
+var (
+	// How long we may wait for downstream data before sending an empty
+	// response. If another query comes in while we are waiting, we'll send
+	// an empty response anyway and restart the delay timer for the next
+	// response.
+	//
+	// Tuned for DNS chains with high intermediate latency (e.g. .ir TLD),
+	// where root→TLD→NS hops can consume 200-500ms of a resolver's ~2s
+	// timeout budget. Override at runtime with DNSTT_RESPONSE_DELAY (e.g. "200ms").
+	maxResponseDelay = 200 * time.Millisecond
 )
 
 var (
@@ -808,7 +810,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 // response, it sends on the network immediately. Those that represent a
 // response capable of carrying data, it packs full of as many packets as will
 // fit while keeping the total size under maxEncodedPayload, then sends it.
-func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-chan *record, maxEncodedPayload int) error {
+func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-chan *record, maxEncodedPayload int, clientLocks *sync.Map) error {
 	var nextRec *record
 	for {
 		rec := nextRec
@@ -880,73 +882,80 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 					}
 				}
 			} else {
-				var payload bytes.Buffer
-				limit := maxPayloadForReq
-				if limit > maxEncodedPayload {
-					limit = maxEncodedPayload
-				}
-				timer := time.NewTimer(maxResponseDelay)
-				for {
-					var p []byte
-					unstash := ttConn.Unstash(rec.ClientID)
-					outgoing := ttConn.OutgoingQueue(rec.ClientID)
-					// When channel has pending records, don't wait long so we drain and avoid "channel full" drops.
-					waitDelay := maxResponseDelay
-					if len(ch) > 0 {
-						waitDelay = 0
+				// Serialize data collection per client so concurrent goroutines
+				// don't compete for the same outgoing queue and overflow the
+				// single-element stash (which silently drops KCP segments).
+				// Use TryLock to avoid thundering-herd: if another goroutine is
+				// already collecting for this client, send an empty ACK immediately.
+				lockVal, _ := clientLocks.LoadOrStore(rec.ClientID, &sync.Mutex{})
+				mu := lockVal.(*sync.Mutex)
+				if !mu.TryLock() {
+					rec.Resp.Answer[0].Data = dns.EncodeRDataTXT([]byte{0})
+				} else {
+					var payload bytes.Buffer
+					limit := maxPayloadForReq
+					if limit > maxEncodedPayload {
+						limit = maxEncodedPayload
 					}
-					if !timer.Stop() {
-						select {
-						case <-timer.C:
-						default:
+					timer := time.NewTimer(maxResponseDelay)
+					for {
+						var p []byte
+						unstash := ttConn.Unstash(rec.ClientID)
+						outgoing := ttConn.OutgoingQueue(rec.ClientID)
+						// When channel has pending records, don't wait long so we drain and avoid "channel full" drops.
+						waitDelay := maxResponseDelay
+						if len(ch) > 0 {
+							waitDelay = 0
 						}
-					}
-					timer.Reset(waitDelay)
-					select {
-					case p = <-unstash:
-					default:
+						if !timer.Stop() {
+							select {
+							case <-timer.C:
+							default:
+							}
+						}
+						timer.Reset(waitDelay)
 						select {
 						case p = <-unstash:
-						case p = <-outgoing:
 						default:
 							select {
 							case p = <-unstash:
 							case p = <-outgoing:
-							case <-timer.C:
-							case nextRec = <-ch:
+							default:
+								select {
+								case p = <-unstash:
+								case p = <-outgoing:
+								case <-timer.C:
+								case nextRec = <-ch:
+								}
 							}
 						}
-					}
-					timer.Reset(0)
+						timer.Reset(0)
 
-					if len(p) == 0 {
-						break
-					}
+						if len(p) == 0 {
+							break
+						}
 
-					packetSize := 2 + len(p)
-					if limit < packetSize {
-						ttConn.Stash(p, rec.ClientID)
-						break
+						packetSize := 2 + len(p)
+						if limit < packetSize {
+							ttConn.Stash(p, rec.ClientID)
+							break
+						}
+						limit -= packetSize
+						if int(uint16(len(p))) != len(p) {
+							panic(len(p))
+						}
+						binary.Write(&payload, binary.BigEndian, uint16(len(p)))
+						payload.Write(p)
 					}
-					limit -= packetSize
-					if int(uint16(len(p))) != len(p) {
-						panic(len(p))
+					timer.Stop()
+					mu.Unlock()
+
+					payloadBytes := payload.Bytes()
+					if len(payloadBytes) == 0 {
+						payloadBytes = []byte{0}
 					}
-					binary.Write(&payload, binary.BigEndian, uint16(len(p)))
-					payload.Write(p)
+					rec.Resp.Answer[0].Data = dns.EncodeRDataTXT(payloadBytes)
 				}
-				timer.Stop()
-
-				payloadBytes := payload.Bytes()
-				if len(payloadBytes) == 0 {
-					// Send a 1-byte ACK instead of empty TXT so public resolvers
-					// (e.g. Google 8.8.8.8) that may reject empty TXT responses
-					// still forward the answer. The client safely ignores this:
-					// nextPacket needs ≥2 bytes for the uint16 length prefix, so
-					// 1 byte is parsed as incomplete → EOF → no packets queued.
-					payloadBytes = []byte{0}
-				}
-				rec.Resp.Answer[0].Data = dns.EncodeRDataTXT(payloadBytes)
 			}
 		}
 
@@ -1185,21 +1194,41 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 	ch := make(chan *record, sendChanSize)
 	defer close(ch)
 
+	if s := os.Getenv("DNSTT_RESPONSE_DELAY"); s != "" {
+		if d, err := time.ParseDuration(s); err == nil && d > 0 {
+			maxResponseDelay = d
+		}
+	}
+	log.Printf("maxResponseDelay %v", maxResponseDelay)
+
 	// Create a fallback manager if an address is specified.
 	var fallbackMgr *FallbackManager
 	if fallbackAddr != nil {
 		fallbackMgr = NewFallbackManager(dnsConn, fallbackAddr)
 	}
 
-	// We could run multiple copies of sendLoop; that would allow more time
-	// for each response to collect downstream data before being evicted by
-	// another response that needs to be sent.
-	go func() {
-		err := sendLoop(dnsConn, ttConn, ch, maxEncodedPayload)
-		if err != nil {
-			log.Printf("sendLoop: %v", err)
+	// Run multiple sendLoop goroutines so concurrent clients don't block
+	// each other. Each goroutine independently collects downstream data and
+	// sends responses; the shared channel distributes work automatically.
+	numSendLoops := 64
+	if s := os.Getenv("DNSTT_SEND_LOOPS"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n >= 1 {
+			if n > 1024 {
+				n = 1024
+			}
+			numSendLoops = n
 		}
-	}()
+	}
+	log.Printf("starting %d sendLoop goroutines", numSendLoops)
+	var clientLocks sync.Map
+	for i := 0; i < numSendLoops; i++ {
+		go func() {
+			err := sendLoop(dnsConn, ttConn, ch, maxEncodedPayload, &clientLocks)
+			if err != nil {
+				log.Printf("sendLoop: %v", err)
+			}
+		}()
+	}
 
 	return recvLoop(domain, dnsConn, ttConn, ch, fallbackMgr)
 }
