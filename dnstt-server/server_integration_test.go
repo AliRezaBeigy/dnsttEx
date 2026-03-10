@@ -10,6 +10,8 @@ import (
 
 	"dnsttEx/dns"
 	"dnsttEx/turbotunnel"
+
+	"github.com/jellydator/ttlcache/v3"
 )
 
 // base36Encode encodes src into Base36 (0-9a-v, 5 bits/symbol) for name-based tests.
@@ -479,9 +481,12 @@ func TestRecvLoopInjectsPackets(t *testing.T) {
 	ch := make(chan *record, 64)
 
 	// Start recvLoop in a goroutine. It returns when dnsConn is closed.
+	clientCache := ttlcache.New[turbotunnel.ClientID, *clientState](
+		ttlcache.WithTTL[turbotunnel.ClientID, *clientState](2*time.Minute),
+	)
 	done := make(chan error, 1)
 	go func() {
-		done <- recvLoop(domain, dnsConn, ttConn, ch, nil)
+		done <- recvLoop(domain, dnsConn, ttConn, ch, nil, clientCache)
 	}()
 
 	// Build a query that carries a real KCP-style packet.
@@ -603,9 +608,12 @@ func TestPongResponseSize(t *testing.T) {
 	defer ttConn.Close()
 
 	ch := make(chan *record, 64)
+	clientCache := ttlcache.New[turbotunnel.ClientID, *clientState](
+		ttlcache.WithTTL[turbotunnel.ClientID, *clientState](2*time.Minute),
+	)
 	done := make(chan error, 1)
 	go func() {
-		done <- recvLoop(domain, dnsConn, ttConn, ch, nil)
+		done <- recvLoop(domain, dnsConn, ttConn, ch, nil, clientCache)
 	}()
 
 	// PING with requested response size 5: clientID(8) + 0xFF + size_hi(1) + size_lo(1) + 6 noise = 17 bytes.
