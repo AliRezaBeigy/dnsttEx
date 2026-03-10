@@ -23,7 +23,7 @@ RELEASE_BASE="https://github.com/AliRezaBeigy/dnsttEx/releases/latest/download"
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/dnsttEx"
 SYSTEMD_DIR="/etc/systemd/system"
-DNSTT_PORT="5300"
+DNSTT_PORT="53"
 DNSTT_USER="dnsttEx"
 SERVICE_NAME="dnsttEx-server"
 CONFIG_FILE="${CONFIG_DIR}/dnsttEx-server.conf"
@@ -200,7 +200,7 @@ show_configuration_info() {
     echo -e "  MTU: ${YELLOW}$MTU_VALUE${NC}"
     echo -e "  Tunnel mode: ${YELLOW}$TUNNEL_MODE${NC}"
     echo -e "  User: ${YELLOW}$DNSTT_USER${NC}"
-    echo -e "  Listen port: ${YELLOW}$DNSTT_PORT${NC} (DNS 53 -> $DNSTT_PORT)"
+    echo -e "  Listen port: ${YELLOW}$DNSTT_PORT${NC} (UDP)"
     echo -e "  Service status: $service_status"
     echo ""
     if [[ -f "$PUBLIC_KEY_FILE" ]]; then
@@ -227,18 +227,27 @@ remove_iptables_rules() {
     iface=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -1)
     iface="${iface:-eth0}"
     print_status "Removing iptables rules..."
+    # Remove current port rule
     while iptables -C INPUT -p udp --dport "$DNSTT_PORT" -j ACCEPT 2>/dev/null; do
         iptables -D INPUT -p udp --dport "$DNSTT_PORT" -j ACCEPT
     done
-    while iptables -t nat -C PREROUTING -i "$iface" -p udp --dport 53 -j REDIRECT --to-ports "$DNSTT_PORT" 2>/dev/null; do
-        iptables -t nat -D PREROUTING -i "$iface" -p udp --dport 53 -j REDIRECT --to-ports "$DNSTT_PORT"
+    # Remove legacy redirect and port 5300 rules from older installations
+    for old_port in 5300 "$DNSTT_PORT"; do
+        while iptables -C INPUT -p udp --dport "$old_port" -j ACCEPT 2>/dev/null; do
+            iptables -D INPUT -p udp --dport "$old_port" -j ACCEPT
+        done
+        while iptables -t nat -C PREROUTING -i "$iface" -p udp --dport 53 -j REDIRECT --to-ports "$old_port" 2>/dev/null; do
+            iptables -t nat -D PREROUTING -i "$iface" -p udp --dport 53 -j REDIRECT --to-ports "$old_port"
+        done
     done
     if command -v ip6tables &>/dev/null && [[ -f /proc/net/if_inet6 ]]; then
-        while ip6tables -C INPUT -p udp --dport "$DNSTT_PORT" -j ACCEPT 2>/dev/null; do
-            ip6tables -D INPUT -p udp --dport "$DNSTT_PORT" -j ACCEPT
-        done
-        while ip6tables -t nat -C PREROUTING -i "$iface" -p udp --dport 53 -j REDIRECT --to-ports "$DNSTT_PORT" 2>/dev/null; do
-            ip6tables -t nat -D PREROUTING -i "$iface" -p udp --dport 53 -j REDIRECT --to-ports "$DNSTT_PORT"
+        for old_port in 5300 "$DNSTT_PORT"; do
+            while ip6tables -C INPUT -p udp --dport "$old_port" -j ACCEPT 2>/dev/null; do
+                ip6tables -D INPUT -p udp --dport "$old_port" -j ACCEPT
+            done
+            while ip6tables -t nat -C PREROUTING -i "$iface" -p udp --dport 53 -j REDIRECT --to-ports "$old_port" 2>/dev/null; do
+                ip6tables -t nat -D PREROUTING -i "$iface" -p udp --dport 53 -j REDIRECT --to-ports "$old_port"
+            done
         done
     fi
     save_iptables_rules
@@ -249,12 +258,14 @@ remove_firewall_rules() {
         print_status "Removing firewalld rules..."
         firewall-cmd --permanent --remove-port="${DNSTT_PORT}/udp" 2>/dev/null
         firewall-cmd --permanent --remove-port=53/udp 2>/dev/null
+        firewall-cmd --permanent --remove-port=5300/udp 2>/dev/null
         firewall-cmd --reload 2>/dev/null
     fi
     if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
         print_status "Removing ufw rules..."
         ufw delete allow "${DNSTT_PORT}/udp" 2>/dev/null
         ufw delete allow 53/udp 2>/dev/null
+        ufw delete allow 5300/udp 2>/dev/null
     fi
 }
 
@@ -503,16 +514,21 @@ save_iptables_rules() {
 }
 
 configure_iptables() {
-    print_status "Configuring iptables (port 53 -> $DNSTT_PORT)..."
+    print_status "Configuring iptables (allow UDP port $DNSTT_PORT inbound)..."
+    iptables -C INPUT -p udp --dport "$DNSTT_PORT" -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT -p udp --dport "$DNSTT_PORT" -j ACCEPT
+    if command -v ip6tables &>/dev/null && [[ -f /proc/net/if_inet6 ]]; then
+        ip6tables -C INPUT -p udp --dport "$DNSTT_PORT" -j ACCEPT 2>/dev/null || \
+            ip6tables -I INPUT -p udp --dport "$DNSTT_PORT" -j ACCEPT 2>/dev/null || true
+    fi
+    # Clean up legacy PREROUTING redirect rules from older installations
     local iface
     iface=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -1)
     iface="${iface:-eth0}"
-    iptables -I INPUT -p udp --dport "$DNSTT_PORT" -j ACCEPT
-    iptables -t nat -I PREROUTING -i "$iface" -p udp --dport 53 -j REDIRECT --to-ports "$DNSTT_PORT"
-    if command -v ip6tables &>/dev/null && [[ -f /proc/net/if_inet6 ]]; then
-        ip6tables -I INPUT -p udp --dport "$DNSTT_PORT" -j ACCEPT 2>/dev/null || true
-        ip6tables -t nat -I PREROUTING -i "$iface" -p udp --dport 53 -j REDIRECT --to-ports "$DNSTT_PORT" 2>/dev/null || true
-    fi
+    while iptables -t nat -C PREROUTING -i "$iface" -p udp --dport 53 -j REDIRECT --to-ports 5300 2>/dev/null; do
+        iptables -t nat -D PREROUTING -i "$iface" -p udp --dport 53 -j REDIRECT --to-ports 5300
+        print_status "Removed legacy iptables PREROUTING redirect (53→5300)"
+    done
     save_iptables_rules
 }
 
@@ -562,6 +578,42 @@ DANTE_EOF
     print_status "Dante SOCKS listening on 127.0.0.1:1080"
 }
 
+free_port_53() {
+    # systemd-resolved's stub listener can occupy 127.0.0.53:53 or 127.0.0.1:53.
+    # The main listener on 0.0.0.0:53 / :::53 is what blocks us.
+    # Disable the stub listener so dnstt-server can bind to :53.
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        local stub_status
+        stub_status=$(resolvectl status 2>/dev/null | grep -i "DNSStubListener" || true)
+        # Check if anything is actually bound to *:53 or 0.0.0.0:53
+        if ss -ulnp 2>/dev/null | grep -qE '(0\.0\.0\.0|:::|\*):53 '; then
+            print_status "Disabling systemd-resolved stub listener to free port 53..."
+            mkdir -p /etc/systemd/resolved.conf.d
+            cat > /etc/systemd/resolved.conf.d/no-stub.conf << 'STUBEOF'
+[Resolve]
+DNSStubListener=no
+STUBEOF
+            systemctl restart systemd-resolved
+            # Point /etc/resolv.conf to a real upstream so the server can still resolve DNS
+            if [[ -L /etc/resolv.conf ]] && readlink /etc/resolv.conf | grep -q stub-resolv; then
+                print_status "Updating /etc/resolv.conf to use upstream DNS..."
+                rm -f /etc/resolv.conf
+                echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > /etc/resolv.conf
+            fi
+        fi
+    fi
+    # Stop bind9/named if running on port 53
+    for svc_name in named bind9; do
+        if systemctl is-active --quiet "$svc_name" 2>/dev/null; then
+            if ss -ulnp 2>/dev/null | grep -E '(0\.0\.0\.0|:::|\*):53 ' | grep -q "$svc_name"; then
+                print_status "Stopping $svc_name which is using port 53..."
+                systemctl stop "$svc_name"
+                systemctl disable "$svc_name"
+            fi
+        fi
+    done
+}
+
 create_systemd_service() {
     local target_port
     if [[ "$TUNNEL_MODE" == "ssh" ]]; then
@@ -575,17 +627,21 @@ create_systemd_service() {
         print_status "Stopping $SERVICE_NAME for reconfiguration..."
         systemctl stop "$SERVICE_NAME"
     fi
+    free_port_53
     local svc="${SYSTEMD_DIR}/${SERVICE_NAME}.service"
     print_status "Creating systemd service..."
     cat > "$svc" << EOF
 [Unit]
 Description=dnsttEx DNS Tunnel Server
 After=network.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=$DNSTT_USER
 Group=$DNSTT_USER
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 ExecStart=${INSTALL_DIR}/dnsttEx-server -udp :${DNSTT_PORT} -privkey-file ${PRIVATE_KEY_FILE} -mtu ${MTU_VALUE} ${NS_SUBDOMAIN} 127.0.0.1:${target_port}
 Restart=always
 RestartSec=5
@@ -596,7 +652,14 @@ EOF
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME"
     systemctl start "$SERVICE_NAME"
-    print_status "$SERVICE_NAME started"
+
+    # Verify the service is actually listening on port 53
+    sleep 1
+    if ss -ulnp 2>/dev/null | grep -qE ":${DNSTT_PORT}\b"; then
+        print_status "$SERVICE_NAME is listening on UDP port $DNSTT_PORT"
+    else
+        print_warning "$SERVICE_NAME may not be listening on port $DNSTT_PORT — check: journalctl -u $SERVICE_NAME"
+    fi
 }
 
 print_success_box() {
