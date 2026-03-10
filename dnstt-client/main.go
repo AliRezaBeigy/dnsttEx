@@ -673,195 +673,216 @@ func scanResolvers(endpoints []*poolEndpoint, domain dns.Name, timeout time.Dura
 	return passed
 }
 
+// mtuProbe represents a single MTU probe (server response size or client request size).
+type mtuProbe struct {
+	msg          []byte
+	expectedName string
+	size         int
+	isServer     bool // true = server/response MTU, false = client/request MTU
+	succeeded    bool
+	skipRetry    bool // set when sizes above max-successful shouldn't be retried
+}
+
+func (p *mtuProbe) done() bool { return p.succeeded || p.skipRetry }
+
 // discoverMTU finds the max response size (server MTU) and max request size (client MTU)
-// that work for this resolver by sending PING probes with increasing sizes until no answer.
-// Results are stored on the endpoint.
+// that work for this resolver. All probe sizes (both directions) are sent concurrently
+// in each round, with up to 2 retry rounds for probes that don't get a response.
+// After each round, probes for sizes above the highest successful size are skipped
+// (truncated responses can't be parsed, so those would otherwise block the full timeout).
 func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration) {
 	if ep.probeConn == nil {
 		return
 	}
 	probeID := turbotunnel.NewClientID()
 
-	// Server MTU: how big a response can the path deliver? (server→client)
 	serverSizes := []int{256, 384, 512, 1024, 1232, 1452, 2048, 4096}
-	serverMTU := 0
-	if dnsttDebug() {
-		log.Printf("DNSTT_DEBUG: MTU phase 1 %s: testing max response size (server→client)", ep.name)
-	}
+	clientSizes := []int{128, 160, 192, 256, 280}
+
+	probes := make([]*mtuProbe, 0, len(serverSizes)+len(clientSizes))
+	nameToProbe := make(map[string]*mtuProbe, len(serverSizes)+len(clientSizes))
+
 	for _, size := range serverSizes {
-		if dnsttDebug() {
-			log.Printf("DNSTT_DEBUG: MTU probe %s: testing response size %d (requested from server)", ep.name, size)
-		}
 		msg, err := BuildMTUProbeMessage(domain, probeID, size)
 		if err != nil {
 			continue
 		}
-		expectedName := ""
-		if query, parseErr := dns.MessageFromWireFormat(msg); parseErr == nil && len(query.Question) == 1 {
-			expectedName = query.Question[0].Name.String()
+		var name string
+		if q, e := dns.MessageFromWireFormat(msg); e == nil && len(q.Question) == 1 {
+			name = q.Question[0].Name.String()
 		}
-		ok := false
-		hadResponse := false
-		for attempt := 0; attempt <= mtuProbeErrorRetries; attempt++ {
-			ep.probeConn.SetDeadline(time.Now().Add(timeout))
-			_, err = ep.probeConn.WriteTo(msg, ep.addr)
-			if err != nil {
-				ep.probeConn.SetDeadline(time.Time{})
-				if dnsttDebug() && attempt < mtuProbeErrorRetries {
-					log.Printf("DNSTT_DEBUG: MTU probe %s: response size %d write error, retry %d/%d: %v", ep.name, size, attempt+1, mtuProbeErrorRetries, err)
-				}
-				continue
-			}
-			if dnsttDebug() && attempt == 0 {
-				log.Printf("DNSTT_DEBUG: MTU probe %s: testing response size %d, PING query (hex):\n%s", ep.name, size, dnsttDebugHexDump(msg, 0))
-			}
-			buf := make([]byte, 4096)
-			n, _, err := ep.probeConn.ReadFrom(buf)
-			ep.probeConn.SetDeadline(time.Time{})
-			responseLen := 0
-			matchedQuery := false
-			if err == nil {
-				if resp, parseErr := dns.MessageFromWireFormat(buf[:n]); parseErr == nil {
-					if len(resp.Question) == 1 && resp.Question[0].Name.String() == expectedName {
-						matchedQuery = true
-						hadResponse = true
-					}
-					if p := dnsResponsePayload(&resp, domain); p != nil {
-						responseLen = len(p)
-					}
-				}
-			}
-			ok = err == nil && matchedQuery && VerifyMTUProbeResponse(buf[:n], domain, size)
-			if dnsttDebug() {
-				if err != nil {
-					log.Printf("DNSTT_DEBUG: MTU probe %s: response error (requested %d): %v", ep.name, size, err)
-				} else if !matchedQuery {
-					log.Printf("DNSTT_DEBUG: MTU probe %s: ignored stale response while testing response size %d", ep.name, size)
-				} else {
-					log.Printf("DNSTT_DEBUG: MTU probe %s: response payload %d bytes (requested %d), ok=%v", ep.name, responseLen, size, ok)
-					log.Printf("DNSTT_DEBUG: MTU probe %s: testing response size %d, PONG response (hex):\n%s", ep.name, size, dnsttDebugHexDump(buf[:n], 0))
-				}
-			}
-			if err != nil || !matchedQuery {
-				if attempt < mtuProbeErrorRetries {
-					continue
-				}
-				break
-			}
-			break
+		p := &mtuProbe{msg: msg, expectedName: name, size: size, isServer: true}
+		probes = append(probes, p)
+		if name != "" {
+			nameToProbe[name] = p
 		}
-		if ok {
-			serverMTU = size
-		} else {
-			if !hadResponse && dnsttDebug() {
-				log.Printf("DNSTT_DEBUG: MTU probe %s: giving up on response size %d after %d transient error retries", ep.name, size, mtuProbeErrorRetries)
-			}
-			break
-		}
-	}
-	if serverMTU == 0 {
-		serverMTU = 512 // safe default
-	}
-
-	// Client MTU: how big can our query be and still get a PONG? (Independent of response size—
-	// many paths allow larger requests but truncate responses, so we probe both.)
-	// DNS limits the question name to 255 octets, so max query wire size is ~282; we only probe up to that.
-	clientSizes := []int{128, 160, 192, 256, 280}
-	clientMTU := 0
-	if dnsttDebug() {
-		log.Printf("DNSTT_DEBUG: MTU phase 2 %s: testing max request (query) size (client→server)", ep.name)
 	}
 	for _, size := range clientSizes {
-		if dnsttDebug() {
-			log.Printf("DNSTT_DEBUG: MTU probe %s: testing request size %d bytes (client→server)", ep.name, size)
-		}
 		msg, err := BuildProbeMessageWithRequestSize(domain, probeID, size)
 		if err != nil {
 			continue
 		}
-		expectedName := ""
-		if query, parseErr := dns.MessageFromWireFormat(msg); parseErr == nil && len(query.Question) == 1 {
-			expectedName = query.Question[0].Name.String()
+		var name string
+		if q, e := dns.MessageFromWireFormat(msg); e == nil && len(q.Question) == 1 {
+			name = q.Question[0].Name.String()
 		}
-		var ok bool
-		var n int
-		buf := make([]byte, 4096)
-		for attempt := 0; attempt <= mtuProbeNXDOMAINRetries+mtuProbeErrorRetries; attempt++ {
-			ep.probeConn.SetDeadline(time.Now().Add(timeout))
-			_, err = ep.probeConn.WriteTo(msg, ep.addr)
-			if err != nil {
-				ep.probeConn.SetDeadline(time.Time{})
-				if dnsttDebug() && attempt < mtuProbeNXDOMAINRetries+mtuProbeErrorRetries {
-					log.Printf("DNSTT_DEBUG: MTU probe %s: request size %d write error, retry %d/%d: %v", ep.name, size, attempt+1, mtuProbeNXDOMAINRetries+mtuProbeErrorRetries, err)
-				}
-				continue
-			}
-			if dnsttDebug() && attempt > 0 {
-				log.Printf("DNSTT_DEBUG: MTU probe %s: request size %d retry %d/%d", ep.name, size, attempt, mtuProbeNXDOMAINRetries+mtuProbeErrorRetries)
-			}
-			if dnsttDebug() && attempt == 0 {
-				log.Printf("DNSTT_DEBUG: MTU probe %s: testing request size %d bytes, PING query (hex):\n%s", ep.name, size, dnsttDebugHexDump(msg, 0))
-			}
-			n, _, err = ep.probeConn.ReadFrom(buf)
-			ep.probeConn.SetDeadline(time.Time{})
-			if err != nil {
-				if dnsttDebug() && attempt < mtuProbeNXDOMAINRetries+mtuProbeErrorRetries {
-					log.Printf("DNSTT_DEBUG: MTU probe %s: request size %d read error, retry %d/%d: %v", ep.name, size, attempt+1, mtuProbeNXDOMAINRetries+mtuProbeErrorRetries, err)
-				}
-				continue
-			}
-			responseLen := 0
-			var responseRcode int
-			matchedQuery := false
-			if resp, parseErr := dns.MessageFromWireFormat(buf[:n]); parseErr == nil {
-				if len(resp.Question) == 1 && resp.Question[0].Name.String() == expectedName {
-					matchedQuery = true
-				}
-				responseRcode = int(resp.Rcode())
-				if p := dnsResponsePayload(&resp, domain); p != nil {
-					responseLen = len(p)
-				}
-			}
-			ok = matchedQuery && VerifyProbeResponse(buf[:n], domain)
-			if dnsttDebug() {
-				rcodeStr := "NOERROR"
-				if responseRcode != dns.RcodeNoError {
-					rcodeStr = fmt.Sprintf("RCODE %d (e.g. NXDOMAIN=3)", responseRcode)
-				}
-				if !matchedQuery {
-					log.Printf("DNSTT_DEBUG: MTU probe %s: ignored stale response while testing request size %d", ep.name, size)
-				} else {
-					log.Printf("DNSTT_DEBUG: MTU probe %s: response %s, payload %d bytes (request size %d), PONG ok=%v", ep.name, rcodeStr, responseLen, size, ok)
-				}
-				if !ok && responseRcode != dns.RcodeNoError && clientMTU > 0 {
-					log.Printf("DNSTT_DEBUG: MTU probe %s: path or resolver rejects request size %d (returned %s); max request size is %d bytes", ep.name, size, rcodeStr, clientMTU)
-				}
-				if matchedQuery {
-					log.Printf("DNSTT_DEBUG: MTU probe %s: testing request size %d bytes, PONG response (hex):\n%s", ep.name, size, dnsttDebugHexDump(buf[:n], 0))
-				}
-			}
-			if ok {
-				break
-			}
-			if !matchedQuery {
-				continue
-			}
-			if responseRcode == dns.RcodeNoError {
-				break
-			}
-			// NXDOMAIN (or other error rcode): retry same probe.
-		}
-		if err != nil {
-			break
-		}
-		if ok {
-			clientMTU = size
-		} else {
-			break
+		p := &mtuProbe{msg: msg, expectedName: name, size: size, isServer: false}
+		probes = append(probes, p)
+		if name != "" {
+			nameToProbe[name] = p
 		}
 	}
+
+	if dnsttDebug() {
+		log.Printf("DNSTT_DEBUG: MTU discovery %s: %d probes (%d server + %d client), sending concurrently",
+			ep.name, len(probes), len(serverSizes), len(clientSizes))
+	}
+
+	const maxRounds = 2
+	for round := 0; round < maxRounds; round++ {
+		pending := 0
+		for _, p := range probes {
+			if !p.done() {
+				pending++
+			}
+		}
+		if pending == 0 {
+			break
+		}
+		if dnsttDebug() && round > 0 {
+			log.Printf("DNSTT_DEBUG: MTU discovery %s: round %d, retrying %d unanswered probes",
+				ep.name, round+1, pending)
+		}
+
+		sent := 0
+		for _, p := range probes {
+			if p.done() {
+				continue
+			}
+			if _, err := ep.probeConn.WriteTo(p.msg, ep.addr); err != nil {
+				if dnsttDebug() {
+					kind := "response"
+					if !p.isServer {
+						kind = "request"
+					}
+					log.Printf("DNSTT_DEBUG: MTU probe %s: round %d write error (%s size %d): %v",
+						ep.name, round+1, kind, p.size, err)
+				}
+				continue
+			}
+			sent++
+		}
+
+		deadline := time.Now().Add(timeout)
+		ep.probeConn.SetDeadline(deadline)
+		received := 0
+		for {
+			buf := make([]byte, 4096)
+			n, _, err := ep.probeConn.ReadFrom(buf)
+			if err != nil {
+				break
+			}
+			received++
+			resp, parseErr := dns.MessageFromWireFormat(buf[:n])
+			if parseErr != nil || len(resp.Question) != 1 {
+				if received >= sent {
+					break
+				}
+				continue
+			}
+			p, found := nameToProbe[resp.Question[0].Name.String()]
+			if !found || p.done() {
+				if received >= sent {
+					break
+				}
+				continue
+			}
+
+			ok := false
+			if p.isServer {
+				ok = VerifyMTUProbeResponse(buf[:n], domain, p.size)
+			} else {
+				ok = VerifyProbeResponse(buf[:n], domain)
+			}
+			if ok {
+				p.succeeded = true
+			} else {
+				p.skipRetry = true
+			}
+			if dnsttDebug() {
+				kind := "response"
+				if !p.isServer {
+					kind = "request"
+				}
+				if ok {
+					log.Printf("DNSTT_DEBUG: MTU probe %s: %s size %d OK (round %d)",
+						ep.name, kind, p.size, round+1)
+				} else {
+					log.Printf("DNSTT_DEBUG: MTU probe %s: %s size %d verification failed (round %d)",
+						ep.name, kind, p.size, round+1)
+				}
+			}
+
+			allDone := true
+			for _, p := range probes {
+				if !p.done() {
+					allDone = false
+					break
+				}
+			}
+			if allDone || received >= sent {
+				break
+			}
+		}
+		ep.probeConn.SetDeadline(time.Time{})
+
+		// MTU behavior is monotonic: if size S succeeds and S+1 doesn't, all sizes
+		// above S will also fail (truncated by the path). Skip retrying those probes
+		// so we don't burn full timeout rounds on sizes we already know won't work.
+		// Only retry probes below maxSuccess that might have been lost to network jitter.
+		maxServerOK, maxClientOK := 0, 0
+		for _, p := range probes {
+			if !p.succeeded {
+				continue
+			}
+			if p.isServer && p.size > maxServerOK {
+				maxServerOK = p.size
+			}
+			if !p.isServer && p.size > maxClientOK {
+				maxClientOK = p.size
+			}
+		}
+		for _, p := range probes {
+			if p.done() {
+				continue
+			}
+			if p.isServer && maxServerOK > 0 && p.size > maxServerOK {
+				p.skipRetry = true
+			}
+			if !p.isServer && maxClientOK > 0 && p.size > maxClientOK {
+				p.skipRetry = true
+			}
+		}
+	}
+
+	serverMTU := 0
+	clientMTU := 0
+	for _, p := range probes {
+		if !p.succeeded {
+			continue
+		}
+		if p.isServer && p.size > serverMTU {
+			serverMTU = p.size
+		}
+		if !p.isServer && p.size > clientMTU {
+			clientMTU = p.size
+		}
+	}
+	if serverMTU == 0 {
+		serverMTU = 512
+	}
 	if clientMTU == 0 {
-		clientMTU = 128 // safest request-side fallback when probes fail
+		clientMTU = 128
 	}
 
 	ep.setMaxSizes(serverMTU, clientMTU)
@@ -1142,10 +1163,19 @@ Known TLS fingerprints for -utls are:
 		endpoints = passed
 	}
 
-	// MTU discovery: find max response and request size per resolver (PING with increasing size until no answer).
+	// MTU discovery: probe all endpoints concurrently (each sends all probe sizes
+	// at once, so discovery completes in ~1 timeout window instead of N×sizes×timeout).
 	mtuTimeout := mtuProbeTimeout()
-	for _, ep := range endpoints {
-		discoverMTU(ep, domain, mtuTimeout)
+	{
+		var wg sync.WaitGroup
+		for _, ep := range endpoints {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				discoverMTU(ep, domain, mtuTimeout)
+			}()
+		}
+		wg.Wait()
 	}
 
 	// Build the transport pconn.
