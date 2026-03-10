@@ -23,11 +23,15 @@
 package kcp
 
 import (
+	"log"
+	"os"
 	"sync/atomic"
 
 	"github.com/pkg/errors"
 	"golang.org/x/net/ipv4"
 )
+
+var traceKCP = os.Getenv("DNSTT_TRACE_KCP") == "1"
 
 // defaultTx is the default procedure to transmit data
 func (s *UDPSession) defaultTx(txqueue []ipv4.Message) {
@@ -44,4 +48,14 @@ func (s *UDPSession) defaultTx(txqueue []ipv4.Message) {
 	}
 	atomic.AddUint64(&DefaultSnmp.OutPkts, uint64(npkts))
 	atomic.AddUint64(&DefaultSnmp.OutBytes, uint64(nbytes))
+	if traceKCP && npkts > 0 {
+		outPkts := atomic.LoadUint64(&DefaultSnmp.OutPkts)
+		prev := outPkts - uint64(npkts)
+		if outPkts <= 100 || (outPkts/5000 > prev/5000) {
+			retrans := atomic.LoadUint64(&DefaultSnmp.RetransSegs)
+			fastRetrans := atomic.LoadUint64(&DefaultSnmp.FastRetransSegs)
+			earlyRetrans := atomic.LoadUint64(&DefaultSnmp.EarlyRetransSegs)
+			log.Printf("DNSTT_TRACE_KCP: OutPkts=%d RetransSegs=%d FastRetrans=%d EarlyRetrans=%d (batch=%d)", outPkts, retrans, fastRetrans, earlyRetrans, npkts)
+		}
+	}
 }

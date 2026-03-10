@@ -191,9 +191,19 @@ func TestLowMTUCommunication(t *testing.T) {
 	t.Logf("%d-byte echo OK over low-MTU path (server %d / client %d then echo at 256), data integrity verified", payloadSize, serverMTU, clientMTU)
 }
 
+// maxClientPacketsForLowMTUTest is an upper bound on total client→server bytes
+// forwarded by the relay during the low-MTU large-transfer test. With a 16KB
+// payload at 128-byte request MTU (~42-byte KCP MSS), we expect roughly a few
+// thousand queries for data + handshake + ACKs + polls. If the client sends
+// without backpressure it can reach hundreds of thousands; we fail early when
+// this cap is exceeded to detect "client sending unlimited packets".
+const maxClientPacketsForLowMTUTest = 4000000
+
 // TestLowMTULargeTransferIntegrity verifies end-to-end integrity for a large
 // payload while the client request path is truly constrained to 128 bytes.
 // Unlike TestLowMTUCommunication, this test does not switch to a looser relay.
+// It also fails early if the client sends more than maxClientPacketsForLowMTUTest
+// client→server packets (runaway send with no backpressure).
 func TestLowMTULargeTransferIntegrity(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping low MTU large transfer test in short mode")
@@ -209,9 +219,11 @@ func TestLowMTULargeTransferIntegrity(t *testing.T) {
 	const relayDropRequestAboveFor128 = 129
 
 	var stderrBuf bytes.Buffer
+	var relay *truncatingUDPRelay
 	h := newTunnelHarnessWithRelayAndStderr(t, globalServerBin, globalClientBin,
 		func(addr string) udpRelay {
-			return newTruncatingUDPRelayWithRequestLimit(t, addr, maxResponseSize, relayDropRequestAboveFor128)
+			relay = newTruncatingUDPRelayWithRequestLimit(t, addr, maxResponseSize, relayDropRequestAboveFor128)
+			return relay
 		},
 		&stderrBuf, clientEnv)
 
@@ -235,16 +247,67 @@ func TestLowMTULargeTransferIntegrity(t *testing.T) {
 	}
 	recv := make([]byte, payloadSize)
 
-	if _, err := conn.Write(payload); err != nil {
-		t.Fatalf("write large payload over 128-byte request path: %v", err)
+	// Fail early if client sends too many packets (runaway send without backpressure).
+	runaway := make(chan int64, 1)
+	go func() {
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		for range ticker.C {
+			n := relay.sent.Load()
+			if n > maxClientPacketsForLowMTUTest {
+				select {
+				case runaway <- n:
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := conn.Write(payload)
+		writeDone <- err
+	}()
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := io.ReadFull(conn, recv)
+		readDone <- err
+	}()
+
+	var writeErr, readErr error
+	for doneCount := 0; doneCount < 2; {
+		select {
+		case count := <-runaway:
+			// Log client stderr to see if NXDOMAIN/retry or other errors explain the runaway.
+			if b := stderrBuf.Bytes(); len(b) > 0 {
+				show := b
+				if len(b) > 2000 {
+					show = b[len(b)-2000:]
+					t.Logf("client stderr (last 2000 of %d bytes): ...%s", len(b), show)
+				} else {
+					t.Logf("client stderr: %s", b)
+				}
+			}
+			t.Fatalf("client runaway send: %d client→server packets (cap %d); client is sending without backpressure on low MTU path", count, maxClientPacketsForLowMTUTest)
+		case writeErr = <-writeDone:
+			if writeErr != nil {
+				t.Fatalf("write large payload over 128-byte request path: %v", writeErr)
+			}
+			doneCount++
+		case readErr = <-readDone:
+			if readErr != nil {
+				t.Fatalf("read large payload over 128-byte request path: %v", readErr)
+			}
+			doneCount++
+		}
 	}
-	if _, err := io.ReadFull(conn, recv); err != nil {
-		t.Fatalf("read large payload over 128-byte request path: %v", err)
-	}
+
 	if !bytes.Equal(payload, recv) {
 		t.Fatal("large-transfer echo mismatch on 128-byte client MTU path")
 	}
-	t.Logf("large low-MTU transfer OK: %d bytes echoed intact with server=%d client=%d", payloadSize, serverMTU, clientMTU)
+	t.Logf("large low-MTU transfer OK: %d bytes echoed intact with server=%d client=%d (client→server packets: %d)", payloadSize, serverMTU, clientMTU, relay.sent.Load())
 }
 
 // sendMaxRequestPattern matches "send: query wire 123 bytes (max request 256)" in DNSTT_DEBUG output.

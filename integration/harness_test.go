@@ -674,10 +674,10 @@ func TestDataIntegrity(t *testing.T) {
 // It counts raw bytes in both directions for wire-overhead measurement.
 // If dnsLog is set, each DNS packet is parsed and logged (query/response).
 type countingUDPRelay struct {
-	ln              *net.UDPConn // listens for client packets
-	serverAddr      *net.UDPAddr // real server address
+	ln               *net.UDPConn // listens for client packets
+	serverAddr       *net.UDPAddr // real server address
 	upstreamBindAddr *net.UDPAddr
-	advertiseAddr   string
+	advertiseAddr    string
 
 	sent     atomic.Int64 // bytes forwarded client → server
 	received atomic.Int64 // bytes forwarded server → client
@@ -918,18 +918,18 @@ func (r *truncatingUDPRelay) Close() {
 // chaosUDPRelay injects packet loss, delay, and duplication between client and server.
 // It is used to simulate realistic DNS transport faults in integration tests.
 type chaosUDPRelay struct {
-	ln         *net.UDPConn
-	serverConn *net.UDPConn
-	serverAddr *net.UDPAddr
+	ln            *net.UDPConn
+	serverConn    *net.UDPConn
+	serverAddr    *net.UDPAddr
 	advertiseAddr string
 
 	mu         sync.Mutex
 	clientAddr *net.UDPAddr
 
-	dropClientEvery     int
-	dropServerEvery     int
+	dropClientEvery      int
+	dropServerEvery      int
 	duplicateServerEvery int
-	serverDelay         time.Duration
+	serverDelay          time.Duration
 
 	clientPackets atomic.Int64
 	serverPackets atomic.Int64
