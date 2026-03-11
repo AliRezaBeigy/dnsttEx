@@ -687,9 +687,8 @@ func (p *mtuProbe) done() bool { return p.succeeded || p.skipRetry }
 // discoverMTU finds the max response size (server MTU) and max request size (client MTU)
 // that work for this resolver. All probe sizes (both directions) are sent concurrently
 // in each round, with up to 2 retry rounds for probes that don't get a response.
-// After each round, probes for sizes above the highest successful size are skipped
-// (truncated responses can't be parsed, so those would otherwise block the full timeout).
-func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration) {
+// If clientMTUOverride > 0, client request size is not probed and that value is used.
+func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration, clientMTUOverride int) {
 	if ep.probeConn == nil {
 		return
 	}
@@ -697,6 +696,9 @@ func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration) {
 
 	serverSizes := []int{256, 384, 512, 1024, 1232, 1452, 2048, 4096}
 	clientSizes := []int{128, 160, 192, 256, 280}
+	if clientMTUOverride > 0 {
+		clientSizes = nil // user set -mtu: skip client request size probes
+	}
 
 	probes := make([]*mtuProbe, 0, len(serverSizes)+len(clientSizes))
 	nameToProbe := make(map[string]*mtuProbe, len(serverSizes)+len(clientSizes))
@@ -880,7 +882,9 @@ func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration) {
 	if serverMTU == 0 {
 		serverMTU = 512
 	}
-	if clientMTU == 0 {
+	if clientMTUOverride > 0 {
+		clientMTU = clientMTUOverride
+	} else if clientMTU == 0 {
 		clientMTU = 128
 	}
 
@@ -1040,7 +1044,7 @@ Known TLS fingerprints for -utls are:
 	flag.BoolVar(&doScan, "scan", false,
 		"pre-start scan: test each resolver and keep only those that receive a valid server response")
 	flag.IntVar(&clientMTUFlag, "mtu", 0,
-		"cap max DNS response size in bytes (0 = use discovered per-resolver limit)")
+		"client path MTU in bytes for request size (0 = discover per resolver). When set, only request size uses this value; response size is still discovered.")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.LUTC)
@@ -1162,19 +1166,21 @@ Known TLS fingerprints for -utls are:
 		endpoints = passed
 	}
 
-	// MTU discovery: probe all endpoints concurrently (each sends all probe sizes
-	// at once, so discovery completes in ~1 timeout window instead of N×sizes×timeout).
+	// MTU discovery: always probe server (response) size; probe client (request) size only when -mtu not set.
 	mtuTimeout := mtuProbeTimeout()
 	{
 		var wg sync.WaitGroup
 		for _, ep := range endpoints {
 			wg.Add(1)
-			go func() {
+			go func(ep *poolEndpoint) {
 				defer wg.Done()
-				discoverMTU(ep, domain, mtuTimeout)
-			}()
+				discoverMTU(ep, domain, mtuTimeout, clientMTUFlag)
+			}(ep)
 		}
 		wg.Wait()
+	}
+	if clientMTUFlag > 0 {
+		log.Printf("Using client MTU %d bytes for request size", clientMTUFlag)
 	}
 
 	// Build the transport pconn.
@@ -1207,8 +1213,8 @@ Known TLS fingerprints for -utls are:
 		effectiveMaxRequest = pool.MinMaxRequestSize(0)
 		log.Printf("Using %d resolver(s), policy: %q", len(endpoints), resolverPolicy)
 	}
-	if clientMTUFlag > 0 && (effectiveMaxResponse <= 0 || clientMTUFlag < effectiveMaxResponse) {
-		effectiveMaxResponse = clientMTUFlag
+	if clientMTUFlag > 0 && (effectiveMaxRequest <= 0 || clientMTUFlag < effectiveMaxRequest) {
+		effectiveMaxRequest = clientMTUFlag
 	}
 
 	pconn = NewDNSPacketConn(pconn, remoteAddr, domain, effectiveMaxResponse, effectiveMaxRequest)
