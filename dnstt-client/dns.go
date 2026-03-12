@@ -134,6 +134,10 @@ type DNSPacketConn struct {
 	pendingRetryMu    sync.Mutex
 	pendingRetry      [][]byte // copy of last sent data batch, for re-queue on NXDOMAIN
 	pendingRetryCount int      // number of times we've re-queued this batch due to NXDOMAIN
+	// TC=1 (truncated) response handling: resolver truncated a response that was
+	// too large. We track this to dynamically reduce maxResponseSize and trigger re-polls.
+	truncatedCount atomic.Uint64 // total TC=1 responses seen (for logging)
+	truncatedOnce  sync.Once     // log warning only once
 	// Stats for periodic report (DNSTT_STATS=1 or DNSTT_DEBUG): atomics, reset every second.
 	statsQueriesSent        atomic.Uint64
 	statsTunnelBytesSent    atomic.Uint64
@@ -183,10 +187,7 @@ func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name, 
 	// Low-MTU paths get a tighter default; normal paths use a generous limit.
 	// Override with DNSTT_INFLIGHT_CAP (0 = no limit).
 	{
-		cap := int32(32)
-		if maxRequestSize > 0 && maxRequestSize <= 256 {
-			cap = 4
-		}
+		cap := int32(0)
 		if s := os.Getenv("DNSTT_INFLIGHT_CAP"); s != "" {
 			if v, err := strconv.Atoi(s); err == nil && v >= 0 {
 				cap = int32(v)
@@ -342,6 +343,43 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 			continue
 		}
 		c.statsResponsesRecvTotal.Add(1)
+
+		// TC=1: the recursive resolver truncated the response because it was
+		// too large for the path. The server's downstream data in this response
+		// is lost. Trigger immediate re-polls so the server gets new queries to
+		// respond to, and dynamically reduce maxResponseSize so subsequent
+		// server responses fit.
+		if resp.Flags&0x0200 != 0 {
+			cnt := c.truncatedCount.Add(1)
+			c.truncatedOnce.Do(func() {
+				log.Printf("WARNING: DNS response truncated (TC=1) by resolver — server data lost; reducing max response size")
+			})
+			if dnsttDebug() {
+				qName := ""
+				if len(resp.Question) >= 1 {
+					qName = resp.Question[0].Name.String()
+				}
+				log.Printf("DNSTT_DEBUG: TC=1 truncated response #%d for %s (wire %d bytes)", cnt, qName, n)
+			}
+			// Reduce maxResponseSize: step down to the next lower safe value.
+			// This affects all future queries' OPT Class field.
+			if c.maxResponseSize > 256 {
+				newMax := c.maxResponseSize * 3 / 4
+				if newMax < 256 {
+					newMax = 256
+				}
+				c.maxResponseSize = newMax
+				log.Printf("Reduced max response size to %d bytes due to truncation", newMax)
+			}
+			// Trigger 2 immediate re-polls so the server has queries to respond
+			// to with the data it couldn't deliver in the truncated response.
+			for i := 0; i < 2; i++ {
+				select {
+				case c.pollChan <- struct{}{}:
+				default:
+				}
+			}
+		}
 
 		rcode := resp.Flags & 0x000f
 		if rcode != dns.RcodeNoError {

@@ -915,6 +915,128 @@ func (r *truncatingUDPRelay) Close() {
 	r.serverConn.Close()
 }
 
+// slowLossyTruncatingUDPRelay is like truncatingUDPRelayWithRequestLimit but also
+// adds one-way server→client delay (realistic slow internet) and drops every
+// dropClientEvery-th client→server packet (queries that never reach the server).
+// Used for integrity tests over a constrained, slow, and lossy path.
+type slowLossyTruncatingUDPRelay struct {
+	ln              *net.UDPConn
+	serverConn      *net.UDPConn
+	serverAddr      *net.UDPAddr
+	advertiseAddr   string
+	maxResponseSize int
+	maxRequestSize  int
+	serverDelay     time.Duration
+	dropClientEvery int
+
+	sent     atomic.Int64
+	received atomic.Int64
+	mu       sync.Mutex
+	clientAddr *net.UDPAddr
+
+	clientPackets atomic.Int64
+}
+
+func newSlowLossyTruncatingUDPRelay(t testing.TB, serverAddrStr string, maxResponseSize, maxRequestSize int, serverDelay time.Duration, dropClientEvery int) *slowLossyTruncatingUDPRelay {
+	t.Helper()
+	serverAddr, err := net.ResolveUDPAddr("udp", serverAddrStr)
+	if err != nil {
+		t.Fatalf("resolve server addr: %v", err)
+	}
+	listenAddr := relayListenUDPAddr(t)
+	ln, err := net.ListenUDP("udp", listenAddr)
+	if err != nil {
+		t.Fatalf("slow-lossy relay listen: %v", err)
+	}
+	serverConn, err := net.ListenUDP("udp", relayUpstreamBindAddr(listenAddr))
+	if err != nil {
+		ln.Close()
+		t.Fatalf("slow-lossy relay server conn: %v", err)
+	}
+	r := &slowLossyTruncatingUDPRelay{
+		ln:                ln,
+		serverConn:        serverConn,
+		serverAddr:        serverAddr,
+		advertiseAddr:     relayAdvertiseAddr(t, ln.LocalAddr().String(), serverAddrStr),
+		maxResponseSize:   maxResponseSize,
+		maxRequestSize:    maxRequestSize,
+		serverDelay:       serverDelay,
+		dropClientEvery:   dropClientEvery,
+	}
+	go r.serverToClientLoop()
+	go r.clientToServerLoop()
+	return r
+}
+
+func (r *slowLossyTruncatingUDPRelay) serverToClientLoop() {
+	buf := make([]byte, 4096)
+	for {
+		n, _, err := r.serverConn.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		r.received.Add(int64(n))
+		r.mu.Lock()
+		addr := r.clientAddr
+		r.mu.Unlock()
+		if addr == nil {
+			continue
+		}
+		toSend := buf[:n]
+		if n > r.maxResponseSize {
+			toSend = buf[:r.maxResponseSize]
+			if len(toSend) >= 3 {
+				toSend[2] |= 0x02 // TC = 1
+			}
+		}
+		send := func(p []byte) {
+			payload := append([]byte(nil), p...)
+			if r.serverDelay > 0 {
+				time.AfterFunc(r.serverDelay, func() {
+					r.ln.WriteToUDP(payload, addr)
+				})
+			} else {
+				r.ln.WriteToUDP(payload, addr)
+			}
+		}
+		send(toSend)
+	}
+}
+
+func (r *slowLossyTruncatingUDPRelay) clientToServerLoop() {
+	buf := make([]byte, 4096)
+	for {
+		n, clientAddr, err := r.ln.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		r.mu.Lock()
+		r.clientAddr = clientAddr
+		r.mu.Unlock()
+		if r.maxRequestSize > 0 && n > r.maxRequestSize {
+			continue
+		}
+		seq := int(r.clientPackets.Add(1))
+		if r.dropClientEvery > 0 && seq%r.dropClientEvery == 0 {
+			continue
+		}
+		r.sent.Add(int64(n))
+		r.serverConn.WriteToUDP(buf[:n], r.serverAddr)
+	}
+}
+
+func (r *slowLossyTruncatingUDPRelay) Addr() string {
+	if r.advertiseAddr != "" {
+		return r.advertiseAddr
+	}
+	return r.ln.LocalAddr().String()
+}
+
+func (r *slowLossyTruncatingUDPRelay) Close() {
+	r.ln.Close()
+	r.serverConn.Close()
+}
+
 // chaosUDPRelay injects packet loss, delay, and duplication between client and server.
 // It is used to simulate realistic DNS transport faults in integration tests.
 type chaosUDPRelay struct {

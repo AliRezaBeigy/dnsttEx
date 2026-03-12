@@ -229,7 +229,7 @@ func (sm *sessionManager) createSessionUnlocked() (*kcp.UDPSession, io.ReadWrite
 		1,  // nc=1: congestion window off
 	)
 	// DNS can take many seconds to respond; set minimum RTO so we don't retransmit too soon and burst.
-	kcpMinRTO := uint32(15000) // 15 sec default
+	kcpMinRTO := uint32(1000)
 	if s := os.Getenv("DNSTT_KCP_MIN_RTO_MS"); s != "" {
 		if ms, err := strconv.ParseUint(s, 10, 32); err == nil {
 			kcpMinRTO = uint32(ms)

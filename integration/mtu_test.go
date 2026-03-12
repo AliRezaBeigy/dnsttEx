@@ -310,6 +310,122 @@ func TestLowMTULargeTransferIntegrity(t *testing.T) {
 	t.Logf("large low-MTU transfer OK: %d bytes echoed intact with server=%d client=%d (client→server packets: %d)", payloadSize, serverMTU, clientMTU, relay.sent.Load())
 }
 
+// maxClientPacketsForSlowLossyTest is a higher cap for the slow+lossy test because
+// retries and RTT mean more packets for the same payload. Still fail if client
+// runs away without backpressure.
+const maxClientPacketsForSlowLossyTest = 8000000
+
+// TestSlowLossyLowMTULargeTransferIntegrity verifies end-to-end integrity for a
+// large payload over a constrained path (128-byte client MTU, 512-byte server
+// MTU) with realistic slow internet (one-way delay) and client→server packet
+// loss so that some queries never reach the server. The tunnel must still
+// deliver the full payload correctly via retries and reliability.
+func TestSlowLossyLowMTULargeTransferIntegrity(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping slow lossy low MTU large transfer test in short mode")
+	}
+	t.Setenv("DNSTT_SEND_CHANNEL_SIZE", "1310720")
+
+	clientEnv := map[string]string{"DNSTT_MTU_PROBE_TIMEOUT": "2s"}
+	const maxResponseSize = 512
+	const maxRequestSize = 128
+	const relayDropRequestAboveFor128 = 129
+	// Realistic slow link: ~80ms one-way delay (~160ms RTT).
+	const serverDelay = 80 * time.Millisecond
+	// Drop every 15th client→server packet (~6.7% of queries never reach server).
+	const dropClientEvery = 15
+
+	var stderrBuf bytes.Buffer
+	var relay *slowLossyTruncatingUDPRelay
+	h := newTunnelHarnessWithRelayAndStderr(t, globalServerBin, globalClientBin,
+		func(addr string) udpRelay {
+			relay = newSlowLossyTruncatingUDPRelay(t, addr, maxResponseSize, relayDropRequestAboveFor128, serverDelay, dropClientEvery)
+			return relay
+		},
+		&stderrBuf, clientEnv)
+
+	serverMTU, clientMTU := waitForMTUDiscovery(t, &stderrBuf, 20*time.Second)
+	if serverMTU != maxResponseSize {
+		t.Errorf("server MTU = %d, want %d (path limits responses to %d)", serverMTU, maxResponseSize, maxResponseSize)
+	}
+	if clientMTU != maxRequestSize {
+		t.Fatalf("client MTU = %d, want %d (relay drops requests > %d)", clientMTU, maxRequestSize, relayDropRequestAboveFor128)
+	}
+	t.Logf("MTU discovery: server=%d client=%d (delay=%v, drop client every %d)", serverMTU, clientMTU, serverDelay, dropClientEvery)
+
+	conn := h.dialTunnel(t)
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(300 * time.Second))
+
+	const payloadSize = 16 * 1024
+	payload := make([]byte, payloadSize)
+	for i := range payload {
+		payload[i] = byte(i % 256)
+	}
+	recv := make([]byte, payloadSize)
+
+	runaway := make(chan int64, 1)
+	go func() {
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		for range ticker.C {
+			n := relay.sent.Load()
+			if n > maxClientPacketsForSlowLossyTest {
+				select {
+				case runaway <- n:
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := conn.Write(payload)
+		writeDone <- err
+	}()
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := io.ReadFull(conn, recv)
+		readDone <- err
+	}()
+
+	var writeErr, readErr error
+	for doneCount := 0; doneCount < 2; {
+		select {
+		case count := <-runaway:
+			if b := stderrBuf.Bytes(); len(b) > 0 {
+				show := b
+				if len(b) > 2000 {
+					show = b[len(b)-2000:]
+					t.Logf("client stderr (last 2000 of %d bytes): ...%s", len(b), show)
+				} else {
+					t.Logf("client stderr: %s", b)
+				}
+			}
+			t.Fatalf("client runaway send: %d client→server packets (cap %d) on slow+lossy path", count, maxClientPacketsForSlowLossyTest)
+		case writeErr = <-writeDone:
+			if writeErr != nil {
+				t.Fatalf("write large payload over slow+lossy 128-byte path: %v", writeErr)
+			}
+			doneCount++
+		case readErr = <-readDone:
+			if readErr != nil {
+				t.Fatalf("read large payload over slow+lossy 128-byte path: %v", readErr)
+			}
+			doneCount++
+		}
+	}
+
+	if !bytes.Equal(payload, recv) {
+		t.Fatal("large transfer echo mismatch on slow+lossy 128-byte client MTU path")
+	}
+	t.Logf("slow+lossy low-MTU transfer OK: %d bytes echoed intact (server=%d client=%d, delay=%v, drop every %d; client→server packets: %d)",
+		payloadSize, serverMTU, clientMTU, serverDelay, dropClientEvery, relay.sent.Load())
+}
+
 // sendMaxRequestPattern matches "send: query wire 123 bytes (max request 256)" in DNSTT_DEBUG output.
 var sendMaxRequestPattern = regexp.MustCompile(`send: query wire \d+ bytes \(max request (\d+)\)`)
 

@@ -222,3 +222,110 @@ func TestSocks5RealCurl(t *testing.T) {
 		relay.sent.Load(), relay.received.Load())
 	t.Log("TestSocks5RealCurl: OK — real curl through dnstt tunnel via SOCKS5")
 }
+
+// TestSocks5RealCurlSlowLossy is like TestSocks5RealCurl but runs the tunnel over
+// a slow, lossy, low-MTU path (128-byte client MTU, 512-byte server MTU, ~80ms
+// one-way delay, ~6.7% client→server packet loss). Verifies that real curl
+// through SOCKS5 still succeeds when some queries never reach the server.
+func TestSocks5RealCurlSlowLossy(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping slow+lossy curl test in short mode")
+	}
+
+	curlPath, err := exec.LookPath("curl")
+	if err != nil {
+		t.Skip("skipping: curl not found in PATH")
+	}
+
+	probe, err := net.DialTimeout("tcp", "ipify.ir:80", 5*time.Second)
+	if err != nil {
+		t.Skipf("skipping: ipify.ir unreachable (%v)", err)
+	}
+	probe.Close()
+
+	socksLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("socks5 listen: %v", err)
+	}
+	defer socksLn.Close()
+	go runSocks5Proxy(socksLn)
+	t.Logf("SOCKS5 proxy listening on %s", socksLn.Addr())
+
+	privkey, err := noise.GeneratePrivkey()
+	if err != nil {
+		t.Fatalf("GeneratePrivkey: %v", err)
+	}
+	privkeyHex := noise.EncodeKey(privkey)
+	pubkeyHex := noise.EncodeKey(noise.PubkeyFromPrivkey(privkey))
+
+	dnsUDPAddr := allocFreeUDPAddr(t)
+	domain := "t.test.invalid"
+
+	serverCmd := exec.Command(globalServerBin,
+		"-udp", dnsUDPAddr,
+		"-privkey", privkeyHex,
+		domain,
+		socksLn.Addr().String(),
+	)
+	serverCmd.Stderr = os.Stderr
+	if err := serverCmd.Start(); err != nil {
+		t.Fatalf("start server: %v", err)
+	}
+	defer func() {
+		serverCmd.Process.Kill()
+		serverCmd.Wait()
+	}()
+	time.Sleep(300 * time.Millisecond)
+	t.Logf("dnstt-server listening on UDP %s → upstream %s", dnsUDPAddr, socksLn.Addr())
+
+	const maxResponseSize = 512
+	const relayDropRequestAboveFor128 = 129
+	const serverDelay = 80 * time.Millisecond
+	const dropClientEvery = 15
+
+	relay := newSlowLossyTruncatingUDPRelay(t, dnsUDPAddr, maxResponseSize, relayDropRequestAboveFor128, serverDelay, dropClientEvery)
+	defer relay.Close()
+	t.Logf("DNS relay (slow+lossy, MTU 512/128, delay=%v, drop every %d) on %s → server %s", serverDelay, dropClientEvery, relay.Addr(), dnsUDPAddr)
+
+	clientAddr := allocFreeTCPAddr(t)
+	clientCmd := exec.Command(globalClientBin,
+		"-udp", relay.Addr(),
+		"-pubkey", pubkeyHex,
+		domain,
+		clientAddr,
+	)
+	clientCmd.Stderr = os.Stderr
+	clientCmd.Env = append(os.Environ(), "DNSTT_MTU_PROBE_TIMEOUT=2s", "DNSTT_SEND_CHANNEL_SIZE=1310720")
+	if err := clientCmd.Start(); err != nil {
+		t.Fatalf("start client: %v", err)
+	}
+	defer func() {
+		clientCmd.Process.Kill()
+		clientCmd.Wait()
+	}()
+
+	waitTCP(t, clientAddr, 30*time.Second)
+	t.Logf("dnstt-client listening on %s (SOCKS5 entry point)", clientAddr)
+
+	t.Logf("running: %s -x socks5h://%s --max-time 120 -s http://ipify.ir (slow+lossy path)", curlPath, clientAddr)
+	curlCmd := exec.Command(curlPath,
+		"-x", "socks5h://"+clientAddr,
+		"--max-time", "120",
+		"-s", "-S",
+		"http://ipify.ir",
+	)
+	curlOut, err := curlCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("curl failed on slow+lossy path: %v\noutput: %s", err, curlOut)
+	}
+
+	body := strings.TrimSpace(string(curlOut))
+	t.Logf("curl response (%d bytes): %s", len(body), body)
+
+	if len(body) == 0 {
+		t.Fatal("curl returned empty body")
+	}
+
+	t.Logf("client→server packets: %d (slow+lossy)", relay.sent.Load())
+	t.Log("TestSocks5RealCurlSlowLossy: OK — real curl through dnstt tunnel via SOCKS5 over slow+lossy path")
+}
