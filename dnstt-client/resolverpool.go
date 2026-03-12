@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	healthCheckInterval = 60 * time.Second
+	healthCheckInterval = 30 * time.Second
 	healthCheckTimeout  = 7 * time.Second
 	// After this many consecutive probe failures, mark endpoint unhealthy.
 	healthCheckFailThreshold = 2
@@ -27,6 +27,15 @@ const (
 	// stalling the readLoop goroutines. 4096 entries × ~4 KB each = up to
 	// ~16 MB queued, well within practical limits.
 	recvChCap = 4096
+
+	// Data-path responsiveness: endpoints that haven't returned any DNS
+	// response within this window are skipped by pickEndpoint. This catches
+	// resolvers that pass health probes but silently drop tunnel queries
+	// (common with ISP DNS interception across multiple backend resolvers).
+	dataPathResponseWindow = 20 * time.Second
+	// Every reprobeEvery-th query, send one query to a "cold" (unresponsive)
+	// endpoint to check if it has recovered.
+	reprobeEvery = 10
 )
 
 // testHookHealthCheckInterval, when non-zero, overrides healthCheckInterval in
@@ -36,6 +45,10 @@ var testHookHealthCheckInterval time.Duration
 // testHookHealthCheckTimeout, when non-zero, overrides healthCheckTimeout in
 // probeEndpoint so integration tests can fail fast on unresponsive resolvers.
 var testHookHealthCheckTimeout time.Duration
+
+// testHookDataPathResponseWindow, when non-zero, overrides dataPathResponseWindow
+// in pickEndpoint so tests can verify data-path filtering without long waits.
+var testHookDataPathResponseWindow time.Duration
 
 // resolverSpec holds a parsed resolver from flags or file.
 type resolverSpec struct {
@@ -70,6 +83,11 @@ type poolEndpoint struct {
 	// bytesPassed counts bytes received from this endpoint (weighted-traffic).
 	// Accessed only with atomic operations.
 	bytesPassed atomic.Uint64
+
+	// lastResponseTime is the UnixNano timestamp of the most recent DNS
+	// response received from this endpoint's data socket. Updated atomically
+	// by readLoop; read by pickEndpoint for data-path filtering.
+	lastResponseTime atomic.Int64
 }
 
 func (e *poolEndpoint) setHealthy(rtt time.Duration) {
@@ -146,6 +164,10 @@ type ResolverPool struct {
 	sendMu      sync.Mutex
 	pendingSend *poolEndpoint
 
+	// reprobeIdx is the next round-robin index for re-probing cold (data-path
+	// unresponsive) endpoints; accessed atomically.
+	reprobeIdx uint64
+
 	recvCh    chan recvResult
 	done      chan struct{}
 	closeOnce sync.Once
@@ -208,6 +230,7 @@ func (rp *ResolverPool) readLoop(idx int, ep *poolEndpoint) {
 			return
 		}
 		ep.bytesPassed.Add(uint64(n))
+		ep.lastResponseTime.Store(time.Now().UnixNano())
 		select {
 		case rp.recvCh <- recvResult{buf: buf, n: n, addr: addr, endpointIndex: idx}:
 		case <-rp.done:
@@ -313,12 +336,28 @@ func (rp *ResolverPool) logPoolStatus() {
 			selected = fmt.Sprintf("%s (round-robin)", candidates[0].ep.name)
 		}
 	}
+	// Count data-path cold endpoints among healthy ones.
+	respWindow := dataPathResponseWindow
+	if testHookDataPathResponseWindow != 0 {
+		respWindow = testHookDataPathResponseWindow
+	}
+	var coldNames []string
+	for _, s := range candidates {
+		last := s.ep.lastResponseTime.Load()
+		if last == 0 || time.Since(time.Unix(0, last)) >= respWindow {
+			coldNames = append(coldNames, s.ep.name)
+		}
+	}
+
 	msg := fmt.Sprintf("resolver pool: %d/%d healthy", nHealthy, total)
 	if nHealthy > 0 {
 		msg += " — " + strings.Join(healthyNames, ", ")
 	}
 	if len(unhealthyNames) > 0 {
 		msg += "; unhealthy: " + strings.Join(unhealthyNames, ", ")
+	}
+	if len(coldNames) > 0 {
+		msg += fmt.Sprintf("; data-path cold (%d): %s", len(coldNames), strings.Join(coldNames, ", "))
 	}
 	msg += "; selected: " + selected
 	log.Printf("resolverpool: %s", msg)
@@ -404,6 +443,32 @@ func (rp *ResolverPool) pickEndpoint() *poolEndpoint {
 	}
 	if len(candidates) == 0 {
 		return nil
+	}
+
+	// Data-path responsiveness: skip endpoints that haven't returned a DNS
+	// response within the response window. This avoids wasting queries on
+	// resolvers that pass health probes but don't forward tunnel traffic
+	// (e.g., ISP DNS interception with mixed backend resolvers).
+	respWindow := dataPathResponseWindow
+	if testHookDataPathResponseWindow != 0 {
+		respWindow = testHookDataPathResponseWindow
+	}
+	var responsive, cold []epSnap
+	for _, s := range candidates {
+		last := s.ep.lastResponseTime.Load()
+		if last > 0 && time.Since(time.Unix(0, last)) < respWindow {
+			responsive = append(responsive, s)
+		} else {
+			cold = append(cold, s)
+		}
+	}
+	if len(responsive) > 0 && len(cold) > 0 {
+		queryNum := atomic.AddUint64(&rp.reprobeIdx, 1)
+		if queryNum%uint64(reprobeEvery) == 0 {
+			coldIdx := (queryNum / uint64(reprobeEvery)) % uint64(len(cold))
+			return cold[coldIdx].ep
+		}
+		candidates = responsive
 	}
 
 	switch rp.policy {

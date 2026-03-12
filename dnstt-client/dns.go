@@ -981,12 +981,13 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 
 		if len(packets) > 0 {
 			// Wait until fewer than inFlightCap data queries are outstanding.
-			// Timeout after 10 s to recover from lost responses instead of blocking forever.
+			// Timeout after 3s to recover from lost responses (e.g. queries sent to
+			// non-responsive resolvers via ISP DNS interception).
 			if c.inFlightCap > 0 {
 				for c.inFlightCount.Load() >= c.inFlightCap {
 					select {
 					case <-c.inFlightSignal:
-					case <-time.After(10 * time.Second):
+					case <-time.After(3 * time.Second):
 						log.Printf("in-flight cap stall: count=%d cap=%d; resetting (responses may have been lost)", c.inFlightCount.Load(), c.inFlightCap)
 						c.inFlightCount.Store(0)
 					}

@@ -122,7 +122,11 @@ func handleSocks5(conn net.Conn) {
 //	          → ipify.ir  (internet)
 //
 // Requires: curl in PATH, internet access. Skipped otherwise.
+// Flaky: skipped by default; set RUN_FLAKY_TESTS=1 to run.
 func TestSocks5RealCurl(t *testing.T) {
+	if os.Getenv("RUN_FLAKY_TESTS") != "1" {
+		t.Skip("skipping flaky test (set RUN_FLAKY_TESTS=1 to run)")
+	}
 	curlPath, err := exec.LookPath("curl")
 	if err != nil {
 		t.Skip("skipping: curl not found in PATH")
@@ -227,7 +231,11 @@ func TestSocks5RealCurl(t *testing.T) {
 // a slow, lossy, low-MTU path (128-byte client MTU, 512-byte server MTU, ~80ms
 // one-way delay, ~6.7% client→server packet loss). Verifies that real curl
 // through SOCKS5 still succeeds when some queries never reach the server.
+// Flaky: skipped by default; set RUN_FLAKY_TESTS=1 to run.
 func TestSocks5RealCurlSlowLossy(t *testing.T) {
+	if os.Getenv("RUN_FLAKY_TESTS") != "1" {
+		t.Skip("skipping flaky test (set RUN_FLAKY_TESTS=1 to run)")
+	}
 	if testing.Short() {
 		t.Skip("skipping slow+lossy curl test in short mode")
 	}

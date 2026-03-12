@@ -1055,7 +1055,7 @@ Known TLS fingerprints for -utls are:
 	flag.StringVar(&utlsDistribution, "utls",
 		"4*random,3*Firefox_120,1*Firefox_105,3*Chrome_120,1*Chrome_102,1*iOS_14,1*iOS_13",
 		"choose TLS fingerprint from weighted distribution")
-	flag.StringVar(&resolverPolicy, "resolver-policy", "least-ping",
+	flag.StringVar(&resolverPolicy, "resolver-policy", "round-robin",
 		"resolver selection policy when multiple resolvers are used: round-robin, least-ping, weighted-traffic")
 	flag.BoolVar(&doScan, "scan", false,
 		"pre-start scan: test each resolver and keep only those that receive a valid server response")
