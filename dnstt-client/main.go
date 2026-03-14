@@ -91,6 +91,10 @@ const (
 // dnsttDebug returns true when DNSTT_DEBUG is set (for verbose PING/PONG and MTU discovery logs).
 func dnsttDebug() bool { return os.Getenv("DNSTT_DEBUG") != "" }
 
+// dnsttLogRxData enables logging of tunnel payload extracted from DNS answers
+// (length-prefixed stream only; health PONG / probes are skipped). Set DNSTT_LOG_RX_DATA=1.
+func dnsttLogRxData() bool { return os.Getenv("DNSTT_LOG_RX_DATA") != "" }
+
 // dnsttTrace returns true when DNSTT_TRACE is set (for full path tracing to diagnose failures).
 func dnsttTrace() bool { return os.Getenv("DNSTT_TRACE") != "" }
 
@@ -1201,6 +1205,36 @@ Known TLS fingerprints for -utls are:
 	}
 	if clientMTUFlag > 0 {
 		log.Printf("Using client max query QNAME length %d bytes (-mtu)", clientMTUFlag)
+	}
+
+	// Drop UDP resolvers that never succeeded a server (response) MTU probe — they
+	// cannot carry tunneled answers. DoH/DoT skip discoverMTU (probeConn nil); keep those.
+	{
+		var kept []*poolEndpoint
+		for _, ep := range endpoints {
+			if ep.probeConn == nil {
+				kept = append(kept, ep)
+				continue
+			}
+			maxResp, _ := ep.getMaxSizes()
+			if maxResp > 0 {
+				kept = append(kept, ep)
+				continue
+			}
+			log.Printf("MTU: dropping %s (no response-size probe success; unusable for tunnel)", ep.name)
+			ep.conn.Close()
+			if ep.probeConn != nil {
+				ep.probeConn.Close()
+			}
+		}
+		if dropped := len(endpoints) - len(kept); dropped > 0 {
+			log.Printf("MTU: removed %d/%d resolver(s) with max response wire 0", dropped, len(endpoints))
+		}
+		endpoints = kept
+		if len(endpoints) == 0 {
+			fmt.Fprintf(os.Stderr, "no resolvers left after MTU discovery (every UDP resolver failed response-size probes)\n")
+			os.Exit(1)
+		}
 	}
 
 	// Build the transport pconn.

@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	healthCheckInterval = 30 * time.Second
+	healthCheckInterval = 60 * time.Second
 	healthCheckTimeout  = 7 * time.Second
 	// After this many consecutive probe failures, mark endpoint unhealthy.
 	healthCheckFailThreshold = 2

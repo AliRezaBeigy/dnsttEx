@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -38,9 +39,9 @@ const (
 	numPadding        = 0
 	numPaddingForPoll = 8
 
-	initPollDelay    = 2 * time.Second
-	maxPollDelay     = 2 * time.Second
-	initSendCoalesce = 2 * time.Second
+	initPollDelay    = 1 * time.Second
+	maxPollDelay     = 1 * time.Second
+	initSendCoalesce = 0 * time.Second
 
 	pollDelayMultiplier = 2.0
 	pollLimit           = 16
@@ -469,19 +470,48 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 		}
 
 		payload := dnsResponsePayload(&resp, c.domain)
+		if dnsttLogRxData() {
+			if len(payload) == 0 {
+				log.Printf("DNSTT_RX_POLL_EMPTY from %s: no downstream payload (server has nothing to send yet)", addr)
+			}
+		}
+		if len(payload) == 0 {
+			continue
+		}
+		// Health PONG / scan — not tunneled data.
+		if bytes.Equal(payload, ProbeResponsePONG) {
+			continue
+		}
 
-		// Pull out the packets contained in the payload.
+		// Pull out the packets contained in the payload (length-prefixed tunnel stream).
 		r := bytes.NewReader(payload)
 		any := false
 		var recvBytes uint64
+		nPackets := 0
 		for {
 			p, err := nextPacket(r)
 			if err != nil {
 				break
 			}
 			any = true
+			nPackets++
 			recvBytes += uint64(len(p))
 			c.QueuePacketConn.QueueIncoming(p, addr)
+		}
+		if dnsttLogRxData() && !any {
+			log.Printf("DNSTT_RX_POLL_EMPTY from %s: %d B payload but no length-prefixed tunnel packets (not tunneled data)", addr, len(payload))
+		}
+		if any && dnsttLogRxData() {
+			maxHex := 512
+			show := payload
+			if len(show) > maxHex {
+				show = show[:maxHex]
+			}
+			log.Printf("DNSTT_RX_DATA from %s: tunnel payload %d B, %d packet(s), hex: %s",
+				addr, len(payload), nPackets, hex.EncodeToString(show))
+			if len(payload) > maxHex {
+				log.Printf("DNSTT_RX_DATA … truncated (%d more bytes)", len(payload)-maxHex)
+			}
 		}
 		if any {
 			c.statsResponsesRecv.Add(1)

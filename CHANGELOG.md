@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Client MTU is QNAME length, not UDP payload** — `-mtu` and per-resolver client MTU discovery now limit the **question name wire size** (RFC 1035 QNAME, max 255 octets), matching common DPI behavior. Payload sizing, probes, and sends cap by QNAME; full DNS message size may still be larger (header, OPT, etc.). Discovery log reports `max query QNAME N bytes`. **Breaking:** manual `-mtu` values tied to old full-wire sizes (e.g. 280) must be replaced with a QNAME limit (≤ 255).
+
+### Added
+
+- **SERVFAIL-aware resolver pool** — On **SERVFAIL** (rcode 2) for tunnel traffic, the client no longer burns NXDOMAIN retries on the same resolver; it notifies the pool (`ReportServfail`), triggers a poll, and lets KCP retransmit. Successful tunnel responses call `ConfirmDataPath`. Endpoints with repeated SERVFAIL are treated as **cold** for selection (similar to stale data-path), so traffic shifts toward resolvers that actually forward authoritative answers.
+
+### Fixed
+
+- **MTU discovery drops useless resolvers** — UDP endpoints that finish MTU discovery with **max response wire 0** (no successful server-size probe) are closed and removed from the pool so they are not selected; they cannot deliver tunneled DNS answers.
+
+- **In-flight cap vs non-NOERROR responses** — The client decrements the data-query in-flight counter on **every** DNS response (including SERVFAIL, truncation, etc.), so `sendLoop` no longer stalls at the cap when the resolver answers with rcode ≠ 0.
+
 ## [1.3.2] - 2026-03-10
 
 ### Added
