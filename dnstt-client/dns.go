@@ -749,18 +749,12 @@ func (c *DNSPacketConn) send(transport net.PacketConn, packets [][]byte, addr ne
 			if dnsttDebug() && len(packets) > 0 {
 				log.Printf("DNSTT_DEBUG: send: QNAME %d bytes, query wire %d (max QNAME %d)", qnl, len(buf), maxReq)
 			}
-			if dnsttLogRxData() {
+			if dnsttLogRxData() && len(packets) > 0 {
 				maxHex := 512
-				if len(packets) > 0 {
-					log.Printf("DNSTT_TX_DATA → to %s | %d tunnel segment(s) in this query | upstream %d B | QNAME %d | hex: %s",
-						addr, len(packets), len(decoded), qnl, hex.EncodeToString(truncHex(decoded, maxHex)))
-					if len(decoded) > maxHex {
-						log.Printf("DNSTT_TX_DATA → … truncated (%d more B upstream)", len(decoded)-maxHex)
-					}
-				} else {
-					// Idle poll / hint-poll — no KCP segments; still distinct from TX_DATA.
-					log.Printf("DNSTT_TX_POLL → to %s | idle poll only | upstream %d B | QNAME %d | hex: %s",
-						addr, len(decoded), qnl, hex.EncodeToString(truncHex(decoded, maxHex)))
+				log.Printf("DNSTT_TX_DATA → to %s | %d tunnel segment(s) in this query | upstream %d B | QNAME %d | hex: %s",
+					addr, len(packets), len(decoded), qnl, hex.EncodeToString(truncHex(decoded, maxHex)))
+				if len(decoded) > maxHex {
+					log.Printf("DNSTT_TX_DATA → … truncated (%d more B upstream)", len(decoded)-maxHex)
 				}
 			}
 			if len(buf) >= 2 {

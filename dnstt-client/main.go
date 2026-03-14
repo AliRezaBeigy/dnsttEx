@@ -91,8 +91,8 @@ const (
 // dnsttDebug returns true when DNSTT_DEBUG is set (for verbose PING/PONG and MTU discovery logs).
 func dnsttDebug() bool { return os.Getenv("DNSTT_DEBUG") != "" }
 
-// dnsttLogRxData enables DNS payload tracing: RX (answers) and TX (upstream sends).
-// Set DNSTT_LOG_RX_DATA=1. Lines: DNSTT_TX_DATA → (client→server), DNSTT_RX_DATA from / DNSTT_RX_POLL_EMPTY (server→client).
+// dnsttLogRxData enables DNS payload tracing: RX (answers) and TX (data sends only; idle polls not logged).
+// Set DNSTT_LOG_RX_DATA=1. Lines: DNSTT_TX_DATA → (tunnel upstream), DNSTT_RX_* ← (downstream).
 func dnsttLogRxData() bool { return os.Getenv("DNSTT_LOG_RX_DATA") != "" }
 
 // dnsttTrace returns true when DNSTT_TRACE is set (for full path tracing to diagnose failures).
