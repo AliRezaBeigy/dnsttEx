@@ -21,6 +21,28 @@ import (
 	"dnsttEx/noise"
 )
 
+// integrationDNSQuestionQNameWireLen is the length in octets of the first question QNAME on the wire.
+func integrationDNSQuestionQNameWireLen(msg []byte) (int, bool) {
+	if len(msg) < 13 {
+		return 0, false
+	}
+	i := 12
+	for i < len(msg) {
+		l := int(msg[i])
+		if l == 0 {
+			return i - 12 + 1, true
+		}
+		if l&0xC0 == 0xC0 || l > 63 {
+			return 0, false
+		}
+		i += 1 + l
+		if i > len(msg) {
+			return 0, false
+		}
+	}
+	return 0, false
+}
+
 var (
 	globalServerBin string
 	globalClientBin string
@@ -901,16 +923,16 @@ func (r *countingUDPRelay) loop() {
 	}
 }
 
-// truncatingUDPRelay is a UDP relay that limits server→client response size to
-// maxResponseSize (e.g. 512 to simulate 512-byte-only resolvers). Used for MTU discovery tests.
-// If maxRequestSize > 0, client→server packets larger than that are dropped so discovery finds that client MTU.
+// truncatingUDPRelay limits server→client DNS response wire to maxResponseSize bytes
+// (UDP payload = DNS message). If maxRequestSize > 0, drops client→server datagrams
+// whose question QNAME wire length exceeds it (DPI-style), not full UDP payload size.
 type truncatingUDPRelay struct {
 	ln              *net.UDPConn
 	serverConn      *net.UDPConn
 	serverAddr      *net.UDPAddr
 	advertiseAddr   string
-	maxResponseSize int
-	maxRequestSize  int // 0 = no limit
+	maxResponseSize int // max DNS response wire bytes (UDP payload)
+	maxRequestSize  int // max question QNAME wire octets; 0 = no limit
 	sent            atomic.Int64
 	received        atomic.Int64
 	mu              sync.Mutex
@@ -923,9 +945,9 @@ func newTruncatingUDPRelay(t testing.TB, serverAddrStr string, maxResponseSize i
 	return newTruncatingUDPRelayWithRequestLimit(t, serverAddrStr, maxResponseSize, 0)
 }
 
-// newTruncatingUDPRelayWithRequestLimit creates a relay that truncates responses to maxResponseSize
-// and drops client→server packets larger than maxRequestSize (so MTU discovery finds client MTU = maxRequestSize).
-// Pass maxRequestSize 0 for no request limit.
+// newTruncatingUDPRelayWithRequestLimit creates a relay that truncates DNS response wire
+// to maxResponseSize and drops queries whose QNAME length > maxRequestSize.
+// Pass maxRequestSize 0 for no query-name limit.
 func newTruncatingUDPRelayWithRequestLimit(t testing.TB, serverAddrStr string, maxResponseSize, maxRequestSize int) *truncatingUDPRelay {
 	t.Helper()
 	serverAddr, err := net.ResolveUDPAddr("udp", serverAddrStr)
@@ -981,9 +1003,11 @@ func newTruncatingUDPRelayWithRequestLimit(t testing.TB, serverAddrStr string, m
 			r.mu.Lock()
 			r.clientAddr = addr
 			r.mu.Unlock()
-			if r.maxRequestSize > 0 && n > r.maxRequestSize {
-				// Drop oversized request so client MTU discovery finds maxRequestSize.
-				continue
+			if r.maxRequestSize > 0 {
+				qnl, ok := integrationDNSQuestionQNameWireLen(buf[:n])
+				if !ok || qnl > r.maxRequestSize {
+					continue
+				}
 			}
 			r.sent.Add(int64(n))
 			r.serverConn.WriteToUDP(buf[:n], r.serverAddr)
@@ -1004,7 +1028,7 @@ func (r *truncatingUDPRelay) Close() {
 	r.serverConn.Close()
 }
 
-// slowLossyTruncatingUDPRelay is like truncatingUDPRelayWithRequestLimit but also
+// slowLossyTruncatingUDPRelay is like truncatingUDPRelay (response truncate + query wire drop) but also
 // adds one-way server→client delay (realistic slow internet) and drops every
 // dropClientEvery-th client→server packet (queries that never reach the server).
 // Used for integrity tests over a constrained, slow, and lossy path.
@@ -1013,8 +1037,8 @@ type slowLossyTruncatingUDPRelay struct {
 	serverConn      *net.UDPConn
 	serverAddr      *net.UDPAddr
 	advertiseAddr   string
-	maxResponseSize int
-	maxRequestSize  int
+	maxResponseSize int // DNS response wire (UDP payload)
+	maxRequestSize  int // max question QNAME wire octets; 0 = no limit
 	serverDelay     time.Duration
 	dropClientEvery int
 
@@ -1026,6 +1050,7 @@ type slowLossyTruncatingUDPRelay struct {
 	clientPackets atomic.Int64
 }
 
+// newSlowLossyTruncatingUDPRelay maxRequestSize = max QNAME wire octets (DPI-style).
 func newSlowLossyTruncatingUDPRelay(t testing.TB, serverAddrStr string, maxResponseSize, maxRequestSize int, serverDelay time.Duration, dropClientEvery int) *slowLossyTruncatingUDPRelay {
 	t.Helper()
 	serverAddr, err := net.ResolveUDPAddr("udp", serverAddrStr)
@@ -1102,16 +1127,23 @@ func (r *slowLossyTruncatingUDPRelay) clientToServerLoop() {
 		r.mu.Lock()
 		r.clientAddr = clientAddr
 		r.mu.Unlock()
-		if r.maxRequestSize > 0 && n > r.maxRequestSize {
-			continue
+		if r.maxRequestSize > 0 {
+			qnl, ok := integrationDNSQuestionQNameWireLen(buf[:n])
+			if !ok || qnl > r.maxRequestSize {
+				continue
+			}
 		}
 		seq := int(r.clientPackets.Add(1))
-		if r.dropClientEvery > 0 && seq%r.dropClientEvery == 0 {
+		if seq > r.dropClientEvery*2 && r.dropClientEvery > 0 && seq%r.dropClientEvery == 0 {
 			continue
 		}
 		r.sent.Add(int64(n))
 		r.serverConn.WriteToUDP(buf[:n], r.serverAddr)
 	}
+}
+
+func newTruncatingUDPRelayWithClientQueryWireLimit(t testing.TB, serverAddrStr string, maxDNSResponseWire, maxClientQueryWire int) *truncatingUDPRelay {
+	return newTruncatingUDPRelayWithRequestLimit(t, serverAddrStr, maxDNSResponseWire, maxClientQueryWire)
 }
 
 func (r *slowLossyTruncatingUDPRelay) Addr() string {

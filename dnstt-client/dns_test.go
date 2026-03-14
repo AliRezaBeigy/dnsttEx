@@ -156,8 +156,8 @@ func TestPollPayloadNoise(t *testing.T) {
 	}
 }
 
-// TestEffectiveSendCapacityRespectsMTU verifies that when maxRequestSize is set,
-// effectiveSendCapacity caps payload so the resulting query wire size does not exceed it.
+// TestEffectiveSendCapacityRespectsMTU verifies that when maxRequestSize is set (QNAME limit),
+// effectiveSendCapacity caps payload so the question QNAME does not exceed it.
 func TestEffectiveSendCapacityRespectsMTU(t *testing.T) {
 	pconn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -168,24 +168,26 @@ func TestEffectiveSendCapacityRespectsMTU(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseName: %v", err)
 	}
-	// Use a small max request size (wire MTU). Capacity should be capped so built query fits.
-	maxRequestSize := 120
-	conn := NewDNSPacketConn(pconn, pconn.LocalAddr(), domain, 4096, maxRequestSize)
+	maxQName := 120
+	conn := NewDNSPacketConn(pconn, pconn.LocalAddr(), domain, 4096, maxQName)
 	defer conn.Close()
 
 	capacity := conn.effectiveSendCapacity()
 	if capacity <= 0 {
 		t.Fatalf("effectiveSendCapacity() = %d, want > 0", capacity)
 	}
-	// Build a payload of exactly that capacity (poll-style: clientID + 0 + padding to fill).
 	decoded := make([]byte, capacity)
-	decoded[0] = 0 // mode poll; rest can be zero for size measurement
+	decoded[0] = 0
 	wire, err := conn.buildQueryWire(decoded, 0)
 	if err != nil {
 		t.Fatalf("buildQueryWire: %v", err)
 	}
-	if len(wire) > maxRequestSize {
-		t.Errorf("query wire size %d exceeds maxRequestSize %d (capacity used %d)", len(wire), maxRequestSize, capacity)
+	qnl, ok := dnsQuestionQNameWireLen(wire)
+	if !ok {
+		t.Fatal("no QNAME in wire")
+	}
+	if qnl > maxQName {
+		t.Errorf("QNAME length %d exceeds maxQName %d (capacity used %d)", qnl, maxQName, capacity)
 	}
 }
 
@@ -238,19 +240,25 @@ func TestBuildProbeMessageWithRequestSizeMinPadding(t *testing.T) {
 	for i := range clientID {
 		clientID[i] = byte(i)
 	}
-	for _, minRequestSize := range []int{128, 192, 256} {
-		wire, err := BuildProbeMessageWithRequestSize(domain, clientID, minRequestSize)
+	for _, minQName := range []int{64, 128, 192} {
+		wire, err := BuildProbeMessageWithRequestSize(domain, clientID, minQName)
 		if err != nil {
-			t.Fatalf("BuildProbeMessageWithRequestSize(_, _, %d): %v", minRequestSize, err)
+			t.Fatalf("BuildProbeMessageWithRequestSize(_, _, %d): %v", minQName, err)
 		}
-		if len(wire) < minRequestSize {
-			t.Errorf("minRequestSize %d: wire size %d < minRequestSize", minRequestSize, len(wire))
+		msg, err := dns.MessageFromWireFormat(wire)
+		if err != nil || len(msg.Question) != 1 {
+			t.Fatalf("parse probe: %v", err)
 		}
-		// We should not overshoot by a large margin (old code added 48 bytes at a time).
-		// Base36 expansion is ~8/5, so a few raw bytes can add ~10–20 wire bytes; allow some slack.
-		maxReasonable := minRequestSize + 80
-		if len(wire) > maxReasonable {
-			t.Errorf("minRequestSize %d: wire size %d >> %d (overshoot; expected minimal padding)", minRequestSize, len(wire), maxReasonable)
+		qnl := 0
+		for _, lab := range msg.Question[0].Name {
+			qnl += 1 + len(lab)
+		}
+		qnl++ // root
+		if qnl < minQName {
+			t.Errorf("minQName %d: QNAME length %d < minQName", minQName, qnl)
+		}
+		if qnl > minQName+20 {
+			t.Errorf("minQName %d: QNAME length %d (expected minimal padding)", minQName, qnl)
 		}
 	}
 }

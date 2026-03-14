@@ -11,8 +11,8 @@ import (
 	"time"
 )
 
-// mtuDiscoveryLogPattern matches "MTU discovery: 127.0.0.1:12345 → max response 4096 bytes, max request 512 bytes".
-var mtuDiscoveryLogPattern = regexp.MustCompile(`MTU discovery: .* → max response (\d+) bytes, max request (\d+) bytes`)
+// mtuDiscoveryLogPattern matches MTU discovery log from client stderr.
+var mtuDiscoveryLogPattern = regexp.MustCompile(`MTU discovery: .* → max response wire (\d+) bytes, max query QNAME (\d+) bytes`)
 
 // parseMTUDiscoveryFromStderr reads stderrBuf and returns (serverMTU, clientMTU, true) if a line matches.
 // Returns (0, 0, false) if not found.
@@ -41,9 +41,7 @@ func waitForMTUDiscovery(t testing.TB, stderrBuf *bytes.Buffer, timeout time.Dur
 }
 
 // TestMTUDiscoveryFullPath verifies that with a transparent relay the client runs
-// MTU discovery and reports a large downstream MTU and the expected request-side
-// ceiling. DNS query names cap request wire size to roughly 280 bytes, so the
-// client-side request MTU cannot grow to match the downstream response MTU.
+// MTU discovery and reports a large downstream MTU and max question QNAME length 255 (RFC max).
 func TestMTUDiscoveryFullPath(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping MTU discovery test in short mode")
@@ -57,8 +55,8 @@ func TestMTUDiscoveryFullPath(t *testing.T) {
 	if serverMTU < 512 {
 		t.Errorf("server MTU %d < 512 (expected at least 512 with transparent path)", serverMTU)
 	}
-	if clientMTU != 280 {
-		t.Errorf("client MTU %d != 280 (DNS query wire size is expected to top out around 280 bytes on a transparent path)", clientMTU)
+	if clientMTU != 255 {
+		t.Errorf("client MTU %d != 255 (max question QNAME wire length)", clientMTU)
 	}
 	t.Logf("MTU discovery: server=%d client=%d", serverMTU, clientMTU)
 
@@ -95,8 +93,8 @@ func TestMTUDiscoveryTruncated512(t *testing.T) {
 	if serverMTU != 512 {
 		t.Errorf("with 512-byte truncating relay: server MTU = %d, want 512", serverMTU)
 	}
-	if clientMTU != 280 {
-		t.Errorf("client MTU = %d, want 280 (response truncation should not reduce request-path MTU)", clientMTU)
+	if clientMTU != 255 {
+		t.Errorf("client MTU = %d, want 255 (response truncation should not reduce QNAME MTU)", clientMTU)
 	}
 	t.Logf("MTU discovery (512 relay): server=%d client=%d", serverMTU, clientMTU)
 
@@ -122,29 +120,21 @@ func TestMTUDiscoveryTruncated512(t *testing.T) {
 	t.Logf("%d-byte echo OK over 512-byte path", smallPayload)
 }
 
-// TestLowMTUCommunication verifies that client (128-byte request MTU) and server
-// (512-byte response MTU) can communicate with data integrity over a constrained path.
-// The relay limits responses to 512 bytes and drops requests larger than maxRequestSize,
-// so MTU discovery finds server MTU 512 and client MTU = maxRequestSize.
-// We use client MTU 128 for discovery assertion; the echo test uses 256 so it completes
-// in reasonable time (with 128 the server send channel fills and responses are dropped).
+// TestLowMTUCommunication verifies 128-tier client QNAME MTU and 512-byte server path.
+// Relay drops queries whose QNAME length > 128 (so 160+ probes fail).
 func TestLowMTUCommunication(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping low MTU test in short mode")
 	}
-	// Short MTU probe timeout so dropped probes (relay drops 160 and 280) don't block 8s each.
 	clientEnv := map[string]string{"DNSTT_MTU_PROBE_TIMEOUT": "2s"}
 
-	const maxResponseSize = 512 // server MTU: path truncates responses to this
-	const maxRequestSize = 128  // client MTU: relay drops requests larger than this
-	// Relay drops requests above this. Use 129 so 128-byte probe gets through (wire can be 128–129).
-	// Then assert clientMTU == 128. For the echo we need the tunnel to make progress: use a second
-	// harness with 256 so echo completes (or we'd need a much larger server channel and timeout).
-	const relayDropRequestAboveFor128 = 129
+	const maxResponseSize = 512
+	const wantClientMTUProbeTier = 128
+	const maxClientQNameFor128Tier = 129 // allow 128-tier probe (QNAME may be 128–129 octets)
 	var stderrBuf bytes.Buffer
 	h := newTunnelHarnessWithRelayAndStderr(t, globalServerBin, globalClientBin,
 		func(addr string) udpRelay {
-			return newTruncatingUDPRelayWithRequestLimit(t, addr, maxResponseSize, relayDropRequestAboveFor128)
+			return newTruncatingUDPRelayWithClientQueryWireLimit(t, addr, maxResponseSize, maxClientQNameFor128Tier)
 		},
 		&stderrBuf, clientEnv)
 
@@ -152,8 +142,8 @@ func TestLowMTUCommunication(t *testing.T) {
 	if serverMTU != maxResponseSize {
 		t.Errorf("server MTU = %d, want %d (path limits responses to %d)", serverMTU, maxResponseSize, maxResponseSize)
 	}
-	if clientMTU != maxRequestSize {
-		t.Errorf("client MTU = %d, want %d (relay drops requests > %d)", clientMTU, maxRequestSize, relayDropRequestAboveFor128)
+	if clientMTU != wantClientMTUProbeTier {
+		t.Errorf("client MTU = %d, want %d (relay drops QNAME > %d)", clientMTU, wantClientMTUProbeTier, maxClientQNameFor128Tier)
 	}
 	t.Logf("MTU discovery: server=%d client=%d", serverMTU, clientMTU)
 	// The first harness is only needed to observe the constrained discovery result.
@@ -165,7 +155,7 @@ func TestLowMTUCommunication(t *testing.T) {
 	var stderrBuf2 bytes.Buffer
 	h2 := newTunnelHarnessWithRelayAndStderr(t, globalServerBin, globalClientBin,
 		func(addr string) udpRelay {
-			return newTruncatingUDPRelayWithRequestLimit(t, addr, maxResponseSize, 257) // 256 ok, 280 dropped
+			return newTruncatingUDPRelayWithClientQueryWireLimit(t, addr, maxResponseSize, 255) // allow full QNAME
 		},
 		&stderrBuf2, clientEnv)
 	_, _ = waitForMTUDiscovery(t, &stderrBuf2, 15*time.Second)
@@ -200,7 +190,7 @@ func TestLowMTUCommunication(t *testing.T) {
 const maxClientPacketsForLowMTUTest = 4000000
 
 // TestLowMTULargeTransferIntegrity verifies end-to-end integrity for a large
-// payload while the client request path is truly constrained to 128 bytes.
+// payload while the client request path is truly constrained (64-byte probe tier here).
 // Unlike TestLowMTUCommunication, this test does not switch to a looser relay.
 // It also fails early if the client sends more than maxClientPacketsForLowMTUTest
 // client→server packets (runaway send with no backpressure).
@@ -208,21 +198,21 @@ func TestLowMTULargeTransferIntegrity(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping low MTU large transfer test in short mode")
 	}
-	// Give the server more room to queue downstream records while the 128-byte
-	// request path drains slowly, otherwise the test can fail due to artificial
+	// Give the server more room to queue downstream records while the small
+	// query-wire path drains slowly, otherwise the test can fail due to artificial
 	// queue pressure instead of transport corruption.
 	t.Setenv("DNSTT_SEND_CHANNEL_SIZE", "1310720")
 
 	clientEnv := map[string]string{"DNSTT_MTU_PROBE_TIMEOUT": "2s"}
 	const maxResponseSize = 512
-	const maxRequestSize = 128
-	const relayDropRequestAboveFor128 = 129
+	const wantClientMTUProbeTier = 64
+	const maxClientQNameFor64Tier = 65
 
 	var stderrBuf bytes.Buffer
 	var relay *truncatingUDPRelay
 	h := newTunnelHarnessWithRelayAndStderr(t, globalServerBin, globalClientBin,
 		func(addr string) udpRelay {
-			relay = newTruncatingUDPRelayWithRequestLimit(t, addr, maxResponseSize, relayDropRequestAboveFor128)
+			relay = newTruncatingUDPRelayWithClientQueryWireLimit(t, addr, maxResponseSize, maxClientQNameFor64Tier)
 			return relay
 		},
 		&stderrBuf, clientEnv)
@@ -230,15 +220,16 @@ func TestLowMTULargeTransferIntegrity(t *testing.T) {
 	var serverMTU, clientMTU int
 	if integrationExternalMode() {
 		// In external mode we don't capture client stderr, so we can't parse MTU discovery.
-		serverMTU, clientMTU = maxResponseSize, maxRequestSize
+		serverMTU, clientMTU = maxResponseSize, wantClientMTUProbeTier
 		t.Logf("MTU discovery: server=%d client=%d (external mode, not verified from stderr)", serverMTU, clientMTU)
+		waitTCP(t, "127.0.0.1:1082", 20*time.Second)
 	} else {
 		serverMTU, clientMTU = waitForMTUDiscovery(t, &stderrBuf, 15*time.Second)
 		if serverMTU != maxResponseSize {
 			t.Errorf("server MTU = %d, want %d (path limits responses to %d)", serverMTU, maxResponseSize, maxResponseSize)
 		}
-		if clientMTU != maxRequestSize {
-			t.Fatalf("client MTU = %d, want %d (relay drops requests > %d)", clientMTU, maxRequestSize, relayDropRequestAboveFor128)
+		if clientMTU != wantClientMTUProbeTier {
+			t.Fatalf("client MTU = %d, want %d (relay drops QNAME > %d)", clientMTU, wantClientMTUProbeTier, maxClientQNameFor64Tier)
 		}
 		t.Logf("MTU discovery: server=%d client=%d", serverMTU, clientMTU)
 	}
@@ -300,19 +291,19 @@ func TestLowMTULargeTransferIntegrity(t *testing.T) {
 			t.Fatalf("client runaway send: %d client→server packets (cap %d); client is sending without backpressure on low MTU path", count, maxClientPacketsForLowMTUTest)
 		case writeErr = <-writeDone:
 			if writeErr != nil {
-				t.Fatalf("write large payload over 128-byte request path: %v", writeErr)
+				t.Fatalf("write large payload over low query-wire path: %v", writeErr)
 			}
 			doneCount++
 		case readErr = <-readDone:
 			if readErr != nil {
-				t.Fatalf("read large payload over 128-byte request path: %v", readErr)
+				t.Fatalf("read large payload over low query-wire path: %v", readErr)
 			}
 			doneCount++
 		}
 	}
 
 	if !bytes.Equal(payload, recv) {
-		t.Fatal("large-transfer echo mismatch on 128-byte client MTU path")
+		t.Fatal("large-transfer echo mismatch on low client query-wire path")
 	}
 	t.Logf("large low-MTU transfer OK: %d bytes echoed intact with server=%d client=%d (client→server packets: %d)", payloadSize, serverMTU, clientMTU, relay.sent.Load())
 }
@@ -335,8 +326,8 @@ func TestSlowLossyLowMTULargeTransferIntegrity(t *testing.T) {
 
 	clientEnv := map[string]string{"DNSTT_MTU_PROBE_TIMEOUT": "2s"}
 	const maxResponseSize = 512
-	const maxRequestSize = 128
-	const relayDropRequestAboveFor128 = 129
+	const wantClientMTUProbeTier = 128
+	const maxClientQNameFor128TierSlow = 129
 	// Realistic slow link: ~80ms one-way delay (~160ms RTT).
 	const serverDelay = 80 * time.Millisecond
 	// Drop every 15th client→server packet (~6.7% of queries never reach server).
@@ -346,7 +337,7 @@ func TestSlowLossyLowMTULargeTransferIntegrity(t *testing.T) {
 	var relay *slowLossyTruncatingUDPRelay
 	h := newTunnelHarnessWithRelayAndStderr(t, globalServerBin, globalClientBin,
 		func(addr string) udpRelay {
-			relay = newSlowLossyTruncatingUDPRelay(t, addr, maxResponseSize, relayDropRequestAboveFor128, serverDelay, dropClientEvery)
+			relay = newSlowLossyTruncatingUDPRelay(t, addr, maxResponseSize, maxClientQNameFor128TierSlow, serverDelay, dropClientEvery)
 			return relay
 		},
 		&stderrBuf, clientEnv)
@@ -355,8 +346,8 @@ func TestSlowLossyLowMTULargeTransferIntegrity(t *testing.T) {
 	if serverMTU != maxResponseSize {
 		t.Errorf("server MTU = %d, want %d (path limits responses to %d)", serverMTU, maxResponseSize, maxResponseSize)
 	}
-	if clientMTU != maxRequestSize {
-		t.Fatalf("client MTU = %d, want %d (relay drops requests > %d)", clientMTU, maxRequestSize, relayDropRequestAboveFor128)
+	if clientMTU != wantClientMTUProbeTier {
+		t.Fatalf("client MTU = %d, want %d (relay drops QNAME > %d)", clientMTU, wantClientMTUProbeTier, maxClientQNameFor128TierSlow)
 	}
 	t.Logf("MTU discovery: server=%d client=%d (delay=%v, drop client every %d)", serverMTU, clientMTU, serverDelay, dropClientEvery)
 
@@ -433,19 +424,17 @@ func TestSlowLossyLowMTULargeTransferIntegrity(t *testing.T) {
 		payloadSize, serverMTU, clientMTU, serverDelay, dropClientEvery, relay.sent.Load())
 }
 
-// sendMaxRequestPattern matches "send: query wire 123 bytes (max request 256)" in DNSTT_DEBUG output.
-var sendMaxRequestPattern = regexp.MustCompile(`send: query wire \d+ bytes \(max request (\d+)\)`)
+// sendMaxRequestPattern matches DNSTT_DEBUG send line (max QNAME cap).
+var sendMaxRequestPattern = regexp.MustCompile(`send: QNAME \d+ bytes, query wire \d+ \(max QNAME (\d+)\)`)
 
-// TestTunnelUsesDiscoveredRequestMTU verifies that after MTU discovery, the tunnel send path uses
-// the discovered max request size (not a smaller default). So when the path allows 256-byte
-// queries, we should see "max request 256" in send debug lines, not 128 or 0.
+// TestTunnelUsesDiscoveredRequestMTU verifies send path uses discovered QNAME MTU in debug logs.
 func TestTunnelUsesDiscoveredRequestMTU(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping MTU test in short mode")
 	}
 	const maxResponseSize = 512
-	const maxRequestSize = 256
-	// Relay allows requests up to 257 bytes so 256-byte probe succeeds.
+	const wantDiscoveredQNAME = 160
+	// Relay allows QNAME <= 160; 192-tier probes dropped.
 	clientEnv := map[string]string{
 		"DNSTT_MTU_PROBE_TIMEOUT": "2s",
 		"DNSTT_DEBUG":             "1",
@@ -453,13 +442,13 @@ func TestTunnelUsesDiscoveredRequestMTU(t *testing.T) {
 	var stderrBuf bytes.Buffer
 	h := newTunnelHarnessWithRelayAndStderr(t, globalServerBin, globalClientBin,
 		func(addr string) udpRelay {
-			return newTruncatingUDPRelayWithRequestLimit(t, addr, maxResponseSize, 257)
+			return newTruncatingUDPRelayWithClientQueryWireLimit(t, addr, maxResponseSize, wantDiscoveredQNAME)
 		},
 		&stderrBuf, clientEnv)
 
 	serverMTU, clientMTU := waitForMTUDiscovery(t, &stderrBuf, 15*time.Second)
-	if clientMTU != maxRequestSize {
-		t.Fatalf("MTU discovery: client MTU = %d, want %d", clientMTU, maxRequestSize)
+	if clientMTU != wantDiscoveredQNAME {
+		t.Fatalf("MTU discovery: client MTU = %d, want %d", clientMTU, wantDiscoveredQNAME)
 	}
 	t.Logf("MTU discovery: server=%d client=%d", serverMTU, clientMTU)
 
@@ -479,22 +468,21 @@ func TestTunnelUsesDiscoveredRequestMTU(t *testing.T) {
 		t.Fatal("echo mismatch")
 	}
 
-	// Ensure the send path used the discovered max request size (256), not a smaller value.
 	stderr := stderrBuf.Bytes()
 	matches := sendMaxRequestPattern.FindAllSubmatch(stderr, -1)
 	if len(matches) == 0 {
-		t.Skip("no DNSTT_DEBUG send lines found (client may not have logged query wire size)")
+		t.Skip("no DNSTT_DEBUG send lines found")
 	}
 	for _, m := range matches {
 		if len(m) != 2 {
 			continue
 		}
 		maxReq, _ := strconv.Atoi(string(m[1]))
-		if maxReq != maxRequestSize {
-			t.Errorf("send path used max request %d; discovery found %d (tunnel must use discovered MTU)", maxReq, maxRequestSize)
+		if maxReq != wantDiscoveredQNAME {
+			t.Errorf("send path max QNAME %d; discovery %d", maxReq, wantDiscoveredQNAME)
 		}
 	}
-	t.Logf("verified %d send(s) used discovered max request %d", len(matches), maxRequestSize)
+	t.Logf("verified %d send(s) used discovered max QNAME %d", len(matches), wantDiscoveredQNAME)
 }
 
 // sendLoopPacketsPattern matches "sendLoop: sending query with N packet(s), M bytes tunnel data".
@@ -509,7 +497,7 @@ func TestTunnelBatchesPacketsWhenSending1024(t *testing.T) {
 		t.Skip("skipping MTU test in short mode")
 	}
 	const maxResponseSize = 512
-	const maxRequestSize = 256
+	const wantQNAME = 160
 	clientEnv := map[string]string{
 		"DNSTT_MTU_PROBE_TIMEOUT": "2s",
 		"DNSTT_DEBUG":             "1",
@@ -517,13 +505,13 @@ func TestTunnelBatchesPacketsWhenSending1024(t *testing.T) {
 	var stderrBuf bytes.Buffer
 	h := newTunnelHarnessWithRelayAndStderr(t, globalServerBin, globalClientBin,
 		func(addr string) udpRelay {
-			return newTruncatingUDPRelayWithRequestLimit(t, addr, maxResponseSize, 257)
+			return newTruncatingUDPRelayWithClientQueryWireLimit(t, addr, maxResponseSize, wantQNAME)
 		},
 		&stderrBuf, clientEnv)
 
 	_, clientMTU := waitForMTUDiscovery(t, &stderrBuf, 15*time.Second)
-	if clientMTU != maxRequestSize {
-		t.Fatalf("MTU discovery: client MTU = %d, want %d", clientMTU, maxRequestSize)
+	if clientMTU != wantQNAME {
+		t.Fatalf("MTU discovery: client MTU = %d, want %d", clientMTU, wantQNAME)
 	}
 
 	conn := h.dialTunnel(t)

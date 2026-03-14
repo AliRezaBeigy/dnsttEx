@@ -287,11 +287,11 @@ func TestSocks5RealCurlSlowLossy(t *testing.T) {
 	t.Logf("dnstt-server listening on UDP %s → upstream %s", dnsUDPAddr, socksLn.Addr())
 
 	const maxResponseSize = 512
-	const relayDropRequestAboveFor128 = 129
+	const maxClientQueryWireFor128Tier = 129 // max QNAME octets (DPI-style); not UDP payload
 	const serverDelay = 80 * time.Millisecond
 	const dropClientEvery = 15
 
-	relay := newSlowLossyTruncatingUDPRelay(t, dnsUDPAddr, maxResponseSize, relayDropRequestAboveFor128, serverDelay, dropClientEvery)
+	relay := newSlowLossyTruncatingUDPRelay(t, dnsUDPAddr, maxResponseSize, maxClientQueryWireFor128Tier, serverDelay, dropClientEvery)
 	defer relay.Close()
 	t.Logf("DNS relay (slow+lossy, MTU 512/128, delay=%v, drop every %d) on %s → server %s", serverDelay, dropClientEvery, relay.Addr(), dnsUDPAddr)
 

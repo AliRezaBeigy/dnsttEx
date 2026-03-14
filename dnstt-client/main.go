@@ -699,7 +699,7 @@ type mtuProbe struct {
 
 func (p *mtuProbe) done() bool { return p.succeeded || p.skipRetry }
 
-// discoverMTU finds the max response size (server MTU) and max request size (client MTU)
+// discoverMTU finds max DNS response wire (server MTU) and max question QNAME length (client MTU)
 // that work for this resolver. All probe sizes (both directions) are sent concurrently
 // in each round, with up to 2 retry rounds for probes that don't get a response.
 // If clientMTUOverride > 0, client request size is not probed and that value is used.
@@ -710,7 +710,8 @@ func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration, clien
 	probeID := turbotunnel.NewClientID()
 
 	serverSizes := []int{256, 384, 512, 1024, 1232, 1452, 2048, 4096}
-	clientSizes := []int{128, 160, 192, 256, 280}
+	// Client path: DPI-style limit on question QNAME wire length (not UDP payload).
+	clientSizes := []int{32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 255}
 	if clientMTUOverride > 0 {
 		clientSizes = nil // user set -mtu: skip client request size probes
 	}
@@ -894,17 +895,12 @@ func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration, clien
 			clientMTU = p.size
 		}
 	}
-	if serverMTU == 0 {
-		serverMTU = 512
-	}
 	if clientMTUOverride > 0 {
 		clientMTU = clientMTUOverride
-	} else if clientMTU == 0 {
-		clientMTU = 128
 	}
 
 	ep.setMaxSizes(serverMTU, clientMTU)
-	log.Printf("MTU discovery: %s → max response %d bytes, max request %d bytes", ep.name, serverMTU, clientMTU)
+	log.Printf("MTU discovery: %s → max response wire %d bytes, max query QNAME %d bytes", ep.name, serverMTU, clientMTU)
 }
 
 func main() {
@@ -1062,7 +1058,7 @@ Known TLS fingerprints for -utls are:
 	flag.IntVar(&scanChecks, "scan-checks", 1,
 		"when -scan is used, run this many PING checks per resolver; a resolver passes only if all checks succeed (default 1, use higher for stricter scan)")
 	flag.IntVar(&clientMTUFlag, "mtu", 0,
-		"client path MTU in bytes for request size (0 = discover per resolver). When set, only request size uses this value; response size is still discovered.")
+		"max question QNAME wire length in bytes (what many DPI systems limit—not full UDP size). 0 = discover per resolver. Response size is still discovered.")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.LUTC)
@@ -1204,7 +1200,7 @@ Known TLS fingerprints for -utls are:
 		wg.Wait()
 	}
 	if clientMTUFlag > 0 {
-		log.Printf("Using client MTU %d bytes for request size", clientMTUFlag)
+		log.Printf("Using client max query QNAME length %d bytes (-mtu)", clientMTUFlag)
 	}
 
 	// Build the transport pconn.

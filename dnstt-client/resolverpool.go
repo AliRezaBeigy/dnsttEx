@@ -36,6 +36,14 @@ const (
 	// Every reprobeEvery-th query, send one query to a "cold" (unresponsive)
 	// endpoint to check if it has recovered.
 	reprobeEvery = 10
+
+	// Endpoints with >= servfailColdThreshold consecutive SERVFAILs (without
+	// an intervening success) are treated as "cold" by pickEndpoint. This
+	// catches resolvers that consistently return SERVFAIL for tunnel data
+	// queries. The threshold must be high enough to tolerate intermittent
+	// SERVFAILs (e.g. 27% rate → P(5 consecutive) ≈ 0.1%) without
+	// deprioritizing a resolver that is otherwise the only one working.
+	servfailColdThreshold = 5
 )
 
 // testHookHealthCheckInterval, when non-zero, overrides healthCheckInterval in
@@ -76,7 +84,7 @@ type poolEndpoint struct {
 	// maxResponseSize is the max UDP response size that works through this resolver (server MTU).
 	// 0 means unknown; discovery will set it or use a default.
 	maxResponseSize int
-	// maxRequestSize is the max request (query) size that works to this resolver (client MTU).
+	// maxRequestSize is the max question QNAME wire length (client MTU / DPI limit).
 	// 0 means unknown.
 	maxRequestSize int
 
@@ -88,6 +96,16 @@ type poolEndpoint struct {
 	// response received from this endpoint's data socket. Updated atomically
 	// by readLoop; read by pickEndpoint for data-path filtering.
 	lastResponseTime atomic.Int64
+
+	// servfailStreak counts consecutive SERVFAIL (rcode 2) responses from
+	// this endpoint without an intervening successful response.
+	// ReportServfail increments it; ConfirmDataPath resets it to 0.
+	// pickEndpoint treats endpoints with servfailStreak >= servfailColdThreshold
+	// as "cold" even if lastResponseTime is recent.
+	servfailStreak atomic.Int32
+
+	// servfailTotal is the lifetime SERVFAIL count (for logging).
+	servfailTotal atomic.Uint64
 }
 
 func (e *poolEndpoint) setHealthy(rtt time.Duration) {
@@ -344,8 +362,15 @@ func (rp *ResolverPool) logPoolStatus() {
 	var coldNames []string
 	for _, s := range candidates {
 		last := s.ep.lastResponseTime.Load()
-		if last == 0 || time.Since(time.Unix(0, last)) >= respWindow {
-			coldNames = append(coldNames, s.ep.name)
+		sfStreak := s.ep.servfailStreak.Load()
+		isCold := (last == 0 || time.Since(time.Unix(0, last)) >= respWindow) ||
+			sfStreak >= servfailColdThreshold
+		if isCold {
+			label := s.ep.name
+			if sfStreak >= servfailColdThreshold {
+				label += fmt.Sprintf(" (SERVFAIL×%d)", sfStreak)
+			}
+			coldNames = append(coldNames, label)
 		}
 	}
 
@@ -455,11 +480,17 @@ func (rp *ResolverPool) pickEndpoint() *poolEndpoint {
 	}
 	var responsive, cold []epSnap
 	for _, s := range candidates {
+		// An endpoint is "cold" if it hasn't responded recently OR if it
+		// has a SERVFAIL streak above the threshold (passes health probes
+		// but can't forward tunnel traffic).
 		last := s.ep.lastResponseTime.Load()
-		if last > 0 && time.Since(time.Unix(0, last)) < respWindow {
-			responsive = append(responsive, s)
-		} else {
+		sfStreak := s.ep.servfailStreak.Load()
+		isCold := (last == 0 || time.Since(time.Unix(0, last)) >= respWindow) ||
+			sfStreak >= servfailColdThreshold
+		if isCold {
 			cold = append(cold, s)
+		} else {
+			responsive = append(responsive, s)
 		}
 	}
 	if len(responsive) > 0 && len(cold) > 0 {
@@ -566,9 +597,9 @@ func (rp *ResolverPool) MinMaxRequestSize(defaultReq int) int {
 	return min
 }
 
-// NextSendMTU returns the max response size and max request size for the endpoint
+// NextSendMTU returns the max response size and max QNAME length for the endpoint
 // that will be used for the next WriteTo. The caller must build the query with
-// those limits (OPT Class = max response, query wire size ≤ max request) and
+// those limits (OPT Class = max response, QNAME length ≤ max request) and
 // then call WriteTo; the same endpoint will be used. Used so each resolver gets
 // queries sized to its own MTU and the server gets the correct response size.
 func (rp *ResolverPool) NextSendMTU() (maxResponseSize, maxRequestSize int) {
@@ -630,6 +661,41 @@ func (rp *ResolverPool) Close() error {
 		}
 	})
 	return nil
+}
+
+// ConfirmDataPath resets the SERVFAIL streak for the endpoint matching addr,
+// confirming it can successfully forward tunnel traffic. Called by recvLoop
+// on successful (rcode=0) DNS responses.
+func (rp *ResolverPool) ConfirmDataPath(addr net.Addr) {
+	addrStr := addr.String()
+	for _, ep := range rp.endpoints {
+		if ep.addr.String() == addrStr {
+			ep.servfailStreak.Store(0)
+			return
+		}
+	}
+}
+
+// ReportServfail increments the SERVFAIL streak for the endpoint matching addr.
+// When the streak reaches servfailColdThreshold, pickEndpoint treats the
+// endpoint as "cold" and deprioritizes it. The resolver passes health probes
+// but cannot forward tunnel traffic to the authoritative server.
+func (rp *ResolverPool) ReportServfail(addr net.Addr) {
+	addrStr := addr.String()
+	for _, ep := range rp.endpoints {
+		if ep.addr.String() == addrStr {
+			streak := ep.servfailStreak.Add(1)
+			total := ep.servfailTotal.Add(1)
+			if streak == servfailColdThreshold {
+				log.Printf("resolverpool: endpoint %s SERVFAIL streak=%d (threshold) total=%d — deprioritizing",
+					ep.name, streak, total)
+			} else if total == 1 || total%20 == 0 {
+				log.Printf("resolverpool: endpoint %s SERVFAIL streak=%d total=%d",
+					ep.name, streak, total)
+			}
+			return
+		}
+	}
 }
 
 // LocalAddr implements net.PacketConn.

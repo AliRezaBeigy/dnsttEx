@@ -19,6 +19,15 @@ import (
 	"dnsttEx/turbotunnel"
 )
 
+// DataPathReporter is implemented by transports (e.g. ResolverPool) that track
+// per-endpoint data-path health. recvLoop calls these methods so the pool can
+// deprioritize resolvers that return SERVFAIL for tunnel queries while passing
+// health probes.
+type DataPathReporter interface {
+	ConfirmDataPath(addr net.Addr)
+	ReportServfail(addr net.Addr)
+}
+
 // EDNS option codes (used when resolver forwards them; name-based is fallback for 8.8.8.8 etc).
 const (
 	upstreamEDNSOptionCode   = 0xFF00
@@ -118,7 +127,7 @@ type DNSPacketConn struct {
 	clientID        turbotunnel.ClientID
 	domain          dns.Name
 	maxResponseSize int // max UDP response size to request (OPT Class); 0 = 4096
-	maxRequestSize  int // max request (query) wire size from MTU discovery; 0 = use nameCapacity only
+	maxRequestSize  int // max question QNAME wire length (octets); DPI-style limit, not full UDP size; 0 = nameCapacity only
 	// Sending on pollChan permits sendLoop to send an empty polling query.
 	// sendLoop also does its own polling according to a time schedule.
 	pollChan chan struct{}
@@ -170,8 +179,8 @@ func (c *DNSPacketConn) KCPMTUHint() int {
 // messages encoded by DNSPacketConn. addr is the address to be passed to
 // transport.WriteTo whenever a message needs to be sent. maxResponseSize is the
 // max response size to request from the server (OPT Class); 0 means 4096.
-// maxRequestSize is the max request (query) wire size from MTU discovery; 0
-// means use nameCapacity only (no MTU-based limit).
+// maxRequestSize is the max question QNAME wire length (octets); 0 means
+// nameCapacity only (no MTU-based limit).
 func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name, maxResponseSize, maxRequestSize int) *DNSPacketConn {
 	// Generate a new random ClientID.
 	clientID := turbotunnel.NewClientID()
@@ -344,6 +353,19 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 		}
 		c.statsResponsesRecvTotal.Add(1)
 
+		// Decrement in-flight counter on EVERY DNS response (including
+		// SERVFAIL, TC=1, etc.) so sendLoop doesn't stall at the cap
+		// waiting for responses that will never arrive as rcode=0.
+		if c.inFlightCap > 0 {
+			if cur := c.inFlightCount.Load(); cur > 0 {
+				c.inFlightCount.Add(-1)
+			}
+			select {
+			case c.inFlightSignal <- struct{}{}:
+			default:
+			}
+		}
+
 		// TC=1: the recursive resolver truncated the response because it was
 		// too large for the path. The server's downstream data in this response
 		// is lost. Trigger immediate re-polls so the server gets new queries to
@@ -382,8 +404,35 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 		}
 
 		rcode := resp.Flags & 0x000f
+
+		// SERVFAIL (rcode 2): the recursive resolver could not reach the
+		// authoritative server or it timed out. This is a resolver-level
+		// failure — the tunnel data in the query was lost, but retrying the
+		// same data to the SAME resolver won't help. Instead:
+		//  1. Tell the pool to deprioritize this resolver (mark it "cold").
+		//  2. Trigger a re-poll so the server gets a new query from a working resolver.
+		//  3. Let KCP handle retransmission of the lost segment.
+		if rcode == dns.RcodeServerFailure {
+			qName := ""
+			if len(resp.Question) >= 1 {
+				qName = resp.Question[0].Name.String()
+			}
+			if dnsttDebug() {
+				log.Printf("DNSTT_DEBUG: SERVFAIL (rcode 2) for query %s from %s", qName, addr)
+			}
+			if reporter, ok := transport.(DataPathReporter); ok {
+				reporter.ReportServfail(addr)
+			}
+			select {
+			case c.pollChan <- struct{}{}:
+			default:
+			}
+			continue
+		}
+
+		// Other non-zero rcodes (NXDOMAIN etc): re-queue last data batch
+		// and retry up to nxdomainRetryMax times.
 		if rcode != dns.RcodeNoError {
-			// Server or path returned an error (e.g. NXDOMAIN). Re-queue last data batch and retry up to nxdomainRetryMax times.
 			qName := ""
 			if len(resp.Question) >= 1 {
 				qName = resp.Question[0].Name.String()
@@ -413,6 +462,12 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 			continue
 		}
 
+		// Successful response (rcode=0). Confirm data-path health for
+		// this resolver so the pool keeps it in the "responsive" set.
+		if reporter, ok := transport.(DataPathReporter); ok {
+			reporter.ConfirmDataPath(addr)
+		}
+
 		payload := dnsResponsePayload(&resp, c.domain)
 
 		// Pull out the packets contained in the payload.
@@ -431,17 +486,6 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 		if any {
 			c.statsResponsesRecv.Add(1)
 			c.statsTunnelBytesRecv.Add(recvBytes)
-		}
-		// Decrement in-flight counter (floor 0) and wake sendLoop.
-		// Poll responses that arrive when count==0 are harmlessly ignored.
-		if c.inFlightCap > 0 {
-			if cur := c.inFlightCount.Load(); cur > 0 {
-				c.inFlightCount.Add(-1)
-			}
-			select {
-			case c.inFlightSignal <- struct{}{}:
-			default:
-			}
 		}
 		// If the payload contained one or more packets, permit sendLoop
 		// to poll immediately. ACKs on received data will effectively
@@ -512,15 +556,37 @@ func (c *DNSPacketConn) buildQueryWire(decoded []byte, optMaxResp int) ([]byte, 
 	return query.WireFormat()
 }
 
-// maxDecodedPayloadForMaxWire returns the maximum decoded payload length that
-// fits in a query whose wire size is at most maxWire. Used when maxRequestSize
-// (client MTU) is set so we don't send requests larger than the path allows.
-func (c *DNSPacketConn) maxDecodedPayloadForMaxWire(maxWire int) int {
-	if maxWire <= 0 {
+// dnsQuestionQNameWireLen returns the wire length in octets of the first
+// question's QNAME (length-prefixed labels through root). This matches what
+// many DPI systems enforce—not full UDP DNS message size.
+func dnsQuestionQNameWireLen(msg []byte) (int, bool) {
+	if len(msg) < 13 {
+		return 0, false
+	}
+	i := 12
+	for i < len(msg) {
+		l := int(msg[i])
+		if l == 0 {
+			return i - 12 + 1, true
+		}
+		if l&0xC0 == 0xC0 || l > 63 {
+			return 0, false
+		}
+		i += 1 + l
+		if i > len(msg) {
+			return 0, false
+		}
+	}
+	return 0, false
+}
+
+// maxDecodedPayloadForMaxQName returns the maximum decoded payload length that
+// fits in a query whose question QNAME wire length is at most maxQName.
+func (c *DNSPacketConn) maxDecodedPayloadForMaxQName(maxQName int) int {
+	if maxQName <= 0 {
 		return nameCapacity(c.domain)
 	}
 	capByName := nameCapacity(c.domain)
-	// Binary search for largest decoded length that fits.
 	lo, hi := 0, capByName+1
 	for lo+1 < hi {
 		mid := (lo + hi) / 2
@@ -530,7 +596,12 @@ func (c *DNSPacketConn) maxDecodedPayloadForMaxWire(maxWire int) int {
 			hi = mid
 			continue
 		}
-		if len(wire) <= maxWire {
+		qnl, ok := dnsQuestionQNameWireLen(wire)
+		if !ok {
+			hi = mid
+			continue
+		}
+		if qnl <= maxQName {
 			lo = mid
 		} else {
 			hi = mid
@@ -546,7 +617,7 @@ func (c *DNSPacketConn) effectiveSendCapacity() int {
 	if c.maxRequestSize <= 0 {
 		return capByName
 	}
-	capByMTU := c.maxDecodedPayloadForMaxWire(c.maxRequestSize)
+	capByMTU := c.maxDecodedPayloadForMaxQName(c.maxRequestSize)
 	if capByMTU < capByName {
 		return capByMTU
 	}
@@ -610,7 +681,7 @@ func (c *DNSPacketConn) send(transport net.PacketConn, packets [][]byte, addr ne
 
 	capacity := c.effectiveSendCapacity()
 	if maxReqOverride > 0 {
-		capacity = c.maxDecodedPayloadForMaxWire(maxReqOverride)
+		capacity = c.maxDecodedPayloadForMaxQName(maxReqOverride)
 	}
 	decoded := c.buildUpstreamPayload(packets, respHint)
 	for len(decoded) > capacity && len(packets) > 1 {
@@ -632,10 +703,14 @@ func (c *DNSPacketConn) send(transport net.PacketConn, packets [][]byte, addr ne
 		if err != nil {
 			return err
 		}
+		qnl, qok := dnsQuestionQNameWireLen(buf)
+		if !qok {
+			return fmt.Errorf("send: built query has no parsable QNAME")
+		}
 		sendAnyway := len(packets) == 0 && len(decoded) <= 11+probeNoiseLen // minimal poll payload (may include 2-byte hint)
-		if maxReq <= 0 || len(buf) <= maxReq || sendAnyway {
+		if maxReq <= 0 || qnl <= maxReq || sendAnyway {
 			if dnsttDebug() && len(packets) > 0 {
-				log.Printf("DNSTT_DEBUG: send: query wire %d bytes (max request %d)", len(buf), maxReq)
+				log.Printf("DNSTT_DEBUG: send: QNAME %d bytes, query wire %d (max QNAME %d)", qnl, len(buf), maxReq)
 			}
 			if len(buf) >= 2 {
 				rand.Read(buf[0:2])
@@ -643,7 +718,7 @@ func (c *DNSPacketConn) send(transport net.PacketConn, packets [][]byte, addr ne
 			_, err = transport.WriteTo(buf, addr)
 			return err
 		}
-		// Built query exceeds path MTU; reduce payload and retry.
+		// Built query QNAME exceeds path limit; reduce payload and retry.
 		if len(packets) <= 1 {
 			if len(packets) == 1 {
 				c.QueuePacketConn.Stash(packets[0], addr)
@@ -772,13 +847,12 @@ func VerifyMTUProbeResponse(buf []byte, domain dns.Name, responseSize int) bool 
 	return payload != nil
 }
 
-// maxProbeRequestWireSize is the maximum DNS query wire size we can build for client MTU probes:
-// the question name is limited to 255 octets (RFC 1035), so header(12)+name(255)+type(2)+class(2)+OPT(11) ≈ 282.
-const maxProbeRequestWireSize = 282
+// maxProbeQNameSize is the maximum QNAME wire length (RFC 1035): 255 octets.
+const maxProbeQNameSize = 255
 
-// probeRequestWireSize returns the wire size of a PING probe query with the given raw payload length.
-// Used to find the minimum padding so the probe is exactly >= minRequestSize.
-func probeRequestWireSize(domain dns.Name, rawLen int) (int, error) {
+// probeRequestQNameLen returns the question QNAME wire length for a PING probe
+// with the given raw payload length.
+func probeRequestQNameLen(domain dns.Name, rawLen int) (int, error) {
 	if rawLen <= 0 {
 		return 0, fmt.Errorf("rawLen must be positive")
 	}
@@ -791,42 +865,37 @@ func probeRequestWireSize(domain dns.Name, rawLen int) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	query := &dns.Message{
-		ID:    0,
-		Flags: 0x0100,
-		Question: []dns.Question{
-			{Name: name, Type: dns.RRTypeTXT, Class: dns.ClassIN},
-		},
-		Additional: []dns.RR{
-			{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: 0, Data: []byte{}},
-		},
+	qnl := 0
+	for _, lab := range name {
+		qnl += 1 + len(lab)
 	}
-	wire, err := query.WireFormat()
-	if err != nil {
-		return 0, err
+	qnl++ // root
+	if qnl > maxProbeQNameSize {
+		return 0, fmt.Errorf("QNAME would exceed %d octets", maxProbeQNameSize)
 	}
-	return len(wire), nil
+	return qnl, nil
 }
 
-// BuildProbeMessageWithRequestSize builds a PING probe whose wire size is at least minRequestSize
-// bytes (for client MTU discovery). The minimum padding needed is added so the query is just
-// >= minRequestSize (we don't overshoot), giving an accurate probe for that request size.
-// minRequestSize must be <= maxProbeRequestWireSize or the name would exceed 255 octets.
-func BuildProbeMessageWithRequestSize(domain dns.Name, clientID turbotunnel.ClientID, minRequestSize int) ([]byte, error) {
-	if minRequestSize > maxProbeRequestWireSize {
-		return nil, fmt.Errorf("minRequestSize %d exceeds max DNS query size %d (name limited to 255 octets)", minRequestSize, maxProbeRequestWireSize)
+// BuildProbeMessageWithRequestSize builds a PING probe whose question QNAME wire
+// length is at least minQNameSize (client MTU discovery: DPI limits name size).
+func BuildProbeMessageWithRequestSize(domain dns.Name, clientID turbotunnel.ClientID, minQNameSize int) ([]byte, error) {
+	if minQNameSize > maxProbeQNameSize {
+		return nil, fmt.Errorf("minQNameSize %d exceeds max QNAME %d", minQNameSize, maxProbeQNameSize)
+	}
+	if minQNameSize < 1 {
+		return nil, fmt.Errorf("minQNameSize must be positive")
 	}
 	baseLen := 9 + probeNoiseLen // clientID(8) + PING(1) + noise(6)
-	// Binary search for the smallest raw payload length such that wire size >= minRequestSize.
+	// Binary search for smallest raw payload such that QNAME length >= minQNameSize.
 	lo, hi := baseLen, 256
 	for lo+1 < hi {
 		mid := (lo + hi) / 2
-		wireLen, err := probeRequestWireSize(domain, mid)
+		qnl, err := probeRequestQNameLen(domain, mid)
 		if err != nil {
 			hi = mid
 			continue
 		}
-		if wireLen >= minRequestSize {
+		if qnl >= minQNameSize {
 			hi = mid
 		} else {
 			lo = mid
@@ -935,6 +1004,20 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 			sendCoalesce = time.Duration(ms) * time.Millisecond
 		}
 	}
+	// Low-MTU paths (e.g. 128-byte request limit) have tiny payloads per
+	// query; use shorter coalesce and poll timers to maintain reasonable
+	// throughput instead of the default 2s intervals.
+	if c.maxRequestSize > 0 && c.maxRequestSize <= 256 {
+		if initPoll > 1*time.Second {
+			initPoll = 1 * time.Second
+		}
+		if maxPoll > 1*time.Second {
+			maxPoll = 1 * time.Second
+		}
+		if sendCoalesce > 500*time.Millisecond {
+			sendCoalesce = 500 * time.Millisecond
+		}
+	}
 	pollDelay := initPoll
 	pollTimer := time.NewTimer(pollDelay)
 	var sendFailures int
@@ -946,7 +1029,7 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 		if pool, ok := transport.(*ResolverPool); ok {
 			maxRespOverride, maxReqOverride = pool.NextSendMTU()
 			if maxReqOverride > 0 {
-				capacity = c.maxDecodedPayloadForMaxWire(maxReqOverride)
+				capacity = c.maxDecodedPayloadForMaxQName(maxReqOverride)
 			}
 		}
 		overhead := 8 + 1 + numPadding

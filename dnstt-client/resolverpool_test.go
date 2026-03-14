@@ -5,6 +5,7 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"time"
 
 	"dnsttEx/turbotunnel"
 )
@@ -64,6 +65,12 @@ func TestResolverPoolNextSendMTUWriteToSameEndpoint(t *testing.T) {
 		probeConn: nil,
 	}
 	ep1.setMaxSizes(200, 200)
+
+	// Both endpoints must look data-path responsive; otherwise after first WriteTo only ep0
+	// has lastResponseTime set and pickEndpoint sticks to ep0.
+	now := time.Now().UnixNano()
+	ep0.lastResponseTime.Store(now)
+	ep1.lastResponseTime.Store(now)
 
 	pool := NewResolverPool(
 		[]*poolEndpoint{ep0, ep1},
