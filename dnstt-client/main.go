@@ -24,6 +24,11 @@
 //
 //	-resolvers-file /path/to/resolvers.txt
 //
+// Resolver scan (write resolvers that return PONG to a file):
+//
+//	dnstt-client scan -resolvers-file dns.txt -scan-checks 3 -scan-retry 2 t.example.com output.txt
+//	dnstt-client scan -resolvers-file dns.txt -domain t.example.com -scan-checks 3 -scan-retry 2 output.txt
+//
 // File format: one resolver per line, prefix doh:, dot:, or udp:.
 // Lines starting with # or blank lines are ignored.
 //
@@ -599,13 +604,19 @@ func parseResolversFile(path string) ([]resolverSpec, error) {
 // checks times and passes only if all checks succeed (DoH/DoT are still
 // assumed OK and pass without probing).
 //
+// retriesPerCheck: on UDP, each check round is retried up to this many extra
+// times after a failure (0 = single attempt per round).
+//
 // For UDP endpoints the dedicated probeConn is used so the scan socket is
 // never shared with the later readLoop. For DoH/DoT endpoints SetReadDeadline
 // is a no-op on the underlying QueuePacketConn, so we log a warning and treat
 // those endpoints as passing without a real probe.
-func scanResolvers(endpoints []*poolEndpoint, domain dns.Name, timeout time.Duration, checks int) []*poolEndpoint {
+func scanResolvers(endpoints []*poolEndpoint, domain dns.Name, timeout time.Duration, checks int, retriesPerCheck int) []*poolEndpoint {
 	if checks < 1 {
 		checks = 1
+	}
+	if retriesPerCheck < 0 {
+		retriesPerCheck = 0
 	}
 	probeID := turbotunnel.NewClientID()
 	probeBuilder := func() ([]byte, error) { return BuildProbeMessage(domain, probeID) }
@@ -633,53 +644,73 @@ func scanResolvers(endpoints []*poolEndpoint, domain dns.Name, timeout time.Dura
 
 			// UDP: run up to checks PING/PONG rounds; pass only if all succeed.
 			for round := 0; round < checks; round++ {
-				msg, err := probeBuilder()
-				if err != nil {
-					log.Printf("Scan: %s — PING build failed (check %d/%d): %v", ep.name, round+1, checks, err)
-					return
-				}
-				ep.probeConn.SetDeadline(time.Now().Add(timeout))
-				_, err = ep.probeConn.WriteTo(msg, ep.addr)
-				if err != nil {
+				roundOK := false
+				for attempt := 0; attempt <= retriesPerCheck; attempt++ {
+					if attempt > 0 {
+						log.Printf("Scan: %s — retry %d/%d (check %d/%d)", ep.name, attempt, retriesPerCheck, round+1, checks)
+					}
+					msg, err := probeBuilder()
+					if err != nil {
+						log.Printf("Scan: %s — PING build failed (check %d/%d): %v", ep.name, round+1, checks, err)
+						return
+					}
+					ep.probeConn.SetDeadline(time.Now().Add(timeout))
+					_, err = ep.probeConn.WriteTo(msg, ep.addr)
+					if err != nil {
+						ep.probeConn.SetDeadline(time.Time{})
+						log.Printf("Scan: %s — PING send failed (check %d/%d, attempt %d): %v", ep.name, round+1, checks, attempt+1, err)
+						if attempt == retriesPerCheck {
+							return
+						}
+						continue
+					}
+					if checks == 1 && retriesPerCheck == 0 {
+						log.Printf("Scan: %s ← PING sent", ep.name)
+					} else {
+						log.Printf("Scan: %s ← PING sent (check %d/%d, attempt %d)", ep.name, round+1, checks, attempt+1)
+					}
+					if dnsttDebug() {
+						log.Printf("DNSTT_DEBUG: PING to %s (health probe, no requested payload size)", ep.name)
+						log.Printf("DNSTT_DEBUG: PING query (hex):\n%s", dnsttDebugHexDump(msg, 0))
+					}
+					buf := make([]byte, 4096)
+					n, _, err := ep.probeConn.ReadFrom(buf)
 					ep.probeConn.SetDeadline(time.Time{})
-					log.Printf("Scan: %s — PING send failed (check %d/%d): %v", ep.name, round+1, checks, err)
+					if err != nil {
+						log.Printf("Scan: %s — no PONG (check %d/%d, attempt %d: %v)", ep.name, round+1, checks, attempt+1, err)
+						if attempt == retriesPerCheck {
+							return
+						}
+						continue
+					}
+					if dnsttDebug() {
+						log.Printf("DNSTT_DEBUG: PONG response (hex):\n%s", dnsttDebugHexDump(buf[:n], 0))
+					}
+					if !probeVerify(buf[:n]) {
+						log.Printf("Scan: %s → bad response (check %d/%d, attempt %d): %s", ep.name, round+1, checks, attempt+1, ExplainProbeResponseFailure(buf[:n], domain))
+						if attempt == retriesPerCheck {
+							return
+						}
+						continue
+					}
+					payloadLen := 0
+					if resp, err := dns.MessageFromWireFormat(buf[:n]); err == nil {
+						payload := dnsResponsePayload(&resp, domain)
+						payloadLen = len(payload)
+					}
+					if checks == 1 && retriesPerCheck == 0 {
+						log.Printf("Scan: %s → PONG received (%d bytes)", ep.name, payloadLen)
+					} else {
+						log.Printf("Scan: %s → PONG received (check %d/%d, attempt %d, %d bytes)", ep.name, round+1, checks, attempt+1, payloadLen)
+					}
+					if dnsttDebug() {
+						log.Printf("DNSTT_DEBUG: PONG from %s payload %d bytes (health probe)", ep.name, payloadLen)
+					}
+					roundOK = true
+					break
+				}
+				if !roundOK {
 					return
-				}
-				if checks == 1 {
-					log.Printf("Scan: %s ← PING sent", ep.name)
-				} else {
-					log.Printf("Scan: %s ← PING sent (check %d/%d)", ep.name, round+1, checks)
-				}
-				if dnsttDebug() {
-					log.Printf("DNSTT_DEBUG: PING to %s (health probe, no requested payload size)", ep.name)
-					log.Printf("DNSTT_DEBUG: PING query (hex):\n%s", dnsttDebugHexDump(msg, 0))
-				}
-				buf := make([]byte, 4096)
-				n, _, err := ep.probeConn.ReadFrom(buf)
-				ep.probeConn.SetDeadline(time.Time{})
-				if err != nil {
-					log.Printf("Scan: %s — no PONG (check %d/%d: %v)", ep.name, round+1, checks, err)
-					return
-				}
-				if dnsttDebug() {
-					log.Printf("DNSTT_DEBUG: PONG response (hex):\n%s", dnsttDebugHexDump(buf[:n], 0))
-				}
-				if !probeVerify(buf[:n]) {
-					log.Printf("Scan: %s → bad response (check %d/%d): %s", ep.name, round+1, checks, ExplainProbeResponseFailure(buf[:n], domain))
-					return
-				}
-				payloadLen := 0
-				if resp, err := dns.MessageFromWireFormat(buf[:n]); err == nil {
-					payload := dnsResponsePayload(&resp, domain)
-					payloadLen = len(payload)
-				}
-				if checks == 1 {
-					log.Printf("Scan: %s → PONG received (%d bytes)", ep.name, payloadLen)
-				} else {
-					log.Printf("Scan: %s → PONG received (check %d/%d, %d bytes)", ep.name, round+1, checks, payloadLen)
-				}
-				if dnsttDebug() {
-					log.Printf("DNSTT_DEBUG: PONG from %s payload %d bytes (health probe)", ep.name, payloadLen)
 				}
 			}
 			mu.Lock()
@@ -689,6 +720,19 @@ func scanResolvers(endpoints []*poolEndpoint, domain dns.Name, timeout time.Dura
 	}
 	wg.Wait()
 	return passed
+}
+
+// resolverLineForScanOutput formats a UDP resolver for writing to a resolvers file.
+// udp:host:53 and host:53 are written as bare host to match common IP lists.
+func resolverLineForScanOutput(udpAddr string) string {
+	host, port, err := net.SplitHostPort(udpAddr)
+	if err != nil {
+		return "udp:" + udpAddr
+	}
+	if port == "53" {
+		return host
+	}
+	return "udp:" + udpAddr
 }
 
 // mtuProbe represents a single MTU probe (server response size or client request size).
@@ -1000,6 +1044,167 @@ func main() {
 		}
 	}
 
+	// Standalone scan: test resolvers with PING/PONG and write passing UDP lines to a file.
+	// Usage: dnstt-client scan [-resolvers-file FILE]... [-udp ADDR]... [-scan-checks N] [-scan-retry R] DOMAIN OUTPUT.txt
+	if len(os.Args) >= 2 && os.Args[1] == "scan" {
+		scanFS := flag.NewFlagSet("scan", flag.ExitOnError)
+		scanFS.SetOutput(os.Stderr)
+		var scanDoh, scanDot, scanUdp stringSliceFlag
+		var scanResolverFiles stringSliceFlag
+		var scanUtls string
+		var scanChecks, scanRetry int
+		var scanDomain string
+		scanFS.Var(&scanDoh, "doh", "DoH resolver URL (repeatable)")
+		scanFS.Var(&scanDot, "dot", "DoT resolver address (repeatable)")
+		scanFS.Var(&scanUdp, "udp", "UDP resolver host:port (repeatable)")
+		scanFS.Var(&scanResolverFiles, "resolvers-file", "resolvers file (repeatable); same format as main client")
+		scanFS.StringVar(&scanDomain, "domain", "", "tunnel DNS zone (required if only OUTPUT.txt is given as argument)")
+		scanFS.StringVar(&scanUtls, "utls",
+			"4*random,3*Firefox_120,1*Firefox_105,3*Chrome_120,1*Chrome_102,1*iOS_14,1*iOS_13",
+			"uTLS distribution for DoH/DoT")
+		scanFS.IntVar(&scanChecks, "scan-checks", 1, "PING/PONG rounds per resolver; all must succeed")
+		scanFS.IntVar(&scanRetry, "scan-retry", 0, "extra attempts per check after failure (0 = no retry)")
+		scanFS.Usage = func() {
+			fmt.Fprintf(scanFS.Output(), `Usage:
+  %[1]s scan [flags] DOMAIN OUTPUT.txt
+  %[1]s scan [flags] -domain DOMAIN OUTPUT.txt
+
+  DOMAIN is your dnstt tunnel zone. Only resolvers that reach the dnstt server answer PONG.
+
+  OUTPUT.txt: one passing UDP resolver per line (bare IP when port is 53).
+
+Examples:
+  %[1]s scan -resolvers-file dns.txt -scan-checks 3 -scan-retry 2 t.example.com out.txt
+  %[1]s scan -resolvers-file dns.txt -domain t.example.com -scan-checks 3 -scan-retry 2 out.txt
+
+`, os.Args[0])
+			scanFS.PrintDefaults()
+		}
+		if err := scanFS.Parse(os.Args[2:]); err != nil {
+			os.Exit(2)
+		}
+		var domainStr, outPath string
+		switch scanFS.NArg() {
+		case 1:
+			if scanDomain == "" {
+				fmt.Fprintf(os.Stderr, "scan: give DOMAIN OUTPUT.txt, or -domain DOMAIN and OUTPUT.txt\n")
+				scanFS.Usage()
+				os.Exit(1)
+			}
+			domainStr = scanDomain
+			outPath = scanFS.Arg(0)
+		case 2:
+			domainStr = scanFS.Arg(0)
+			outPath = scanFS.Arg(1)
+		default:
+			scanFS.Usage()
+			os.Exit(1)
+		}
+		domain, err := dns.ParseName(domainStr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "invalid domain %q: %v\n", domainStr, err)
+			os.Exit(1)
+		}
+
+		var specs []resolverSpec
+		for _, u := range scanDoh {
+			specs = append(specs, resolverSpec{typ: "doh", addr: u})
+		}
+		for _, a := range scanDot {
+			specs = append(specs, resolverSpec{typ: "dot", addr: a})
+		}
+		for _, a := range scanUdp {
+			specs = append(specs, resolverSpec{typ: "udp", addr: a})
+		}
+		for _, path := range scanResolverFiles {
+			fileSpecs, err := parseResolversFile(path)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "reading resolvers file %q: %v\n", path, err)
+				os.Exit(1)
+			}
+			specs = append(specs, fileSpecs...)
+		}
+		if len(specs) == 0 {
+			fmt.Fprintf(os.Stderr, "scan: give at least one of -resolvers-file, -udp, -doh, -dot\n")
+			os.Exit(1)
+		}
+		if scanChecks < 1 {
+			scanChecks = 1
+		}
+		if scanChecks > 20 {
+			scanChecks = 20
+		}
+		if scanRetry < 0 {
+			scanRetry = 0
+		}
+		if scanRetry > 10 {
+			scanRetry = 10
+		}
+
+		utlsID, err := sampleUTLSDistribution(scanUtls)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "scan: -utls: %v\n", err)
+			os.Exit(1)
+		}
+
+		log.SetFlags(log.LstdFlags | log.LUTC)
+		endpoints := make([]*poolEndpoint, 0, len(specs))
+		for _, spec := range specs {
+			ep, _, err := buildEndpointFromSpec(spec, utlsID)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "scan: resolver %s %s: %v\n", spec.typ, spec.addr, err)
+				os.Exit(1)
+			}
+			endpoints = append(endpoints, ep)
+		}
+
+		nUDP := 0
+		for _, ep := range endpoints {
+			if ep.probeConn != nil {
+				nUDP++
+			}
+		}
+		log.Printf("Scan: sending PING to %d resolver(s) (%d UDP, %d check(s) each, up to %d retries per check)",
+			len(endpoints), nUDP, scanChecks, scanRetry)
+		passed := scanResolvers(endpoints, domain, 8*time.Second, scanChecks, scanRetry)
+
+		var lines []string
+		seen := make(map[string]bool)
+		for _, ep := range passed {
+			if ep.probeConn == nil {
+				continue
+			}
+			line := resolverLineForScanOutput(ep.name)
+			if seen[line] {
+				continue
+			}
+			seen[line] = true
+			lines = append(lines, line)
+		}
+
+		out, err := os.Create(outPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "scan: create output %q: %v\n", outPath, err)
+			os.Exit(1)
+		}
+		for _, line := range lines {
+			fmt.Fprintln(out, line)
+		}
+		if err := out.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "scan: close output: %v\n", err)
+			os.Exit(1)
+		}
+
+		for _, ep := range endpoints {
+			ep.conn.Close()
+			if ep.probeConn != nil {
+				ep.probeConn.Close()
+			}
+		}
+		log.Printf("Scan: wrote %d resolver(s) with PONG to %q (%d/%d UDP tried)", len(lines), outPath, len(lines), nUDP)
+		os.Exit(0)
+	}
+
 	var dohURLs stringSliceFlag
 	var dotAddrs stringSliceFlag
 	var udpAddrs stringSliceFlag
@@ -1168,7 +1373,7 @@ Known TLS fingerprints for -utls are:
 			scanChecks = 20
 		}
 		log.Printf("Scan: sending PING to %d resolver(s) (%d check(s) each)", len(endpoints), scanChecks)
-		passed := scanResolvers(endpoints, domain, 8*time.Second, scanChecks)
+		passed := scanResolvers(endpoints, domain, 8*time.Second, scanChecks, 0)
 		// Close endpoints that didn't pass.
 		passedSet := make(map[*poolEndpoint]bool, len(passed))
 		for _, ep := range passed {

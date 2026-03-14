@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`scan` subcommand (client)** — `dnstt-client scan -resolvers-file … -scan-checks N -scan-retry R DOMAIN out.txt` (or `-domain DOMAIN` with a single output path) probes each **UDP** resolver with the usual PING/PONG health check and writes passing lines to a file. `-scan-retry` retries failed checks before giving up on that round.
+
 - **SERVFAIL-aware resolver pool** — On **SERVFAIL** (rcode 2) for tunnel traffic, the client no longer burns NXDOMAIN retries on the same resolver; it notifies the pool (`ReportServfail`), triggers a poll, and lets KCP retransmit. Successful tunnel responses call `ConfirmDataPath`. Endpoints with repeated SERVFAIL are treated as **cold** for selection (similar to stale data-path), so traffic shifts toward resolvers that actually forward authoritative answers.
 
 ### Fixed
