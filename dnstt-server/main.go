@@ -1272,7 +1272,7 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 		}
 	}
 	log.Printf("starting %d sendLoop goroutines", numSendLoops)
-	clientCache := ttlcache.New[turbotunnel.ClientID, *clientState](
+	clientCache := ttlcache.New(
 		ttlcache.WithTTL[turbotunnel.ClientID, *clientState](idleTimeout * 2),
 	)
 	go clientCache.Start()

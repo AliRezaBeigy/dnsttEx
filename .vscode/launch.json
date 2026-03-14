@@ -9,15 +9,112 @@
             "program": "${workspaceFolder}/dnstt-client",
             "args": [
                 "-udp",
-                "8.8.8.8:53",
+                "185.139.64.9:53",
+                "-scan",
                 "-pubkey",
-                "XXXXXXXXXXXX",
-                "j.xxxx.com",
-                "127.0.0.1:7000"
+                "5361ef4764db7f7435c6caae2c043daae4e6a3803b60aa8aafa9fda77439970a",
+                "e.markop.ir",
+                "127.0.0.1:1082"
             ],
-            "env": {},
+            "env": {
+                "DNSTT_DEBUG": "1"
+            },
             "showLog": true,
             "trace": "log"
+        },
+        {
+            "name": "Debug Test: TestLowMTULargeTransferIntegrity",
+            "type": "go",
+            "request": "launch",
+            "mode": "test",
+            "program": "${workspaceFolder}/integration",
+            "buildFlags": "-tags=integration",
+            "args": [
+                "-test.v",
+                "-test.run",
+                "TestLowMTULargeTransferIntegrity",
+                "-test.count=1"
+            ],
+            "showLog": true
+        },
+        {
+            "name": "Integration (external): Print keys",
+            "type": "go",
+            "request": "launch",
+            "mode": "test",
+            "program": "${workspaceFolder}/integration",
+            "buildFlags": "-tags=integration",
+            "args": ["-test.run=^$"],
+            "env": {
+                "DNSTT_INTEGRATION_PRINT_KEYS": "1"
+            },
+            "console": "integratedTerminal",
+            "showLog": true
+        },
+        {
+            "name": "Integration (external): Server",
+            "type": "go",
+            "request": "launch",
+            "mode": "debug",
+            "program": "${workspaceFolder}/dnstt-server",
+            "args": [
+                "-udp", "127.0.0.1:9354",
+                "-privkey", "365c9f54e4ac7f5426a5750eb254d1aa41123c0ba249962996c83db28c4c8049",
+                "t.test.invalid",
+                "127.0.0.1:9090"
+            ],
+            "showLog": true
+        },
+        {
+            "name": "Integration (external): Client",
+            "type": "go",
+            "request": "launch",
+            "mode": "debug",
+            "program": "${workspaceFolder}/dnstt-client",
+            "args": [
+                "-udp", "127.0.0.1:9353",
+                "-pubkey", "8e262d6a71e3a7917ae7cd5f9eb7daa8f3320fd5e29e78e35df31113d56f2565",
+                "t.test.invalid",
+                "127.0.0.1:1082"
+            ],
+            "env": {
+                "DNSTT_MTU_PROBE_TIMEOUT": "2s",
+                "DNSTT_SEND_CHANNEL_SIZE": "1310720",
+                "DNSTT_DEBUG": "1"
+            },
+            "preLaunchTask": "Integration: Delay 5s for server",
+            "showLog": true
+        },
+        {
+            "name": "Integration (external): Test",
+            "type": "go",
+            "request": "launch",
+            "mode": "test",
+            "program": "${workspaceFolder}/integration",
+            "buildFlags": "-tags=integration",
+            "args": [
+                "-test.v",
+                "-test.run",
+                "TestLowMTULargeTransferIntegrity",
+                "-test.count=1"
+            ],
+            "env": {
+                "DNSTT_INTEGRATION_EXTERNAL": "1",
+                "DNSTT_INTEGRATION_PRIVKEY": "365c9f54e4ac7f5426a5750eb254d1aa41123c0ba249962996c83db28c4c8049",
+                "DNSTT_INTEGRATION_PUBKEY": "8e262d6a71e3a7917ae7cd5f9eb7daa8f3320fd5e29e78e35df31113d56f2565"
+            },
+            "showLog": true
+        },
+    ],
+    "compounds": [
+        {
+            "name": "Integration (external): All (Test + Server + Client)",
+            "configurations": [
+                "Integration (external): Test",
+                "Integration (external): Server",
+                "Integration (external): Client"
+            ],
+            "stopAll": true
         }
     ]
 }

@@ -227,14 +227,21 @@ func TestLowMTULargeTransferIntegrity(t *testing.T) {
 		},
 		&stderrBuf, clientEnv)
 
-	serverMTU, clientMTU := waitForMTUDiscovery(t, &stderrBuf, 15*time.Second)
-	if serverMTU != maxResponseSize {
-		t.Errorf("server MTU = %d, want %d (path limits responses to %d)", serverMTU, maxResponseSize, maxResponseSize)
+	var serverMTU, clientMTU int
+	if integrationExternalMode() {
+		// In external mode we don't capture client stderr, so we can't parse MTU discovery.
+		serverMTU, clientMTU = maxResponseSize, maxRequestSize
+		t.Logf("MTU discovery: server=%d client=%d (external mode, not verified from stderr)", serverMTU, clientMTU)
+	} else {
+		serverMTU, clientMTU = waitForMTUDiscovery(t, &stderrBuf, 15*time.Second)
+		if serverMTU != maxResponseSize {
+			t.Errorf("server MTU = %d, want %d (path limits responses to %d)", serverMTU, maxResponseSize, maxResponseSize)
+		}
+		if clientMTU != maxRequestSize {
+			t.Fatalf("client MTU = %d, want %d (relay drops requests > %d)", clientMTU, maxRequestSize, relayDropRequestAboveFor128)
+		}
+		t.Logf("MTU discovery: server=%d client=%d", serverMTU, clientMTU)
 	}
-	if clientMTU != maxRequestSize {
-		t.Fatalf("client MTU = %d, want %d (relay drops requests > %d)", clientMTU, maxRequestSize, relayDropRequestAboveFor128)
-	}
-	t.Logf("MTU discovery: server=%d client=%d", serverMTU, clientMTU)
 
 	conn := h.dialTunnel(t)
 	defer conn.Close()

@@ -27,6 +27,18 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	if os.Getenv("DNSTT_INTEGRATION_PRINT_KEYS") == "1" {
+		privkey, err := noise.GeneratePrivkey()
+		if err != nil {
+			log.Fatalf("GeneratePrivkey: %v", err)
+		}
+		pubkey := noise.PubkeyFromPrivkey(privkey)
+		fmt.Printf("DNSTT_INTEGRATION_PRIVKEY=%s\n", noise.EncodeKey(privkey))
+		fmt.Printf("DNSTT_INTEGRATION_PUBKEY=%s\n", noise.EncodeKey(pubkey))
+		fmt.Fprintf(os.Stderr, "Add these to your Server/Client/Test launch config env for DNSTT_INTEGRATION_EXTERNAL=1 debugging.\n")
+		os.Exit(0)
+	}
+
 	dir, err := os.MkdirTemp("", "dnstt-int-*")
 	if err != nil {
 		log.Fatalf("MkdirTemp: %v", err)
@@ -147,11 +159,27 @@ func loadRealNetworkConfig(t testing.TB) *realNetworkConfig {
 	return cfg
 }
 
+// externalIntegrationPorts are used when DNSTT_INTEGRATION_EXTERNAL=1 so that
+// server and client can be started under the debugger with fixed launch configs.
+const (
+	externalRelayListen  = "127.0.0.1:9353"
+	externalServerUDP    = "127.0.0.1:9354"
+	externalClientListen = "127.0.0.1:1082"
+	externalEchoListen   = "127.0.0.1:9090"
+)
+
+func integrationExternalMode() bool {
+	return os.Getenv("DNSTT_INTEGRATION_EXTERNAL") == "1"
+}
+
 func relayListenUDPAddr(t testing.TB) *net.UDPAddr {
 	t.Helper()
 	addr := "127.0.0.1:0"
 	if realNetworkEnabled() {
 		addr = "0.0.0.0:0"
+	}
+	if integrationExternalMode() {
+		addr = externalRelayListen
 	}
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
@@ -364,8 +392,17 @@ type makeRelayFunc func(serverAddr string) udpRelay
 // makeRelay(serverAddr) to create the relay after the server is started, and
 // captures client stderr into stderrBuf so tests can parse e.g. "MTU discovery ... server=512 client=512".
 // If clientEnv is non-nil, the client process is started with these env vars (in addition to the current process env).
+//
+// When DNSTT_INTEGRATION_EXTERNAL=1, the harness does not start server or client; it only starts
+// the in-process echo server and relay on fixed ports (see external* constants). Start server and
+// client under the debugger using the same keypair and ports. Set DNSTT_INTEGRATION_PRIVKEY and
+// DNSTT_INTEGRATION_PUBKEY in the environment (run TestPrintIntegrationKeys with
+// DNSTT_INTEGRATION_PRINT_KEYS=1 to generate a keypair).
 func newTunnelHarnessWithRelayAndStderr(t testing.TB, serverBin, clientBin string, makeRelay makeRelayFunc, stderrBuf *bytes.Buffer, clientEnv map[string]string) *tunnelHarness {
 	t.Helper()
+	if integrationExternalMode() {
+		return newTunnelHarnessExternalWithRelayAndStderr(t, makeRelay, stderrBuf)
+	}
 	realnet := loadRealNetworkConfig(t)
 	h := &tunnelHarness{
 		serverBin: serverBin,
@@ -427,6 +464,42 @@ func newTunnelHarnessWithRelayAndStderr(t testing.TB, serverBin, clientBin strin
 		t.Fatalf("start client: %v", err)
 	}
 	waitTCP(t, h.ClientAddr, 20*time.Second)
+	t.Cleanup(func() {
+		relay.Close()
+		h.Teardown()
+	})
+	return h
+}
+
+// newTunnelHarnessExternalWithRelayAndStderr is used when DNSTT_INTEGRATION_EXTERNAL=1.
+// It starts only the echo server and relay on fixed ports; server and client must be
+// started separately (e.g. under the debugger) with the same keypair and ports.
+func newTunnelHarnessExternalWithRelayAndStderr(t testing.TB, makeRelay makeRelayFunc, stderrBuf *bytes.Buffer) *tunnelHarness {
+	t.Helper()
+	privkeyHex := os.Getenv("DNSTT_INTEGRATION_PRIVKEY")
+	pubkeyHex := os.Getenv("DNSTT_INTEGRATION_PUBKEY")
+	if privkeyHex == "" || pubkeyHex == "" {
+		t.Fatalf("DNSTT_INTEGRATION_EXTERNAL=1 requires DNSTT_INTEGRATION_PRIVKEY and DNSTT_INTEGRATION_PUBKEY in environment. Run TestPrintIntegrationKeys with DNSTT_INTEGRATION_PRINT_KEYS=1 to generate a keypair, then set those env vars in your Server and Client launch configs.")
+	}
+	h := &tunnelHarness{
+		domain:     "t.test.invalid",
+		privkeyHex: privkeyHex,
+		pubkeyHex:  pubkeyHex,
+		dnsUDPAddr: externalServerUDP,
+		ClientAddr: externalClientListen,
+		serverCmd:  nil,
+		clientCmd:  nil,
+	}
+	echoLn, err := net.Listen("tcp", externalEchoListen)
+	if err != nil {
+		t.Fatalf("echo listen (external mode): %v (is another process using %s?)", err, externalEchoListen)
+	}
+	h.echoLn = echoLn
+	go runEchoServer(echoLn)
+	relay := makeRelay(externalServerUDP)
+	t.Logf("external mode: relay %s -> server %s; start server with -udp %s -privkey <same> %s %s; start client with -udp %s -pubkey <same> %s %s",
+		externalRelayListen, externalServerUDP, externalServerUDP, h.domain, externalEchoListen, externalRelayListen, h.domain, externalClientListen)
+	_ = stderrBuf
 	t.Cleanup(func() {
 		relay.Close()
 		h.Teardown()
@@ -551,6 +624,22 @@ func runEchoServer(ln net.Listener) {
 			io.Copy(c, c)
 		}(conn)
 	}
+}
+
+// signalOnFirstAcceptListener wraps a listener and closes ready when the first connection is accepted.
+type signalOnFirstAcceptListener struct {
+	net.Listener
+	once  sync.Once
+	ready chan struct{}
+}
+
+func (s *signalOnFirstAcceptListener) Accept() (net.Conn, error) {
+	conn, err := s.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	s.once.Do(func() { close(s.ready) })
+	return conn, nil
 }
 
 // allocFreeUDPAddr returns a free loopback UDP host:port string.
@@ -929,9 +1018,9 @@ type slowLossyTruncatingUDPRelay struct {
 	serverDelay     time.Duration
 	dropClientEvery int
 
-	sent     atomic.Int64
-	received atomic.Int64
-	mu       sync.Mutex
+	sent       atomic.Int64
+	received   atomic.Int64
+	mu         sync.Mutex
 	clientAddr *net.UDPAddr
 
 	clientPackets atomic.Int64
@@ -954,14 +1043,14 @@ func newSlowLossyTruncatingUDPRelay(t testing.TB, serverAddrStr string, maxRespo
 		t.Fatalf("slow-lossy relay server conn: %v", err)
 	}
 	r := &slowLossyTruncatingUDPRelay{
-		ln:                ln,
-		serverConn:        serverConn,
-		serverAddr:        serverAddr,
-		advertiseAddr:     relayAdvertiseAddr(t, ln.LocalAddr().String(), serverAddrStr),
-		maxResponseSize:   maxResponseSize,
-		maxRequestSize:    maxRequestSize,
-		serverDelay:       serverDelay,
-		dropClientEvery:   dropClientEvery,
+		ln:              ln,
+		serverConn:      serverConn,
+		serverAddr:      serverAddr,
+		advertiseAddr:   relayAdvertiseAddr(t, ln.LocalAddr().String(), serverAddrStr),
+		maxResponseSize: maxResponseSize,
+		maxRequestSize:  maxRequestSize,
+		serverDelay:     serverDelay,
+		dropClientEvery: dropClientEvery,
 	}
 	go r.serverToClientLoop()
 	go r.clientToServerLoop()
