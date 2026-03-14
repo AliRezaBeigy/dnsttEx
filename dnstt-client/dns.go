@@ -116,6 +116,13 @@ func base36Decode(dst, src []byte) error {
 
 func base36DecodedLen(n int) int { return n * 5 / 8 }
 
+func truncHex(b []byte, max int) []byte {
+	if len(b) <= max {
+		return b
+	}
+	return b[:max]
+}
+
 // DNSPacketConn sends and receives tunnel payload over DNS. Upstream is Base36 in the
 // question name (0-9a-v); server decodes case-insensitively for QNAME randomization.
 // No EDNS for payload. Downstream from TXT Answer first, then EDNS 0xFF01 if present.
@@ -472,7 +479,7 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 		payload := dnsResponsePayload(&resp, c.domain)
 		if dnsttLogRxData() {
 			if len(payload) == 0 {
-				log.Printf("DNSTT_RX_POLL_EMPTY from %s: no downstream payload (server has nothing to send yet)", addr)
+				log.Printf("DNSTT_RX_POLL_EMPTY ← from %s | no TXT/downstream (nothing to read yet)", addr)
 			}
 		}
 		if len(payload) == 0 {
@@ -480,6 +487,9 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 		}
 		// Health PONG / scan — not tunneled data.
 		if bytes.Equal(payload, ProbeResponsePONG) {
+			if dnsttLogRxData() {
+				log.Printf("DNSTT_RX_POLL_EMPTY ← from %s | PONG only (health / idle)", addr)
+			}
 			continue
 		}
 
@@ -499,18 +509,15 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 			c.QueuePacketConn.QueueIncoming(p, addr)
 		}
 		if dnsttLogRxData() && !any {
-			log.Printf("DNSTT_RX_POLL_EMPTY from %s: %d B payload but no length-prefixed tunnel packets (not tunneled data)", addr, len(payload))
+			log.Printf("DNSTT_RX_POLL_EMPTY ← from %s | %d B payload, not a tunnel stream", addr, len(payload))
 		}
 		if any && dnsttLogRxData() {
 			maxHex := 512
-			show := payload
-			if len(show) > maxHex {
-				show = show[:maxHex]
-			}
-			log.Printf("DNSTT_RX_DATA from %s: tunnel payload %d B, %d packet(s), hex: %s",
-				addr, len(payload), nPackets, hex.EncodeToString(show))
+			show := truncHex(payload, maxHex)
+			log.Printf("DNSTT_RX_DATA ← from %s | %d packet(s) in answer | downstream %d B | hex: %s",
+				addr, nPackets, len(payload), hex.EncodeToString(show))
 			if len(payload) > maxHex {
-				log.Printf("DNSTT_RX_DATA … truncated (%d more bytes)", len(payload)-maxHex)
+				log.Printf("DNSTT_RX_DATA ← … truncated (%d more B)", len(payload)-maxHex)
 			}
 		}
 		if any {
@@ -741,6 +748,20 @@ func (c *DNSPacketConn) send(transport net.PacketConn, packets [][]byte, addr ne
 		if maxReq <= 0 || qnl <= maxReq || sendAnyway {
 			if dnsttDebug() && len(packets) > 0 {
 				log.Printf("DNSTT_DEBUG: send: QNAME %d bytes, query wire %d (max QNAME %d)", qnl, len(buf), maxReq)
+			}
+			if dnsttLogRxData() {
+				maxHex := 512
+				if len(packets) > 0 {
+					log.Printf("DNSTT_TX_DATA → to %s | %d tunnel segment(s) in this query | upstream %d B | QNAME %d | hex: %s",
+						addr, len(packets), len(decoded), qnl, hex.EncodeToString(truncHex(decoded, maxHex)))
+					if len(decoded) > maxHex {
+						log.Printf("DNSTT_TX_DATA → … truncated (%d more B upstream)", len(decoded)-maxHex)
+					}
+				} else {
+					// Idle poll / hint-poll — no KCP segments; still distinct from TX_DATA.
+					log.Printf("DNSTT_TX_POLL → to %s | idle poll only | upstream %d B | QNAME %d | hex: %s",
+						addr, len(decoded), qnl, hex.EncodeToString(truncHex(decoded, maxHex)))
+				}
 			}
 			if len(buf) >= 2 {
 				rand.Read(buf[0:2])
