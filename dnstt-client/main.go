@@ -68,8 +68,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"dnsttEx/dns"
@@ -199,8 +199,9 @@ func newSessionManager(pubkey []byte, domain dns.Name, remoteAddr net.Addr, pcon
 }
 
 // closeSessionLocked closes the current session if it exists.
+// reason is logged so the user knows why the connection dropped.
 // Caller must hold sm.mu write lock.
-func (sm *sessionManager) closeSessionLocked() {
+func (sm *sessionManager) closeSessionLocked(reason string) {
 	if sm.sess != nil {
 		sm.sess.Close()
 		sm.sess = nil
@@ -211,7 +212,7 @@ func (sm *sessionManager) closeSessionLocked() {
 	}
 	if sm.conn != nil {
 		conv := sm.conv
-		log.Printf("end session %08x", conv)
+		log.Printf("connection closed: session %08x — %s", conv, reason)
 		sm.conn.Close()
 		sm.conn = nil
 	}
@@ -299,7 +300,7 @@ func (sm *sessionManager) createSession() error {
 		sm.mu.Unlock()
 		return nil
 	}
-	sm.closeSessionLocked()
+	sm.closeSessionLocked("replacing with new session")
 	sm.mu.Unlock()
 
 	conn, rw, sess, conv, err := sm.createSessionUnlocked()
@@ -324,10 +325,11 @@ func (sm *sessionManager) createSession() error {
 }
 
 // closeSession closes the current session if it exists.
-func (sm *sessionManager) closeSession() {
+// reason is logged so the user knows why the connection dropped.
+func (sm *sessionManager) closeSession(reason string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	sm.closeSessionLocked()
+	sm.closeSessionLocked(reason)
 }
 
 // getSession returns the current session, creating one if needed.
@@ -374,12 +376,12 @@ func (sm *sessionManager) openStream() (*smux.Stream, uint32, error) {
 		return nil, 0, fmt.Errorf("session %08x opening stream: %v", conv, err)
 	}
 
-	log.Printf("session %08x closed, recreating: %v", conv, err)
+	log.Printf("connection closed: session %08x — session dead (e.g. keepalive timeout or remote close), recreating: %v", conv, err)
 	// Clear the dead session only if it hasn't already been replaced by
 	// another goroutine.
 	sm.mu.Lock()
 	if sm.sess == sess {
-		sm.closeSessionLocked()
+		sm.closeSessionLocked("session dead, recreating")
 	}
 	sm.mu.Unlock()
 
@@ -395,13 +397,113 @@ func (sm *sessionManager) openStream() (*smux.Stream, uint32, error) {
 	return stream, conv, nil
 }
 
+// peekSize is the max bytes we read per chunk to describe upstream/downstream for DNSTT_LOG_RX_DATA.
+const peekSize = 4096
+
+// logFirstChunks is how many chunks in each direction we log when DNSTT_LOG_RX_DATA is set,
+// so you see SOCKS greeting, SOCKS CONNECT, HTTP request (upstream) and SOCKS reply, HTTP response (downstream).
+const logFirstChunks = 5
+
+// minChunkBytesForCount is the minimum chunk size to count toward logFirstChunks, so we don't
+// burn log lines on tiny tunnel fragments (e.g. "relay 2 B") and are more likely to log SOCKS/HTTP.
+const minChunkBytesForCount = 4
+
+// copyUpstreamWithLog copies from local to stream and, when DNSTT_LOG_RX_DATA is set,
+// logs the first few chunks using FormatUpstreamForSocksLog so you see SOCKS greeting,
+// SOCKS CONNECT, and HTTP request.
+func copyUpstreamWithLog(stream *smux.Stream, local *net.TCPConn, conv uint32, streamID uint32) (int64, error) {
+	buf := make([]byte, peekSize)
+	var total int64
+	logCount := 0
+	for logCount < logFirstChunks {
+		n, err := local.Read(buf)
+		if n > 0 {
+			chunk := buf[:n]
+			if dnsttLogRxData() {
+				desc := FormatUpstreamForSocksLog(chunk)
+				log.Printf("DNSTT_CLIENT_UPSTREAM stream %08x:%d | %s", conv, streamID, desc)
+				if n >= minChunkBytesForCount {
+					logCount++
+				}
+			}
+			if _, werr := stream.Write(chunk); werr != nil {
+				return total + int64(n), werr
+			}
+			total += int64(n)
+			continue
+		}
+		if err != nil {
+			if err == io.EOF {
+				return total, nil
+			}
+			return total, err
+		}
+		// n == 0, err == nil: exit chunk loop and copy rest
+		break
+	}
+	copied, err := io.Copy(stream, local)
+	return total + copied, err
+}
+
+// firstDownstreamGatherMin is the minimum bytes we try to gather for the first downstream log
+// so it's enough to parse SOCKS5 reply (e.g. 10 bytes) instead of logging "relay 2 B".
+const firstDownstreamGatherMin = 10
+
+// copyDownstreamWithLog copies from stream to local and, when DNSTT_LOG_RX_DATA is set,
+// logs the first few chunks using FormatDownstreamForSocksLog so you see SOCKS reply
+// and HTTP response. For the first chunk we briefly gather more data if the read was tiny
+// so the first log line is usually "SOCKS5 reply ..." instead of "relay 2 B".
+func copyDownstreamWithLog(local *net.TCPConn, stream *smux.Stream, conv uint32, streamID uint32) (int64, error) {
+	buf := make([]byte, peekSize)
+	var total int64
+	logCount := 0
+	for logCount < logFirstChunks {
+		n, err := stream.Read(buf)
+		if n > 0 {
+			chunk := buf[:n]
+			// First downstream chunk is often a tiny fragment; gather a bit more so we can log "SOCKS5 reply ...".
+			if dnsttLogRxData() && logCount == 0 && n < firstDownstreamGatherMin && n < len(buf) {
+				stream.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+				nn, _ := stream.Read(buf[n:])
+				stream.SetReadDeadline(time.Time{})
+				if nn > 0 {
+					chunk = buf[:n+nn]
+					n += nn
+				}
+			}
+			if dnsttLogRxData() {
+				desc := FormatDownstreamForSocksLog(chunk)
+				log.Printf("DNSTT_CLIENT_DOWNSTREAM stream %08x:%d | %s", conv, streamID, desc)
+				if len(chunk) >= minChunkBytesForCount {
+					logCount++
+				}
+			}
+			if _, werr := local.Write(chunk); werr != nil {
+				return total + int64(len(chunk)), werr
+			}
+			total += int64(len(chunk))
+			continue
+		}
+		if err != nil {
+			if err == io.EOF {
+				return total, nil
+			}
+			return total, err
+		}
+		// n == 0, err == nil: exit chunk loop and copy rest
+		break
+	}
+	copied, err := io.Copy(local, stream)
+	return total + copied, err
+}
+
 func handle(local *net.TCPConn, sm *sessionManager) error {
 	stream, conv, err := sm.openStream()
 	if err != nil {
 		return fmt.Errorf("opening stream: %v", err)
 	}
 	defer func() {
-		log.Printf("end stream %08x:%d", conv, stream.ID())
+		log.Printf("connection closed: stream %08x:%d — ended", conv, stream.ID())
 		stream.Close()
 	}()
 	log.Printf("begin stream %08x:%d", conv, stream.ID())
@@ -410,26 +512,24 @@ func handle(local *net.TCPConn, sm *sessionManager) error {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, err := io.Copy(stream, local)
+		_, err := copyUpstreamWithLog(stream, local, conv, stream.ID())
 		if err == io.EOF {
 			// smux Stream.Write may return io.EOF.
 			err = nil
 		}
 		if err != nil && !errors.Is(err, io.ErrClosedPipe) {
-			log.Printf("stream %08x:%d copy stream←local: %v", conv, stream.ID(), err)
+			log.Printf("connection closed: stream %08x:%d — local→tunnel write failed: %v", conv, stream.ID(), err)
 		}
 		local.CloseRead()
-		stream.Close()
 	}()
 	go func() {
 		defer wg.Done()
-		_, err := io.Copy(local, stream)
+		_, err := copyDownstreamWithLog(local, stream, conv, stream.ID())
 		if err == io.EOF {
-			// smux Stream.WriteTo may return io.EOF.
 			err = nil
 		}
 		if err != nil && !errors.Is(err, io.ErrClosedPipe) {
-			log.Printf("stream %08x:%d copy local←stream: %v", conv, stream.ID(), err)
+			log.Printf("connection closed: stream %08x:%d — tunnel→local read failed (remote may have closed): %v", conv, stream.ID(), err)
 		}
 		local.CloseWrite()
 	}()
@@ -485,7 +585,7 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 	// Create session manager. Session (KCP + Noise + smux) is created lazily on
 	// first TCP connection via getSession(), so no handshake burst when no app is connected.
 	sm := newSessionManager(pubkey, domain, remoteAddr, pconn, mtu)
-	defer sm.closeSession()
+	defer sm.closeSession("tunnel shutting down")
 
 	if dpc, ok := pconn.(packetConnWithDone); ok {
 		// When pconn is closed (e.g. dnsConn.Close() in tests), exit so run() returns.
@@ -500,6 +600,7 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 				select {
 				case acceptCh <- local:
 				case <-dpc.Done():
+					log.Printf("connection closed: tunnel transport closed (rejecting new connection)")
 					local.Close()
 					close(acceptCh)
 					return
