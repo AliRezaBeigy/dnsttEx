@@ -76,8 +76,8 @@ func TestMain(m *testing.M) {
 	}
 
 	pairs := [][2]string{
-		{filepath.Join(dir, "dnstt-server"+ext), filepath.Join(root, "dnstt-server")},
-		{filepath.Join(dir, "dnstt-client"+ext), filepath.Join(root, "dnstt-client")},
+		{filepath.Join(dir, "dnsttEx-server"+ext), filepath.Join(root, "dnsttEx-server")},
+		{filepath.Join(dir, "dnsttEx-client"+ext), filepath.Join(root, "dnsttEx-client")},
 	}
 	for _, p := range pairs {
 		cmd := exec.Command("go", "build", "-o", p[0], p[1])

@@ -21,7 +21,7 @@ try {
     # Build test args
     $testArgs = @(
         "test", "-tags", "integration", "-v", "-timeout", "120s",
-        "./dnstt-server/", "./dnstt-client/", "./integration/",
+        "./dnsttEx-server/", "./dnsttEx-client/", "./integration/",
         "./dns/", "./noise/", "./turbotunnel/"
     )
     if ($Short) { $testArgs += "-short" }

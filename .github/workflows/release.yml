@@ -25,7 +25,7 @@ jobs:
 
       - name: Run tests
         run: |
-          go test -tags=integration -v -timeout 120s -short ./dnstt-server/ ./dnstt-client/ ./integration/ ./dns/ ./noise/ ./turbotunnel/
+          go test -tags=integration -v -timeout 120s -short ./dnsttEx-server/ ./dnsttEx-client/ ./integration/ ./dns/ ./noise/ ./turbotunnel/
 
   build:
     needs: test
@@ -79,8 +79,8 @@ jobs:
         shell: bash
         run: |
           mkdir -p build_assets
-          go build -o build_assets/dnsttEx-client-${{ env.ASSET_SUFFIX }}${{ env.EXE_EXT }} -ldflags="-s -w" ./dnstt-client
-          go build -o build_assets/dnsttEx-server-${{ env.ASSET_SUFFIX }}${{ env.EXE_EXT }} -ldflags="-s -w" ./dnstt-server
+          go build -o build_assets/dnsttEx-client-${{ env.ASSET_SUFFIX }}${{ env.EXE_EXT }} -ldflags="-s -w" ./dnsttEx-client
+          go build -o build_assets/dnsttEx-server-${{ env.ASSET_SUFFIX }}${{ env.EXE_EXT }} -ldflags="-s -w" ./dnsttEx-server
           if [ "${{ matrix.goos }}" != "windows" ]; then
             chmod +x build_assets/dnsttEx-client-${{ env.ASSET_SUFFIX }}${{ env.EXE_EXT }}
             chmod +x build_assets/dnsttEx-server-${{ env.ASSET_SUFFIX }}${{ env.EXE_EXT }}

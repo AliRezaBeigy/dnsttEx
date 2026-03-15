@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# ss-server -p 53 -k <password> --plugin dnstt-server-plugin --plugin-opts 'domain=<domain>;privkey=<privkey>'
+# ss-server -p 53 -k <password> --plugin dnsttEx-server-plugin --plugin-opts 'domain=<domain>;privkey=<privkey>'
 
-DNSTT_SERVER="./dnstt-server"
+DNSTT_SERVER="./dnsttEx-server"
 
 unset PRIVKEY DOMAIN MTU
 IFS=";" read -a OPTIONS <<<"$SS_PLUGIN_OPTIONS"

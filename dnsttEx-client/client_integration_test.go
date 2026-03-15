@@ -75,7 +75,7 @@ func TestSessionManagerNoDeadlock(t *testing.T) {
 		t.Fatal("goroutines did not finish within 5s after pconn.Close() — possible deadlock")
 	}
 
-	sm.closeSession()
+	sm.closeSession("test done")
 }
 
 // TestSessionManagerCloseSession verifies that closeSession clears all fields
@@ -94,8 +94,8 @@ func TestSessionManagerCloseSession(t *testing.T) {
 	sm := newSessionManager(pubkey, domain, turbotunnel.DummyAddr{}, pconn, mtu)
 
 	// closeSession on a manager with no session should not panic.
-	sm.closeSession()
-	sm.closeSession()
+	sm.closeSession("")
+	sm.closeSession("")
 
 	// Verify internal state is clean.
 	sm.mu.RLock()
@@ -262,7 +262,7 @@ func TestOpenStreamRecreatesSession(t *testing.T) {
 	defer dnsConn.Close()
 
 	sm := newSessionManager(pubkey, domain, turbotunnel.DummyAddr{}, dnsConn, mtu)
-	defer sm.closeSession()
+	defer sm.closeSession("test done")
 
 	// openStream will call getSession → createSession. The session will be
 	// created but the Noise handshake will never complete (nothing listening),

@@ -42,7 +42,7 @@ for os in ${OSES[@]}; do
 			env CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -v -ldflags "$LDFLAGS" -gcflags "$GCFLAGS" -o "$1${suffix}" "../$1"
 			$upx "$1${suffix}" >/dev/null
 			local archive_name="../bin/$1-plugin-${os}-${arch}-$VERSION.tar.gz"
-			if [[ "$1" == "dnstt-server" ]]; then
+			if [[ "$1" == "dnsttEx-server" ]]; then
 				tar -zcf "$archive_name" "$1${suffix}" -C ".." "$1-plugin"
 			else
 				tar -zcf "$archive_name" "$1${suffix}"
@@ -51,7 +51,7 @@ for os in ${OSES[@]}; do
 			popd
 			rm -rf build
 		}
-		build 'dnstt-client'
-		build 'dnstt-server'
+		build 'dnsttEx-client'
+		build 'dnsttEx-server'
 	done
 done

@@ -1,8 +1,8 @@
-dnstt-client/dnstt-client
-dnstt-server/dnstt-server
+dnsttEx-client/dnsttEx-client
+dnsttEx-server/dnsttEx-server
 
-/dnstt-client_*
-/dnstt-server_*
+/dnsttEx-client_*
+/dnsttEx-server_*
 /bin/
 /build/
 
