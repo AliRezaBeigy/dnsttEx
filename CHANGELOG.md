@@ -13,7 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`scan` subcommand (client)** — `dnstt-client scan -resolvers-file … -scan-checks N -scan-retry R DOMAIN out.txt` (or `-domain DOMAIN` with a single output path) probes each **UDP** resolver with the usual PING/PONG health check and writes passing lines to a file. `-scan-retry` retries failed checks before giving up on that round.
+- **`-send-parallel` (client)** — When using multiple resolvers, the same packet can be sent to N resolvers in parallel so at least one may succeed. Use `-send-parallel 3` (for example) with a resolver pool; the client builds one query (sized to the minimum MTU of the chosen resolvers) and sends it to that many endpoints at once. The send succeeds if any WriteTo succeeds. Default is 1 (single resolver per send). Sending the same tunnel data multiple times is safe; the server handles duplicates.
+
+- **`scan` subcommand (client)** — `dnstt-client scan -resolvers-file … -scan-checks N -scan-retry R DOMAIN out.txt` (or `-domain DOMAIN` with a single output path) probes each **UDP** resolver with the usual PING/PONG health check and writes passing lines to a file. `-scan-retry` retries failed checks before giving up on that round. Large IP lists use **bounded parallelism** (`-scan-parallel`, default 64) and **one UDP socket per probe** (not two × N at once), avoiding Windows bind failures (“buffer space / queue full”).
 
 - **SERVFAIL-aware resolver pool** — On **SERVFAIL** (rcode 2) for tunnel traffic, the client no longer burns NXDOMAIN retries on the same resolver; it notifies the pool (`ReportServfail`), triggers a poll, and lets KCP retransmit. Successful tunnel responses call `ConfirmDataPath`. Endpoints with repeated SERVFAIL are treated as **cold** for selection (similar to stale data-path), so traffic shifts toward resolvers that actually forward authoritative answers.
 

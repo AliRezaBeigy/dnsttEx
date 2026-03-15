@@ -131,7 +131,7 @@ func TestResolverPoolProbeRoundTrip(t *testing.T) {
 	probeBuilder := func() ([]byte, error) { return BuildProbeMessage(domain, probeID) }
 	probeVerify := func(b []byte) bool { return VerifyProbeResponse(b, domain) }
 
-	pool := NewResolverPool([]*poolEndpoint{ep}, "round-robin", probeBuilder, probeVerify)
+	pool := NewResolverPool([]*poolEndpoint{ep}, "round-robin", 1, probeBuilder, probeVerify)
 	defer pool.Close()
 
 	// Send probe via pool (traffic conn); response comes back on recvCh.
@@ -218,7 +218,7 @@ func TestResolverPoolHealthCheckMarksUnhealthy(t *testing.T) {
 	probeBuilder := func() ([]byte, error) { return BuildProbeMessage(domain, probeID) }
 	probeVerify := func(b []byte) bool { return VerifyProbeResponse(b, domain) }
 
-	pool := NewResolverPool([]*poolEndpoint{epA, epB}, "round-robin", probeBuilder, probeVerify)
+	pool := NewResolverPool([]*poolEndpoint{epA, epB}, "round-robin", 1, probeBuilder, probeVerify)
 	defer pool.Close()
 
 	// Wait for at least 2 health cycles so epB gets 2 timeouts and is marked unhealthy.
@@ -315,7 +315,7 @@ func TestResolverPoolDataPathSkipsUnresponsive(t *testing.T) {
 	probeBuilder := func() ([]byte, error) { return BuildProbeMessage(domain, probeID) }
 	probeVerify := func(b []byte) bool { return VerifyProbeResponse(b, domain) }
 
-	pool := NewResolverPool([]*poolEndpoint{epA, epB}, "round-robin", probeBuilder, probeVerify)
+	pool := NewResolverPool([]*poolEndpoint{epA, epB}, "round-robin", 1, probeBuilder, probeVerify)
 	defer pool.Close()
 
 	// Phase 1: Send queries and collect responses. During the data-path
@@ -440,7 +440,7 @@ func TestResolverPoolReprobeRecoversColdEndpoint(t *testing.T) {
 	probeBuilder := func() ([]byte, error) { return BuildProbeMessage(domain, probeID) }
 	probeVerify := func(b []byte) bool { return VerifyProbeResponse(b, domain) }
 
-	pool := NewResolverPool([]*poolEndpoint{epA, epB}, "round-robin", probeBuilder, probeVerify)
+	pool := NewResolverPool([]*poolEndpoint{epA, epB}, "round-robin", 1, probeBuilder, probeVerify)
 	defer pool.Close()
 
 	// Drain responses.

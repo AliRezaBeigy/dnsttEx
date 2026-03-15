@@ -173,14 +173,18 @@ type ResolverPool struct {
 	endpoints []*poolEndpoint
 	policy    string // "round-robin", "least-ping", "weighted-traffic"
 
+	// sendParallel is how many resolvers to use per send (1 = single resolver).
+	// When > 1, the same packet is sent to that many resolvers so at least one may succeed.
+	sendParallel int
+
 	// rrIndex is the next round-robin index; accessed atomically.
 	rrIndex uint64
 
-	// sendMu guards pendingSend. NextSendMTU picks an endpoint and stores it here;
-	// the next WriteTo sends to that same endpoint so the query (built with that
-	// endpoint's MTU) goes to the correct resolver.
-	sendMu      sync.Mutex
-	pendingSend *poolEndpoint
+	// sendMu guards pendingSends. NextSendMTU picks endpoint(s) and stores them here;
+	// the next WriteTo sends to those same endpoint(s) so the query (built with the
+	// minimum MTU of the chosen endpoints) goes to the correct resolver(s).
+	sendMu       sync.Mutex
+	pendingSends []*poolEndpoint
 
 	// reprobeIdx is the next round-robin index for re-probing cold (data-path
 	// unresponsive) endpoints; accessed atomically.
@@ -196,12 +200,18 @@ type ResolverPool struct {
 // probeBuilder/probeVerify are used only for UDP endpoints (DoH/DoT endpoints
 // cannot use a dedicated probe connection and are kept permanently healthy with
 // a startup warning).
-func NewResolverPool(endpoints []*poolEndpoint, policy string, probeBuilder func() ([]byte, error), probeVerify func([]byte) bool) *ResolverPool {
+// sendParallel is how many resolvers to use per send (1 = current behavior; >1 sends
+// the same packet to that many resolvers in parallel so at least one may succeed).
+func NewResolverPool(endpoints []*poolEndpoint, policy string, sendParallel int, probeBuilder func() ([]byte, error), probeVerify func([]byte) bool) *ResolverPool {
+	if sendParallel < 1 {
+		sendParallel = 1
+	}
 	rp := &ResolverPool{
-		endpoints: endpoints,
-		policy:    policy,
-		recvCh:    make(chan recvResult, recvChCap),
-		done:      make(chan struct{}),
+		endpoints:    endpoints,
+		policy:       policy,
+		sendParallel: sendParallel,
+		recvCh:       make(chan recvResult, recvChCap),
+		done:         make(chan struct{}),
 	}
 
 	// Mark all healthy at start; ranked=false until first RTT measurement.
@@ -440,26 +450,23 @@ func (rp *ResolverPool) probeEndpoint(ep *poolEndpoint, probeBuilder func() ([]b
 	}
 }
 
-// pickEndpoint selects one endpoint by the configured policy.
-// Fix #7: rrIndex is updated atomically; the function only holds ep.mu briefly
-// via snapshot(), avoiding nested lock ordering issues.
-func (rp *ResolverPool) pickEndpoint() *poolEndpoint {
-	// Snapshot health state of all endpoints without holding any pool-level lock.
-	type epSnap struct {
-		ep      *poolEndpoint
-		healthy bool
-		ranked  bool
-		rtt     time.Duration
-		bytes   uint64
-	}
+// epSnap is a snapshot of an endpoint's health state (used by pickEndpoint and pickNEndpoints).
+type epSnap struct {
+	ep      *poolEndpoint
+	healthy bool
+	ranked  bool
+	rtt     time.Duration
+	bytes   uint64
+}
+
+// getCandidates returns healthy endpoints, filtered by data-path responsiveness
+// (responsive preferred; cold endpoints re-probed occasionally). Caller must not modify.
+func (rp *ResolverPool) getCandidates() []epSnap {
 	snaps := make([]epSnap, len(rp.endpoints))
 	for i, e := range rp.endpoints {
 		h, r, rtt := e.snapshot()
 		snaps[i] = epSnap{ep: e, healthy: h, ranked: r, rtt: rtt, bytes: e.bytesPassed.Load()}
 	}
-
-	// Build candidate list: only healthy endpoints. When none are healthy,
-	// return nil so we don't send to dead resolvers and burst the network.
 	candidates := snaps[:0:0]
 	for _, s := range snaps {
 		if s.healthy {
@@ -469,20 +476,12 @@ func (rp *ResolverPool) pickEndpoint() *poolEndpoint {
 	if len(candidates) == 0 {
 		return nil
 	}
-
-	// Data-path responsiveness: skip endpoints that haven't returned a DNS
-	// response within the response window. This avoids wasting queries on
-	// resolvers that pass health probes but don't forward tunnel traffic
-	// (e.g., ISP DNS interception with mixed backend resolvers).
 	respWindow := dataPathResponseWindow
 	if testHookDataPathResponseWindow != 0 {
 		respWindow = testHookDataPathResponseWindow
 	}
 	var responsive, cold []epSnap
 	for _, s := range candidates {
-		// An endpoint is "cold" if it hasn't responded recently OR if it
-		// has a SERVFAIL streak above the threshold (passes health probes
-		// but can't forward tunnel traffic).
 		last := s.ep.lastResponseTime.Load()
 		sfStreak := s.ep.servfailStreak.Load()
 		isCold := (last == 0 || time.Since(time.Unix(0, last)) >= respWindow) ||
@@ -497,17 +496,47 @@ func (rp *ResolverPool) pickEndpoint() *poolEndpoint {
 		queryNum := atomic.AddUint64(&rp.reprobeIdx, 1)
 		if queryNum%uint64(reprobeEvery) == 0 {
 			coldIdx := (queryNum / uint64(reprobeEvery)) % uint64(len(cold))
-			return cold[coldIdx].ep
+			return []epSnap{cold[coldIdx]}
 		}
-		candidates = responsive
+		return responsive
+	}
+	return candidates
+}
+
+// pickNEndpoints selects up to n endpoints for parallel send. Uses the same
+// candidate list as pickEndpoint but returns min(n, len(candidates)) in
+// round-robin order so the same packet can be sent to multiple resolvers.
+func (rp *ResolverPool) pickNEndpoints(n int) []*poolEndpoint {
+	candidates := rp.getCandidates()
+	if len(candidates) == 0 {
+		return nil
+	}
+	if n <= 0 {
+		n = 1
+	}
+	k := n
+	if k > len(candidates) {
+		k = len(candidates)
+	}
+	idx := atomic.AddUint64(&rp.rrIndex, uint64(k)) - uint64(k)
+	out := make([]*poolEndpoint, k)
+	for i := 0; i < k; i++ {
+		out[i] = candidates[(int(idx)+i)%len(candidates)].ep
+	}
+	return out
+}
+
+// pickEndpoint selects one endpoint by the configured policy.
+// Fix #7: rrIndex is updated atomically; the function only holds ep.mu briefly
+// via snapshot(), avoiding nested lock ordering issues.
+func (rp *ResolverPool) pickEndpoint() *poolEndpoint {
+	candidates := rp.getCandidates()
+	if len(candidates) == 0 {
+		return nil
 	}
 
 	switch rp.policy {
 	case "least-ping":
-		// Fix #6: treat unranked endpoints as a separate group. If any
-		// candidates are unranked, pick among them via round-robin so that
-		// all get a chance to accumulate an RTT measurement before we start
-		// preferring one over another.
 		var unranked []epSnap
 		for _, s := range candidates {
 			if !s.ranked {
@@ -527,13 +556,11 @@ func (rp *ResolverPool) pickEndpoint() *poolEndpoint {
 		return best.ep
 
 	case "weighted-traffic":
-		// Fix #2: compute total and walk using the same snapshot; no second Load().
 		var total uint64
 		for _, s := range candidates {
 			total += s.bytes
 		}
 		if total == 0 {
-			// No measurements yet: fall through to round-robin.
 			break
 		}
 		r := uint64(rand.Int63n(int64(total)))
@@ -547,8 +574,6 @@ func (rp *ResolverPool) pickEndpoint() *poolEndpoint {
 		return candidates[len(candidates)-1].ep
 	}
 
-	// round-robin (default and weighted-traffic fallback).
-	// Fix #7: atomic increment; no pool-level mutex needed.
 	idx := atomic.AddUint64(&rp.rrIndex, 1) - 1
 	return candidates[idx%uint64(len(candidates))].ep
 }
@@ -597,20 +622,43 @@ func (rp *ResolverPool) MinMaxRequestSize(defaultReq int) int {
 	return min
 }
 
-// NextSendMTU returns the max response size and max QNAME length for the endpoint
-// that will be used for the next WriteTo. The caller must build the query with
-// those limits (OPT Class = max response, QNAME length ≤ max request) and
-// then call WriteTo; the same endpoint will be used. Used so each resolver gets
-// queries sized to its own MTU and the server gets the correct response size.
+// NextSendMTU returns the max response size and max QNAME length for the
+// endpoint(s) that will be used for the next WriteTo. When sendParallel > 1,
+// returns the minimum MTU among the chosen endpoints so the same query can be
+// sent to all. The caller must build the query with those limits and then call
+// WriteTo; the same packet is sent to all chosen endpoint(s).
 func (rp *ResolverPool) NextSendMTU() (maxResponseSize, maxRequestSize int) {
 	rp.sendMu.Lock()
-	ep := rp.pickEndpoint()
-	if ep == nil {
+	var eps []*poolEndpoint
+	if rp.sendParallel > 1 {
+		eps = rp.pickNEndpoints(rp.sendParallel)
+	} else {
+		ep := rp.pickEndpoint()
+		if ep != nil {
+			eps = []*poolEndpoint{ep}
+		}
+	}
+	if len(eps) == 0 {
 		rp.sendMu.Unlock()
 		return 0, 0
 	}
-	rp.pendingSend = ep
-	maxResp, maxReq := ep.getMaxSizes()
+	rp.pendingSends = eps
+	maxResp, maxReq := 0, 0
+	for i, ep := range eps {
+		r, q := ep.getMaxSizes()
+		if r <= 0 {
+			r = 4096
+		}
+		if q <= 0 {
+			q = 4096
+		}
+		if i == 0 || r < maxResp {
+			maxResp = r
+		}
+		if i == 0 || q < maxReq {
+			maxReq = q
+		}
+	}
 	rp.sendMu.Unlock()
 	if maxResp <= 0 {
 		maxResp = 4096
@@ -621,21 +669,61 @@ func (rp *ResolverPool) NextSendMTU() (maxResponseSize, maxRequestSize int) {
 	return maxResp, maxReq
 }
 
-// WriteTo implements net.PacketConn. addr is ignored; the pool picks a resolver.
-// If NextSendMTU was called just before this, the same endpoint is used so the
-// query (built with that endpoint's MTU) is sent to the correct resolver.
+// WriteTo implements net.PacketConn. addr is ignored; the pool picks resolver(s).
+// If NextSendMTU was called just before this, the same endpoint(s) are used.
+// When sendParallel > 1, the same packet is sent to all chosen endpoints in
+// parallel; the send succeeds if at least one WriteTo succeeds.
 func (rp *ResolverPool) WriteTo(p []byte, addr net.Addr) (int, error) {
 	rp.sendMu.Lock()
-	ep := rp.pendingSend
-	rp.pendingSend = nil
-	if ep == nil {
-		ep = rp.pickEndpoint()
+	eps := rp.pendingSends
+	rp.pendingSends = nil
+	if len(eps) == 0 {
+		if rp.sendParallel > 1 {
+			eps = rp.pickNEndpoints(rp.sendParallel)
+		} else {
+			ep := rp.pickEndpoint()
+			if ep != nil {
+				eps = []*poolEndpoint{ep}
+			}
+		}
 	}
 	rp.sendMu.Unlock()
-	if ep == nil {
+	if len(eps) == 0 {
 		return 0, fmt.Errorf("resolverpool: no endpoints available")
 	}
-	return ep.conn.WriteTo(p, ep.addr)
+	if len(eps) == 1 {
+		return eps[0].conn.WriteTo(p, eps[0].addr)
+	}
+	// Send to all in parallel; succeed if at least one succeeds.
+	type result struct {
+		n   int
+		err error
+	}
+	results := make(chan result, len(eps))
+	for _, ep := range eps {
+		ep := ep
+		go func() {
+			n, err := ep.conn.WriteTo(p, ep.addr)
+			results <- result{n, err}
+		}()
+	}
+	var lastErr error
+	successN := 0
+	for i := 0; i < len(eps); i++ {
+		res := <-results
+		if res.err == nil {
+			successN = res.n
+		} else {
+			lastErr = res.err
+		}
+	}
+	if successN > 0 {
+		return successN, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("resolverpool: no endpoint succeeded")
+	}
+	return 0, lastErr
 }
 
 // ReadFrom implements net.PacketConn. It returns the next packet from any endpoint.

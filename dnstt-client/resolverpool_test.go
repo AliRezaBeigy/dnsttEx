@@ -75,7 +75,7 @@ func TestResolverPoolNextSendMTUWriteToSameEndpoint(t *testing.T) {
 	pool := NewResolverPool(
 		[]*poolEndpoint{ep0, ep1},
 		"round-robin",
-		nil, nil,
+		1, nil, nil,
 	)
 	defer pool.Close()
 
@@ -140,7 +140,7 @@ func TestResolverPoolWriteToWithoutNextSendMTU(t *testing.T) {
 	}
 	ep0.setMaxSizes(512, 512)
 
-	pool := NewResolverPool([]*poolEndpoint{ep0}, "round-robin", nil, nil)
+	pool := NewResolverPool([]*poolEndpoint{ep0}, "round-robin", 1, nil, nil)
 	defer pool.Close()
 
 	// No NextSendMTU call; WriteTo should still send (pick endpoint as usual).

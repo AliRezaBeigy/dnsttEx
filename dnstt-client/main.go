@@ -56,6 +56,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/hex"
 	"errors"
 	"flag"
@@ -68,6 +69,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"sync/atomic"
 	"time"
 
 	"dnsttEx/dns"
@@ -735,6 +737,106 @@ func resolverLineForScanOutput(udpAddr string) string {
 	return "udp:" + udpAddr
 }
 
+// scanUDPSingleConn runs PING/PONG against one UDP resolver using a single ephemeral
+// socket, then closes it. Used for bulk scan so we never open two sockets × N resolvers
+// at once (avoids Windows "buffer space / queue full" when scanning huge IP lists).
+func scanUDPSingleConn(udpAddrStr string, domain dns.Name, timeout time.Duration, checks, retriesPerCheck int, logName string) bool {
+	if checks < 1 {
+		checks = 1
+	}
+	if retriesPerCheck < 0 {
+		retriesPerCheck = 0
+	}
+	udpAddr, err := net.ResolveUDPAddr("udp", udpAddrStr)
+	if err != nil {
+		log.Printf("Scan: %s — resolve: %v", logName, err)
+		return false
+	}
+	lc := net.ListenConfig{Control: dialerControl}
+	probeConn, err := lc.ListenPacket(context.Background(), "udp", ":0")
+	if err != nil {
+		log.Printf("Scan: %s — open socket: %v", logName, err)
+		return false
+	}
+	defer probeConn.Close()
+
+	probeID := turbotunnel.NewClientID()
+	probeBuilder := func() ([]byte, error) { return BuildProbeMessage(domain, probeID) }
+	probeVerify := func(buf []byte) bool { return VerifyProbeResponse(buf, domain) }
+
+	for round := 0; round < checks; round++ {
+		roundOK := false
+		for attempt := 0; attempt <= retriesPerCheck; attempt++ {
+			if attempt > 0 {
+				log.Printf("Scan: %s — retry %d/%d (check %d/%d)", logName, attempt, retriesPerCheck, round+1, checks)
+			}
+			msg, err := probeBuilder()
+			if err != nil {
+				log.Printf("Scan: %s — PING build failed (check %d/%d): %v", logName, round+1, checks, err)
+				return false
+			}
+			probeConn.SetDeadline(time.Now().Add(timeout))
+			_, err = probeConn.WriteTo(msg, udpAddr)
+			if err != nil {
+				probeConn.SetDeadline(time.Time{})
+				log.Printf("Scan: %s — PING send failed (check %d/%d, attempt %d): %v", logName, round+1, checks, attempt+1, err)
+				if attempt == retriesPerCheck {
+					return false
+				}
+				continue
+			}
+			if checks == 1 && retriesPerCheck == 0 {
+				log.Printf("Scan: %s ← PING sent", logName)
+			} else {
+				log.Printf("Scan: %s ← PING sent (check %d/%d, attempt %d)", logName, round+1, checks, attempt+1)
+			}
+			if dnsttDebug() {
+				log.Printf("DNSTT_DEBUG: PING to %s (health probe, no requested payload size)", logName)
+				log.Printf("DNSTT_DEBUG: PING query (hex):\n%s", dnsttDebugHexDump(msg, 0))
+			}
+			buf := make([]byte, 4096)
+			n, _, err := probeConn.ReadFrom(buf)
+			probeConn.SetDeadline(time.Time{})
+			if err != nil {
+				log.Printf("Scan: %s — no PONG (check %d/%d, attempt %d: %v)", logName, round+1, checks, attempt+1, err)
+				if attempt == retriesPerCheck {
+					return false
+				}
+				continue
+			}
+			if dnsttDebug() {
+				log.Printf("DNSTT_DEBUG: PONG response (hex):\n%s", dnsttDebugHexDump(buf[:n], 0))
+			}
+			if !probeVerify(buf[:n]) {
+				log.Printf("Scan: %s → bad response (check %d/%d, attempt %d): %s", logName, round+1, checks, attempt+1, ExplainProbeResponseFailure(buf[:n], domain))
+				if attempt == retriesPerCheck {
+					return false
+				}
+				continue
+			}
+			payloadLen := 0
+			if resp, err := dns.MessageFromWireFormat(buf[:n]); err == nil {
+				payload := dnsResponsePayload(&resp, domain)
+				payloadLen = len(payload)
+			}
+			if checks == 1 && retriesPerCheck == 0 {
+				log.Printf("Scan: %s → PONG received (%d bytes)", logName, payloadLen)
+			} else {
+				log.Printf("Scan: %s → PONG received (check %d/%d, attempt %d, %d bytes)", logName, round+1, checks, attempt+1, payloadLen)
+			}
+			if dnsttDebug() {
+				log.Printf("DNSTT_DEBUG: PONG from %s payload %d bytes (health probe)", logName, payloadLen)
+			}
+			roundOK = true
+			break
+		}
+		if !roundOK {
+			return false
+		}
+	}
+	return true
+}
+
 // mtuProbe represents a single MTU probe (server response size or client request size).
 type mtuProbe struct {
 	msg          []byte
@@ -1064,6 +1166,9 @@ func main() {
 			"uTLS distribution for DoH/DoT")
 		scanFS.IntVar(&scanChecks, "scan-checks", 1, "PING/PONG rounds per resolver; all must succeed")
 		scanFS.IntVar(&scanRetry, "scan-retry", 0, "extra attempts per check after failure (0 = no retry)")
+		var scanParallel int
+		scanFS.IntVar(&scanParallel, "scan-parallel", 64,
+			"max concurrent UDP probes (lower if bind fails: buffer space / queue full on Windows)")
 		scanFS.Usage = func() {
 			fmt.Fprintf(scanFS.Output(), `Usage:
   %[1]s scan [flags] DOMAIN OUTPUT.txt
@@ -1072,6 +1177,7 @@ func main() {
   DOMAIN is your dnstt tunnel zone. Only resolvers that reach the dnstt server answer PONG.
 
   OUTPUT.txt: one passing UDP resolver per line (bare IP when port is 53).
+  Large lists use -scan-parallel (default 64) so the OS is not flooded with sockets.
 
 Examples:
   %[1]s scan -resolvers-file dns.txt -scan-checks 3 -scan-retry 2 t.example.com out.txt
@@ -1140,46 +1246,67 @@ Examples:
 		if scanRetry > 10 {
 			scanRetry = 10
 		}
+		if scanParallel < 1 {
+			scanParallel = 1
+		}
+		if scanParallel > 512 {
+			scanParallel = 512
+		}
 
-		utlsID, err := sampleUTLSDistribution(scanUtls)
-		if err != nil {
+		if _, err := sampleUTLSDistribution(scanUtls); err != nil {
 			fmt.Fprintf(os.Stderr, "scan: -utls: %v\n", err)
 			os.Exit(1)
 		}
 
 		log.SetFlags(log.LstdFlags | log.LUTC)
-		endpoints := make([]*poolEndpoint, 0, len(specs))
+
+		var udpSpecs []resolverSpec
+		var otherSpecs []resolverSpec
+		seenAddr := make(map[string]bool)
 		for _, spec := range specs {
-			ep, _, err := buildEndpointFromSpec(spec, utlsID)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "scan: resolver %s %s: %v\n", spec.typ, spec.addr, err)
-				os.Exit(1)
+			if spec.typ != "udp" {
+				otherSpecs = append(otherSpecs, spec)
+				continue
 			}
-			endpoints = append(endpoints, ep)
+			if seenAddr[spec.addr] {
+				continue
+			}
+			seenAddr[spec.addr] = true
+			udpSpecs = append(udpSpecs, spec)
 		}
 
-		nUDP := 0
-		for _, ep := range endpoints {
-			if ep.probeConn != nil {
-				nUDP++
-			}
-		}
-		log.Printf("Scan: sending PING to %d resolver(s) (%d UDP, %d check(s) each, up to %d retries per check)",
-			len(endpoints), nUDP, scanChecks, scanRetry)
-		passed := scanResolvers(endpoints, domain, 8*time.Second, scanChecks, scanRetry)
-
+		timeout := 8 * time.Second
 		var lines []string
-		seen := make(map[string]bool)
-		for _, ep := range passed {
-			if ep.probeConn == nil {
-				continue
-			}
-			line := resolverLineForScanOutput(ep.name)
-			if seen[line] {
-				continue
-			}
-			seen[line] = true
-			lines = append(lines, line)
+		var linesMu sync.Mutex
+		sem := make(chan struct{}, scanParallel)
+		var wg sync.WaitGroup
+		var doneUDP atomic.Uint64
+
+		log.Printf("Scan: %d UDP resolver(s), %d parallel, %d check(s) each, up to %d retries per check",
+			len(udpSpecs), scanParallel, scanChecks, scanRetry)
+
+		for _, spec := range udpSpecs {
+			spec := spec
+			wg.Add(1)
+			sem <- struct{}{}
+			go func() {
+				defer func() { <-sem; wg.Done() }()
+				if scanUDPSingleConn(spec.addr, domain, timeout, scanChecks, scanRetry, "udp "+spec.addr) {
+					line := resolverLineForScanOutput(spec.addr)
+					linesMu.Lock()
+					lines = append(lines, line)
+					linesMu.Unlock()
+				}
+				n := doneUDP.Add(1)
+				if n%500 == 0 || n == uint64(len(udpSpecs)) {
+					log.Printf("Scan: progress %d/%d UDP", n, len(udpSpecs))
+				}
+			}()
+		}
+		wg.Wait()
+
+		if len(otherSpecs) > 0 {
+			log.Printf("Scan: ignoring %d DoH/DoT resolver(s) (output file is UDP PONG only)", len(otherSpecs))
 		}
 
 		out, err := os.Create(outPath)
@@ -1195,13 +1322,7 @@ Examples:
 			os.Exit(1)
 		}
 
-		for _, ep := range endpoints {
-			ep.conn.Close()
-			if ep.probeConn != nil {
-				ep.probeConn.Close()
-			}
-		}
-		log.Printf("Scan: wrote %d resolver(s) with PONG to %q (%d/%d UDP tried)", len(lines), outPath, len(lines), nUDP)
+		log.Printf("Scan: wrote %d resolver(s) with PONG to %q (%d/%d UDP tried)", len(lines), outPath, len(lines), len(udpSpecs))
 		os.Exit(0)
 	}
 
@@ -1262,6 +1383,9 @@ Known TLS fingerprints for -utls are:
 		"choose TLS fingerprint from weighted distribution")
 	flag.StringVar(&resolverPolicy, "resolver-policy", "round-robin",
 		"resolver selection policy when multiple resolvers are used: round-robin, least-ping, weighted-traffic")
+	var sendParallel int
+	flag.IntVar(&sendParallel, "send-parallel", 1,
+		"number of resolvers to use per send (same packet sent to each); at least one success counts as success (default 1)")
 	flag.BoolVar(&doScan, "scan", false,
 		"pre-start scan: test each resolver and keep only those that receive a valid server response")
 	flag.IntVar(&scanChecks, "scan-checks", 1,
@@ -1462,15 +1586,18 @@ Known TLS fingerprints for -utls are:
 		remoteAddr = endpoints[0].addr
 	} else {
 		// Multiple resolvers: wrap in ResolverPool.
+		if sendParallel < 1 {
+			sendParallel = 1
+		}
 		probeID := turbotunnel.NewClientID()
 		probeBuilder := func() ([]byte, error) { return BuildProbeMessage(domain, probeID) }
 		probeVerify := func(buf []byte) bool { return VerifyProbeResponse(buf, domain) }
-		pool := NewResolverPool(endpoints, resolverPolicy, probeBuilder, probeVerify)
+		pool := NewResolverPool(endpoints, resolverPolicy, sendParallel, probeBuilder, probeVerify)
 		pconn = pool
 		remoteAddr = turbotunnel.DummyAddr{}
 		effectiveMaxResponse = pool.MinMaxResponseSize(4096)
 		effectiveMaxRequest = pool.MinMaxRequestSize(0)
-		log.Printf("Using %d resolver(s), policy: %q", len(endpoints), resolverPolicy)
+		log.Printf("Using %d resolver(s), policy: %q, send-parallel: %d", len(endpoints), resolverPolicy, sendParallel)
 	}
 	if clientMTUFlag > 0 && (effectiveMaxRequest <= 0 || clientMTUFlag < effectiveMaxRequest) {
 		effectiveMaxRequest = clientMTUFlag
