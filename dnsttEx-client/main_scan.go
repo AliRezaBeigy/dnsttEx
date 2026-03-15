@@ -6,12 +6,14 @@ package main
 import (
 	"bufio"
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"dnsttEx/dns"
@@ -488,4 +490,184 @@ func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration, clien
 
 	ep.setMaxSizes(serverMTU, clientMTU)
 	log.Printf("MTU discovery: %s → max response wire %d bytes, max query QNAME %d bytes", ep.name, serverMTU, clientMTU)
+}
+
+// RunScanCommand runs the standalone "scan" subcommand (args = os.Args[2:]).
+// Returns exit code: 0 success, 1 usage/validation error, 2 flag parse error.
+func RunScanCommand(scanArgs []string) int {
+	scanFS := flag.NewFlagSet("scan", flag.ExitOnError)
+	scanFS.SetOutput(os.Stderr)
+	var scanDoh, scanDot, scanUdp stringSliceFlag
+	var scanResolverFiles stringSliceFlag
+	var scanUtls string
+	var scanChecks, scanRetry int
+	var scanDomain string
+	scanFS.Var(&scanDoh, "doh", "DoH resolver URL (repeatable)")
+	scanFS.Var(&scanDot, "dot", "DoT resolver address (repeatable)")
+	scanFS.Var(&scanUdp, "udp", "UDP resolver host:port (repeatable)")
+	scanFS.Var(&scanResolverFiles, "resolvers-file", "resolvers file (repeatable); same format as main client")
+	scanFS.StringVar(&scanDomain, "domain", "", "tunnel DNS zone (required if only OUTPUT.txt is given as argument)")
+	scanFS.StringVar(&scanUtls, "utls",
+		"4*random,3*Firefox_120,1*Firefox_105,3*Chrome_120,1*Chrome_102,1*iOS_14,1*iOS_13",
+		"uTLS distribution for DoH/DoT")
+	scanFS.IntVar(&scanChecks, "scan-checks", 1, "PING/PONG rounds per resolver; all must succeed")
+	scanFS.IntVar(&scanRetry, "scan-retry", 0, "extra attempts per check after failure (0 = no retry)")
+	var scanParallel int
+	scanFS.IntVar(&scanParallel, "scan-parallel", 64,
+		"max concurrent UDP probes (lower if bind fails: buffer space / queue full on Windows)")
+	scanFS.Usage = func() {
+		fmt.Fprintf(scanFS.Output(), `Usage:
+  %[1]s scan [flags] DOMAIN OUTPUT.txt
+  %[1]s scan [flags] -domain DOMAIN OUTPUT.txt
+
+  DOMAIN is your dnstt tunnel zone. Only resolvers that reach the dnstt server answer PONG.
+
+  OUTPUT.txt: one passing UDP resolver per line (bare IP when port is 53).
+  Large lists use -scan-parallel (default 64) so the OS is not flooded with sockets.
+
+Examples:
+  %[1]s scan -resolvers-file dns.txt -scan-checks 3 -scan-retry 2 t.example.com out.txt
+  %[1]s scan -resolvers-file dns.txt -domain t.example.com -scan-checks 3 -scan-retry 2 out.txt
+
+`, os.Args[0])
+		scanFS.PrintDefaults()
+	}
+	if err := scanFS.Parse(scanArgs); err != nil {
+		return 2
+	}
+	var domainStr, outPath string
+	switch scanFS.NArg() {
+	case 1:
+		if scanDomain == "" {
+			fmt.Fprintf(os.Stderr, "scan: give DOMAIN OUTPUT.txt, or -domain DOMAIN and OUTPUT.txt\n")
+			scanFS.Usage()
+			return 1
+		}
+		domainStr = scanDomain
+		outPath = scanFS.Arg(0)
+	case 2:
+		domainStr = scanFS.Arg(0)
+		outPath = scanFS.Arg(1)
+	default:
+		scanFS.Usage()
+		return 1
+	}
+	domain, err := dns.ParseName(domainStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid domain %q: %v\n", domainStr, err)
+		return 1
+	}
+
+	var specs []resolverSpec
+	for _, u := range scanDoh {
+		specs = append(specs, resolverSpec{typ: "doh", addr: u})
+	}
+	for _, a := range scanDot {
+		specs = append(specs, resolverSpec{typ: "dot", addr: a})
+	}
+	for _, a := range scanUdp {
+		specs = append(specs, resolverSpec{typ: "udp", addr: a})
+	}
+	for _, path := range scanResolverFiles {
+		fileSpecs, err := parseResolversFile(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "reading resolvers file %q: %v\n", path, err)
+			return 1
+		}
+		specs = append(specs, fileSpecs...)
+	}
+	if len(specs) == 0 {
+		fmt.Fprintf(os.Stderr, "scan: give at least one of -resolvers-file, -udp, -doh, -dot\n")
+		return 1
+	}
+	if scanChecks < 1 {
+		scanChecks = 1
+	}
+	if scanChecks > 20 {
+		scanChecks = 20
+	}
+	if scanRetry < 0 {
+		scanRetry = 0
+	}
+	if scanRetry > 10 {
+		scanRetry = 10
+	}
+	if scanParallel < 1 {
+		scanParallel = 1
+	}
+	if scanParallel > 512 {
+		scanParallel = 512
+	}
+
+	if _, err := sampleUTLSDistribution(scanUtls); err != nil {
+		fmt.Fprintf(os.Stderr, "scan: -utls: %v\n", err)
+		return 1
+	}
+
+	log.SetFlags(log.LstdFlags | log.LUTC)
+
+	var udpSpecs []resolverSpec
+	var otherSpecs []resolverSpec
+	seenAddr := make(map[string]bool)
+	for _, spec := range specs {
+		if spec.typ != "udp" {
+			otherSpecs = append(otherSpecs, spec)
+			continue
+		}
+		if seenAddr[spec.addr] {
+			continue
+		}
+		seenAddr[spec.addr] = true
+		udpSpecs = append(udpSpecs, spec)
+	}
+
+	timeout := 8 * time.Second
+	var lines []string
+	var linesMu sync.Mutex
+	sem := make(chan struct{}, scanParallel)
+	var wg sync.WaitGroup
+	var doneUDP atomic.Uint64
+
+	log.Printf("Scan: %d UDP resolver(s), %d parallel, %d check(s) each, up to %d retries per check",
+		len(udpSpecs), scanParallel, scanChecks, scanRetry)
+
+	for _, spec := range udpSpecs {
+		spec := spec
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer func() { <-sem; wg.Done() }()
+			if scanUDPSingleConn(spec.addr, domain, timeout, scanChecks, scanRetry, "udp "+spec.addr) {
+				line := resolverLineForScanOutput(spec.addr)
+				linesMu.Lock()
+				lines = append(lines, line)
+				linesMu.Unlock()
+			}
+			n := doneUDP.Add(1)
+			if n%500 == 0 || n == uint64(len(udpSpecs)) {
+				log.Printf("Scan: progress %d/%d UDP", n, len(udpSpecs))
+			}
+		}()
+	}
+	wg.Wait()
+
+	if len(otherSpecs) > 0 {
+		log.Printf("Scan: ignoring %d DoH/DoT resolver(s) (output file is UDP PONG only)", len(otherSpecs))
+	}
+
+	out, err := os.Create(outPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "scan: create output %q: %v\n", outPath, err)
+		return 1
+	}
+	for _, line := range lines {
+		fmt.Fprintln(out, line)
+	}
+	if err := out.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "scan: close output: %v\n", err)
+		return 1
+	}
+
+	log.Printf("Scan: wrote %d resolver(s) with PONG to %q (%d/%d UDP tried)", len(lines), outPath, len(lines), len(udpSpecs))
+	return 0
 }
