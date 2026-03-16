@@ -89,8 +89,8 @@ func runTunnel(
 			kept = append(kept, ep)
 			continue
 		}
-		maxResp, _ := ep.getMaxSizes()
-		if maxResp > 0 {
+		maxResp, maxReq := ep.getMaxSizes()
+		if maxResp > 0 && maxReq > 0 {
 			kept = append(kept, ep)
 			continue
 		}
