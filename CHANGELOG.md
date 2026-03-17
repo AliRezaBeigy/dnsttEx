@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.3] - 2026-03-16
+
 ### Changed
 
 - **Client MTU is QNAME length, not UDP payload** — `-mtu` and per-resolver client MTU discovery now limit the **question name wire size** (RFC 1035 QNAME, max 255 octets), matching common DPI behavior. Payload sizing, probes, and sends cap by QNAME; full DNS message size may still be larger (header, OPT, etc.). Discovery log reports `max query QNAME N bytes`. **Breaking:** manual `-mtu` values tied to old full-wire sizes (e.g. 280) must be replaced with a QNAME limit (≤ 255).
@@ -127,8 +129,9 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.3.2...HEAD
-[1.3.1]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.3.1...v1.3.2
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.3.3...HEAD
+[1.3.3]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.3.2...v1.3.3
+[1.3.2]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.3.1...v1.3.2
 [1.3.1]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.2.0...v1.2.1
