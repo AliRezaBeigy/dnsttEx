@@ -18,9 +18,10 @@ const (
 	idleTimeout = 2 * time.Minute
 	// mtuProbeNXDOMAINRetries: when request-size MTU probe gets NXDOMAIN, retry this many times before giving up.
 	mtuProbeNXDOMAINRetries = 3
-	// mtuProbeErrorRetries: when an MTU probe times out or hits a transient read/write
-	// error, retry it this many times before treating that size as failed.
-	mtuProbeErrorRetries = 2
+	// mtuProbeSuccessesRequired: a candidate size is accepted only after this many successful probe exchanges.
+	mtuProbeSuccessesRequired = 3
+	// mtuProbeAfterTimeoutRetries: per trial, after a read timeout, repeat send+read this many extra times (1 = one retry).
+	mtuProbeAfterTimeoutRetries = 1
 	// minKCPMTU is the minimum MTU KCP accepts (IKCP_OVERHEAD+1 = 13).
 	// Low-MTU DNS paths (e.g. 128-byte requests) need MTU as low as ~42
 	// so each KCP segment fits inside one DNS query.

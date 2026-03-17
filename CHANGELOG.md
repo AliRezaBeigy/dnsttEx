@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **MTU discovery stricter and more resilient** — Each candidate response/QNAME size must succeed **three** consecutive probe exchanges before it is accepted. After a **read timeout**, the client retries that trial **once** (extra send/read). Discovery still picks the largest working server response size and largest working QNAME by probing sizes in descending order.
+
 - **`internal/kcp` rebased on xtaci/kcp-go v5.6.71** — Vendored KCP stack updated from upstream; brings current session layer, ring buffers, scheduling, and related fixes while keeping dnstt-specific behavior.
 
 ## [1.4.0] - 2026-03-17
@@ -20,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Client-side SOCKS tunnel mode (`-tunnel socks`)** — The client runs a SOCKS5 server and sends the destination per stream; the server dials the requested target directly to reduce extra SOCKS/SSH handshakes crossing the DNS tunnel.
 
-## [1.3.3] - 2026-03-16
+## [1.3.3] - 2026-03-15
 
 ### Changed
 
