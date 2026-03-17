@@ -503,6 +503,21 @@ func (s *UDPSession) SetWindowSize(sndwnd, rcvwnd int) {
 	s.mu.Unlock()
 }
 
+// SetMinRTO sets the minimum retransmission timeout (RTO) in milliseconds.
+func (s *UDPSession) SetMinRTO(ms uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if ms > IKCP_RTO_MAX {
+		ms = IKCP_RTO_MAX
+	}
+
+	s.kcp.rx_minrto = ms
+	if s.kcp.rx_rto < s.kcp.rx_minrto {
+		s.kcp.rx_rto = s.kcp.rx_minrto
+	}
+}
+
 // SetMtu sets the maximum transmission unit(not including UDP header)
 func (s *UDPSession) SetMtu(mtu int) bool {
 	mtu = min(mtuLimit, mtu)
@@ -998,6 +1013,23 @@ func (s *UDPSession) kcpInput(data []byte) {
 	atomic.AddUint64(&DefaultSnmp.InPkts, 1)
 	atomic.AddUint64(&DefaultSnmp.InBytes, uint64(len(data)))
 
+	// Without FEC, wire is compact KCP only; bytes [4:6] are timestamp, not FEC type 0xf1/f2/f3.
+	if s.fecEncoder == nil {
+		s.mu.Lock()
+		if ret := s.kcp.Input(data, IKCP_PACKET_REGULAR, s.ackNoDelay); ret != 0 {
+			atomic.AddUint64(&DefaultSnmp.KCPInErrors, 1)
+		}
+		if n := s.kcp.PeekSize(); n > 0 {
+			s.notifyReadEvent()
+		}
+		waitsnd := s.kcp.WaitSnd()
+		if waitsnd < int(s.kcp.snd_wnd) {
+			s.notifyWriteEvent()
+		}
+		s.mu.Unlock()
+		return
+	}
+
 	// 16bit kcp cmd [81-84] and frg [0-255] will not overlap with FEC type 0x00f1 0x00f2
 	fecFlag := binary.LittleEndian.Uint16(data[4:])
 
@@ -1165,6 +1197,38 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 		return
 	}
 
+	// dnstt uses FEC off: compact KCP only. [4:6] is ts — must not demux as FEC type.
+	if l.dataShards == 0 && l.parityShards == 0 {
+		if len(data) < IKCP_OVERHEAD {
+			return
+		}
+		conv := uint32(binary.LittleEndian.Uint16(data))
+		sn := uint32(binary.LittleEndian.Uint16(data[IKCP_SN_OFFSET:]))
+		l.sessionLock.RLock()
+		s, exist := l.sessions[addr.String()]
+		l.sessionLock.RUnlock()
+		if exist {
+			if conv == s.kcp.conv {
+				s.kcpInput(data)
+				return
+			}
+			if sn != 0 {
+				return
+			}
+			s.Close()
+		}
+		if len(l.chAccepts) >= cap(l.chAccepts) {
+			return
+		}
+		s = newUDPSession(conv, l.dataShards, l.parityShards, l, l.conn, false, addr, l.block)
+		s.kcpInput(data)
+		l.sessionLock.Lock()
+		l.sessions[addr.String()] = s
+		l.sessionLock.Unlock()
+		l.chAccepts <- s
+		return
+	}
+
 	// look for existing session
 	l.sessionLock.RLock()
 	s, exist := l.sessions[addr.String()]
@@ -1185,8 +1249,8 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 		}
 
 		hasConv = true
-		conv = binary.LittleEndian.Uint32(data[fecHeaderSizePlus2:])
-		sn = binary.LittleEndian.Uint32(data[fecHeaderSizePlus2+IKCP_SN_OFFSET:])
+		conv = uint32(binary.LittleEndian.Uint16(data[fecHeaderSizePlus2:]))
+		sn = uint32(binary.LittleEndian.Uint16(data[fecHeaderSizePlus2+IKCP_SN_OFFSET:]))
 	case typeParity:
 		// parity packet of FEC, conversation id inside
 	case typeOOB:
@@ -1200,8 +1264,8 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 			return
 		}
 		hasConv = true
-		conv = binary.LittleEndian.Uint32(data)
-		sn = binary.LittleEndian.Uint32(data[IKCP_SN_OFFSET:])
+		conv = uint32(binary.LittleEndian.Uint16(data))
+		sn = uint32(binary.LittleEndian.Uint16(data[IKCP_SN_OFFSET:]))
 	}
 
 	// on an existing connection
@@ -1488,10 +1552,18 @@ func NewConn3(convid uint32, raddr net.Addr, block BlockCrypt, dataShards, parit
 }
 
 // NewConn2 establishes a session and talks KCP protocol over a packet connection.
+// Conversation ID is 16-bit on the wire (compact KCP); use a non-zero random low 16 bits.
 func NewConn2(raddr net.Addr, block BlockCrypt, dataShards, parityShards int, conn net.PacketConn) (*UDPSession, error) {
-	var convid uint32
-	binary.Read(rand.Reader, binary.LittleEndian, &convid)
-	return NewConn3(convid, raddr, block, dataShards, parityShards, conn)
+	var b [2]byte
+	for {
+		if _, err := rand.Read(b[:]); err != nil {
+			return nil, errors.WithStack(err)
+		}
+		convid := uint32(binary.LittleEndian.Uint16(b[:]))
+		if convid != 0 {
+			return NewConn3(convid, raddr, block, dataShards, parityShards, conn)
+		}
+	}
 }
 
 // NewConn establishes a session and talks KCP protocol over a packet connection.

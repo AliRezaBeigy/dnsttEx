@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-03-17
+
+### Changed
+
+- **`internal/kcp` rebased on xtaci/kcp-go v5.6.71** — Vendored KCP stack updated from upstream; brings current session layer, ring buffers, scheduling, and related fixes while keeping dnstt-specific behavior.
+
 ## [1.4.0] - 2026-03-17
 ### Changed
 - **Default tunnel mode is SOCKS** — Client and server default `-tunnel` to `socks` instead of `tcp`.
@@ -136,8 +142,9 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.4.0...HEAD
-[1.3.3]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.3.3...v1.4.0
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.4.1...HEAD
+[1.4.1]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.4.0...v1.4.1
+[1.4.0]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.3.3...v1.4.0
 [1.3.3]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.3.2...v1.3.3
 [1.3.2]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.3.1...v1.3.2
 [1.3.1]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.3.0...v1.3.1

@@ -52,16 +52,18 @@ const (
 	IKCP_WND_RCV = 32   // default receive window size (packets)
 	IKCP_MTU_DEF = 1400 // default MTU (bytes, not including UDP/IP header)
 
-	// Protocol parameters
+	// Compact wire format for DNS-sized paths (dnstt):
+	// conv(2) + cmd/frg(1) + wnd(1) + ts(2) + sn(2) + una(2) + len(2) = 12 bytes.
+	// Wire conv is 16 bits; use matching low 16 bits on both peers (see NewConn2).
 	IKCP_ACK_FAST    = 3      // fast retransmit trigger threshold (duplicate ACK count)
 	IKCP_INTERVAL    = 100    // default flush interval (ms)
-	IKCP_OVERHEAD    = 24     // per-segment header size: conv(4) + cmd(1) + frg(1) + wnd(2) + ts(4) + sn(4) + una(4) + len(4)
+	IKCP_OVERHEAD    = 12
 	IKCP_DEADLINK    = 20     // max retransmissions before declaring dead link
 	IKCP_THRESH_INIT = 2      // initial slow-start threshold (packets)
 	IKCP_THRESH_MIN  = 2      // minimum slow-start threshold (packets)
 	IKCP_PROBE_INIT  = 500    // initial window probe timeout (ms)
 	IKCP_PROBE_LIMIT = 120000 // maximum window probe timeout (ms), 120 seconds
-	IKCP_SN_OFFSET   = 12     // byte offset of sequence number (sn) within the segment header
+	IKCP_SN_OFFSET   = 6      // byte offset of sequence number (sn) within the segment header
 )
 
 type PacketType int8
@@ -134,17 +136,15 @@ type segment struct {
 	data     []byte
 }
 
-// encode a segment header into buffer
+// encode a segment header (compact 12-byte dnstt layout).
 func (seg *segment) encode(ptr []byte) []byte {
-	_ = ptr[IKCP_OVERHEAD-1] // BCE hint
-	binary.LittleEndian.PutUint32(ptr, seg.conv)
-	ptr[4] = seg.cmd
-	ptr[5] = seg.frg
-	binary.LittleEndian.PutUint16(ptr[6:], seg.wnd)
-	binary.LittleEndian.PutUint32(ptr[8:], seg.ts)
-	binary.LittleEndian.PutUint32(ptr[12:], seg.sn)
-	binary.LittleEndian.PutUint32(ptr[16:], seg.una)
-	binary.LittleEndian.PutUint32(ptr[20:], uint32(len(seg.data)))
+	binary.LittleEndian.PutUint16(ptr, uint16(seg.conv&0xFFFF))
+	ptr[2] = uint8((seg.cmd-81)<<6) | (seg.frg & 0x3F)
+	ptr[3] = byte(min(uint32(seg.wnd), 255))
+	binary.LittleEndian.PutUint16(ptr[4:], uint16(seg.ts&0xFFFF))
+	binary.LittleEndian.PutUint16(ptr[6:], uint16(seg.sn&0xFFFF))
+	binary.LittleEndian.PutUint16(ptr[8:], uint16(seg.una&0xFFFF))
+	binary.LittleEndian.PutUint16(ptr[10:], uint16(len(seg.data)))
 	atomic.AddUint64(&DefaultSnmp.OutSegs, 1)
 	return ptr[IKCP_OVERHEAD:]
 }
@@ -425,6 +425,9 @@ func (kcp *KCP) Send(buffer []byte) int {
 	if count == 0 {
 		count = 1
 	}
+	if kcp.stream == 0 && count > 64 {
+		return -1
+	}
 
 	for i := 0; i < count; i++ {
 		var size int
@@ -606,21 +609,21 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 			break
 		}
 
-		_ = data[IKCP_OVERHEAD-1] // BCE hint
-		conv := binary.LittleEndian.Uint32(data)
-		cmd := data[4]
-		frg := data[5]
-		wnd := binary.LittleEndian.Uint16(data[6:])
-		ts := binary.LittleEndian.Uint32(data[8:])
-		sn := binary.LittleEndian.Uint32(data[12:])
-		una := binary.LittleEndian.Uint32(data[16:])
-		length := binary.LittleEndian.Uint32(data[20:])
-		data = data[IKCP_OVERHEAD:]
-
-		if conv != kcp.conv {
+		conv16 := binary.LittleEndian.Uint16(data)
+		if uint32(conv16) != (kcp.conv & 0xFFFF) {
 			return -1
 		}
+		cmdFrg := data[2]
+		cmd := (cmdFrg >> 6) + 81
+		frg := cmdFrg & 0x3F
+		wnd := uint16(data[3])
+		ts := uint32(binary.LittleEndian.Uint16(data[4:6]))
+		sn := uint32(binary.LittleEndian.Uint16(data[6:8]))
+		una := uint32(binary.LittleEndian.Uint16(data[8:10]))
+		length := uint32(binary.LittleEndian.Uint16(data[10:12]))
+		data = data[IKCP_OVERHEAD:]
 
+		conv := kcp.conv
 		kcp.debugLog(IKCP_LOG_INPUT, "conv", conv, "cmd", cmd, "frg", frg, "wnd", wnd, "ts", ts, "sn", sn, "una", una, "len", length, "datalen", len(data))
 
 		if len(data) < int(length) {
@@ -1076,9 +1079,9 @@ func (kcp *KCP) Check() uint32 {
 	return current + minimal
 }
 
-// SetMtu changes MTU size, default is 1400
+// SetMtu changes MTU size, default is 1400.
 func (kcp *KCP) SetMtu(mtu int) int {
-	if mtu < 50 || mtu < IKCP_OVERHEAD {
+	if mtu < int(IKCP_OVERHEAD)+1 {
 		return -1
 	}
 
