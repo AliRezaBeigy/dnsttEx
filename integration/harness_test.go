@@ -277,6 +277,7 @@ func newTunnelHarness(t testing.TB, serverBin, clientBin string, clientEnv map[s
 	h.serverCmd = exec.Command(serverBin,
 		"-udp", h.dnsUDPAddr,
 		"-privkey", h.privkeyHex,
+		"-tunnel", "tcp",
 		h.domain,
 		echoLn.Addr().String(),
 	)
@@ -298,6 +299,7 @@ func newTunnelHarness(t testing.TB, serverBin, clientBin string, clientEnv map[s
 	h.clientCmd = exec.Command(clientBin,
 		"-udp", clientResolverAddr,
 		"-pubkey", h.pubkeyHex,
+		"-tunnel", "tcp",
 		h.domain,
 		h.ClientAddr,
 	)
@@ -359,6 +361,7 @@ func newTunnelHarnessWithRelay(t testing.TB, serverBin, clientBin string) (*coun
 	h.serverCmd = exec.Command(serverBin,
 		"-udp", h.dnsUDPAddr,
 		"-privkey", h.privkeyHex,
+		"-tunnel", "tcp",
 		h.domain,
 		echoLn.Addr().String(),
 	)
@@ -384,6 +387,7 @@ func newTunnelHarnessWithRelay(t testing.TB, serverBin, clientBin string) (*coun
 	h.clientCmd = exec.Command(clientBin,
 		"-udp", relay.Addr(), // client → relay → server
 		"-pubkey", h.pubkeyHex,
+		"-tunnel", "tcp",
 		h.domain,
 		h.ClientAddr,
 	)
@@ -454,6 +458,7 @@ func newTunnelHarnessWithRelayAndStderr(t testing.TB, serverBin, clientBin strin
 	h.serverCmd = exec.Command(serverBin,
 		"-udp", h.dnsUDPAddr,
 		"-privkey", h.privkeyHex,
+		"-tunnel", "tcp",
 		h.domain,
 		echoLn.Addr().String(),
 	)
@@ -471,6 +476,7 @@ func newTunnelHarnessWithRelayAndStderr(t testing.TB, serverBin, clientBin strin
 	h.clientCmd = exec.Command(clientBin,
 		"-udp", relay.Addr(),
 		"-pubkey", h.pubkeyHex,
+		"-tunnel", "tcp",
 		h.domain,
 		h.ClientAddr,
 	)
@@ -568,6 +574,7 @@ func newTunnelHarnessWithRelayAndDNSLog(t testing.TB, serverBin, clientBin strin
 	h.serverCmd = exec.Command(serverBin,
 		"-udp", h.dnsUDPAddr,
 		"-privkey", h.privkeyHex,
+		"-tunnel", "tcp",
 		h.domain,
 		echoLn.Addr().String(),
 	)
@@ -592,6 +599,7 @@ func newTunnelHarnessWithRelayAndDNSLog(t testing.TB, serverBin, clientBin strin
 	h.clientCmd = exec.Command(clientBin,
 		"-udp", relay.Addr(),
 		"-pubkey", h.pubkeyHex,
+		"-tunnel", "tcp",
 		h.domain,
 		h.ClientAddr,
 	)
@@ -607,6 +615,15 @@ func newTunnelHarnessWithRelayAndDNSLog(t testing.TB, serverBin, clientBin strin
 		h.Teardown()
 	})
 	return relay, h
+}
+
+// EchoListenAddr returns the echo server address (127.0.0.1:port), for tests that
+// dial the final target (e.g. SOCKS tunnel mode).
+func (h *tunnelHarness) EchoListenAddr() string {
+	if h.echoLn == nil {
+		return ""
+	}
+	return h.echoLn.Addr().String()
 }
 
 // dialTunnel opens a TCP connection to the client's local listener.

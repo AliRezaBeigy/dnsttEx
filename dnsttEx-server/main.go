@@ -313,8 +313,9 @@ func handleStream(stream *smux.Stream, upstream string, conv uint32) error {
 }
 
 // acceptStreams wraps a KCP session in a Noise channel and an smux.Session,
-// then awaits smux streams. It passes each stream to handleStream.
-func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string) error {
+// then awaits smux streams. In tcp tunnel mode each stream is relayed to upstream;
+// in socks mode the client sends destination per stream (tunnelproto).
+func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string, socksTunnel bool) error {
 	// Put a Noise channel on top of the KCP conn.
 	rw, err := noise.NewServer(conn, privkey)
 	if err != nil {
@@ -347,9 +348,13 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string) error 
 				log.Printf("end stream %08x:%d", conn.GetConv(), stream.ID())
 				stream.Close()
 			}()
-			err := handleStream(stream, upstream, conn.GetConv())
-			if err != nil {
-				log.Printf("stream %08x:%d handleStream: %v", conn.GetConv(), stream.ID(), err)
+			if socksTunnel {
+				handleSocksRelay(stream, conn.GetConv())
+			} else {
+				err := handleStream(stream, upstream, conn.GetConv())
+				if err != nil {
+					log.Printf("stream %08x:%d handleStream: %v", conn.GetConv(), stream.ID(), err)
+				}
 			}
 		}()
 	}
@@ -357,7 +362,7 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string) error 
 
 // acceptSessions listens for incoming KCP connections and passes them to
 // acceptStreams.
-func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string) error {
+func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string, socksTunnel bool) error {
 	for {
 		conn, err := ln.AcceptKCP()
 		if err != nil {
@@ -388,7 +393,7 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string) 
 				log.Printf("end session %08x", conn.GetConv())
 				conn.Close()
 			}()
-			err := acceptStreams(conn, privkey, upstream)
+			err := acceptStreams(conn, privkey, upstream, socksTunnel)
 			if err != nil && !errors.Is(err, io.ErrClosedPipe) {
 				log.Printf("session %08x acceptStreams: %v", conn.GetConv(), err)
 			}
@@ -1187,7 +1192,7 @@ func computeMaxEncodedPayload(limit int) int {
 	return low
 }
 
-func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketConn, fallbackAddr *net.UDPAddr) error {
+func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketConn, fallbackAddr *net.UDPAddr, socksTunnel bool) error {
 	defer dnsConn.Close()
 
 	log.Printf("pubkey %x", noise.PubkeyFromPrivkey(privkey))
@@ -1225,7 +1230,7 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 	}
 	defer ln.Close()
 	go func() {
-		err := acceptSessions(ln, privkey, mtu, upstream)
+		err := acceptSessions(ln, privkey, mtu, upstream, socksTunnel)
 		if err != nil {
 			log.Printf("acceptSessions: %v", err)
 		}
@@ -1295,15 +1300,17 @@ func main() {
 	var pubkeyFilename string
 	var udpAddr string
 	var fallbackAddrString string
+	var tunnelMode string
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
   %[1]s -gen-key -privkey-file PRIVKEYFILE -pubkey-file PUBKEYFILE
-  %[1]s -udp ADDR -privkey-file PRIVKEYFILE [-fallback FALLBACKADDR] DOMAIN UPSTREAMADDR
+  %[1]s -udp ADDR -privkey-file PRIVKEYFILE [-fallback FALLBACKADDR] [-tunnel tcp|socks] DOMAIN [UPSTREAMADDR]
 
 Example:
   %[1]s -gen-key -privkey-file server.key -pubkey-file server.pub
   %[1]s -udp :53 -privkey-file server.key t.example.com 127.0.0.1:8000
+  %[1]s -udp :53 -privkey-file server.key -tunnel socks t.example.com
   %[1]s -udp :53 -privkey-file server.key -fallback 127.0.0.1:8888 t.example.com 127.0.0.1:8000
 
 `, os.Args[0])
@@ -1316,6 +1323,7 @@ Example:
 	flag.StringVar(&pubkeyFilename, "pubkey-file", "", "with -gen-key, write server public key to file")
 	flag.StringVar(&udpAddr, "udp", "", "UDP address to listen on (required)")
 	flag.StringVar(&fallbackAddrString, "fallback", "", "UDP endpoint to forward non-DNS packets to (e.g., 127.0.0.1:8888)")
+	flag.StringVar(&tunnelMode, "tunnel", "socks", "tcp: streams go to UPSTREAMADDR; socks: client chooses destination per stream")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.LUTC)
@@ -1332,7 +1340,22 @@ Example:
 		}
 	} else {
 		// Ordinary server mode.
-		if flag.NArg() != 2 {
+		var socksTunnel bool
+		switch tunnelMode {
+		case "tcp":
+			socksTunnel = false
+		case "socks":
+			socksTunnel = true
+		default:
+			fmt.Fprintf(os.Stderr, "-tunnel must be tcp or socks, not %q\n", tunnelMode)
+			os.Exit(1)
+		}
+		if socksTunnel {
+			if flag.NArg() != 1 {
+				fmt.Fprintf(os.Stderr, "socks mode: %s -udp ... -tunnel socks DOMAIN (omit UPSTREAMADDR)\n", os.Args[0])
+				os.Exit(1)
+			}
+		} else if flag.NArg() != 2 {
 			flag.Usage()
 			os.Exit(1)
 		}
@@ -1341,34 +1364,25 @@ Example:
 			fmt.Fprintf(os.Stderr, "invalid domain %+q: %v\n", flag.Arg(0), err)
 			os.Exit(1)
 		}
-		upstream := flag.Arg(1)
-		// We keep upstream as a string in order to eventually pass it
-		// to net.Dial in handleStream. But for the sake of displaying
-		// an error or warning at startup, rather than only when the
-		// first stream occurs, we apply some parsing and name
-		// resolution checks here.
-		{
-			upstreamHost, _, err := net.SplitHostPort(upstream)
-			if err != nil {
-				// host:port format is required in all cases, so
-				// this is a fatal error.
-				fmt.Fprintf(os.Stderr, "cannot parse upstream address %+q: %v\n", upstream, err)
-				os.Exit(1)
+		upstream := ""
+		if !socksTunnel {
+			upstream = flag.Arg(1)
+			{
+				upstreamHost, _, err := net.SplitHostPort(upstream)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "cannot parse upstream address %+q: %v\n", upstream, err)
+					os.Exit(1)
+				}
+				upstreamIPAddr, err := net.ResolveIPAddr("ip", upstreamHost)
+				if err != nil {
+					log.Printf("warning: cannot resolve upstream host %+q: %v", upstreamHost, err)
+				} else if upstreamIPAddr.IP == nil {
+					fmt.Fprintf(os.Stderr, "cannot parse upstream address %+q: missing host in address\n", upstream)
+					os.Exit(1)
+				}
 			}
-			upstreamIPAddr, err := net.ResolveIPAddr("ip", upstreamHost)
-			if err != nil {
-				// Failure to resolve the host portion is only a
-				// warning. The name will be re-resolved on each
-				// net.Dial in handleStream.
-				log.Printf("warning: cannot resolve upstream host %+q: %v", upstreamHost, err)
-			} else if upstreamIPAddr.IP == nil {
-				// Handle the special case of an empty string
-				// for the host portion, which resolves to a nil
-				// IP. This is a fatal error as we will not be
-				// able to dial this address.
-				fmt.Fprintf(os.Stderr, "cannot parse upstream address %+q: missing host in address\n", upstream)
-				os.Exit(1)
-			}
+		} else {
+			log.Printf("tunnel mode socks: server will dial TCP/UDP targets requested by the client (secure egress)")
 		}
 
 		if udpAddr == "" {
@@ -1425,7 +1439,7 @@ Example:
 			}
 		}
 
-		err = run(privkey, domain, upstream, dnsConn, fallbackAddr)
+		err = run(privkey, domain, upstream, dnsConn, fallbackAddr, socksTunnel)
 		if err != nil {
 			log.Fatal(err)
 		}

@@ -47,6 +47,7 @@ func BenchmarkReconnect(b *testing.B) {
 			newServerCmd := exec.Command(h.serverBin,
 				"-udp", h.dnsUDPAddr,
 				"-privkey", h.privkeyHex,
+				"-tunnel", "tcp",
 				h.domain,
 				h.echoLn.Addr().String(),
 			)
@@ -120,6 +121,7 @@ func TestReconnect(t *testing.T) {
 	newServerCmd := exec.Command(h.serverBin,
 		"-udp", h.dnsUDPAddr,
 		"-privkey", h.privkeyHex,
+		"-tunnel", "tcp",
 		h.domain,
 		h.echoLn.Addr().String(),
 	)

@@ -116,16 +116,18 @@ func main() {
 	var doScan bool
 	var scanChecks int
 	var clientMTUFlag int
+	var tunnelMode string
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
-  %[1]s [-doh URL|-dot ADDR|-udp ADDR] (-pubkey PUBKEY|-pubkey-file PUBKEYFILE) DOMAIN LOCALADDR
+  %[1]s [-doh URL|-dot ADDR|-udp ADDR] (-pubkey PUBKEY|-pubkey-file PUBKEYFILE) [-tunnel tcp|socks] DOMAIN LOCALADDR
 
 Examples:
   %[1]s -doh https://resolver.example/dns-query -pubkey-file server.pub t.example.com 127.0.0.1:7000
   %[1]s -dot resolver.example:853 -pubkey-file server.pub t.example.com 127.0.0.1:7000
   %[1]s -doh url1 -doh url2 -resolver-policy least-ping -pubkey-file server.pub t.example.com 127.0.0.1:7000
   %[1]s -resolvers-file resolvers.txt -scan -pubkey-file server.pub t.example.com 127.0.0.1:7000
+  %[1]s -udp 8.8.8.8:53 -pubkey-file server.pub -tunnel socks t.example.com 127.0.0.1:1080
 
 `, os.Args[0])
 		flag.PrintDefaults()
@@ -171,6 +173,7 @@ Known TLS fingerprints for -utls are:
 		"when -scan is used, run this many PING checks per resolver; a resolver passes only if all checks succeed (default 1, use higher for stricter scan)")
 	flag.IntVar(&clientMTUFlag, "mtu", 0,
 		"max question QNAME wire length in bytes (what many DPI systems limit—not full UDP size). 0 = discover per resolver. Response size is still discovered.")
+	flag.StringVar(&tunnelMode, "tunnel", "socks", "tcp: LOCALADDR is plain TCP forward; socks: LOCALADDR is SOCKS5 (server needs -tunnel socks)")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.LUTC)
@@ -248,6 +251,13 @@ Known TLS fingerprints for -utls are:
 		os.Exit(1)
 	}
 
+	switch tunnelMode {
+	case "tcp", "socks":
+	default:
+		fmt.Fprintf(os.Stderr, "-tunnel must be tcp or socks, not %q\n", tunnelMode)
+		os.Exit(1)
+	}
+
 	// Validate policy.
 	switch resolverPolicy {
 	case "round-robin", "least-ping", "weighted-traffic":
@@ -256,7 +266,7 @@ Known TLS fingerprints for -utls are:
 		os.Exit(1)
 	}
 
-	err = runTunnel(domain, localAddr, pubkey, utlsClientHelloID, specs, resolverPolicy, doScan, scanChecks, clientMTUFlag, sendParallel)
+	err = runTunnel(domain, localAddr, pubkey, utlsClientHelloID, specs, resolverPolicy, doScan, scanChecks, clientMTUFlag, sendParallel, tunnelMode)
 	if err != nil {
 		log.Fatal(err)
 	}

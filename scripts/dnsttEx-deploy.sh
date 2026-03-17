@@ -390,17 +390,21 @@ get_user_input() {
         [[ -n "$NS_SUBDOMAIN" ]] && break
         print_error "Subdomain is required"
     done
-    echo "Tunnel mode: 1) SOCKS proxy  2) SSH"
+    echo "Tunnel mode: 1) SOCKS proxy (recommended)  2) SSH"
     while true; do
         if [[ -n "$existing_mode" ]]; then
             local n; [[ "$existing_mode" == "socks" ]] && n=1 || n=2
             print_question "Choice (current: $n - $existing_mode): "
         else
-            print_question "Choice (1 or 2): "
+            print_question "Choice (1 or 2, default: 1=socks): "
         fi
         read -r choice
         if [[ -z "$choice" && -n "$existing_mode" ]]; then
             TUNNEL_MODE="$existing_mode"
+            break
+        fi
+        if [[ -z "$choice" && -z "$existing_mode" ]]; then
+            TUNNEL_MODE="socks"
             break
         fi
         case $choice in
@@ -637,6 +641,7 @@ STUBEOF
 
 create_systemd_service() {
     local target_port
+    local exec_args
     if [[ "$TUNNEL_MODE" == "ssh" ]]; then
         target_port=$(detect_ssh_port)
         print_status "SSH mode: forwarding to 127.0.0.1:$target_port"
@@ -663,7 +668,17 @@ User=$DNSTT_USER
 Group=$DNSTT_USER
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-ExecStart=${INSTALL_DIR}/dnsttEx-server -udp :${DNSTT_PORT} -privkey-file ${PRIVATE_KEY_FILE} ${NS_SUBDOMAIN} 127.0.0.1:${target_port}
+EOF
+    if [[ "$TUNNEL_MODE" == "socks" ]]; then
+        cat >> "$svc" << EOF
+ExecStart=${INSTALL_DIR}/dnsttEx-server -udp :${DNSTT_PORT} -privkey-file ${PRIVATE_KEY_FILE} -tunnel socks ${NS_SUBDOMAIN}
+EOF
+    else
+        cat >> "$svc" << EOF
+ExecStart=${INSTALL_DIR}/dnsttEx-server -udp :${DNSTT_PORT} -privkey-file ${PRIVATE_KEY_FILE} -tunnel tcp ${NS_SUBDOMAIN} 127.0.0.1:${target_port}
+EOF
+    fi
+    cat >> "$svc" << EOF
 Restart=always
 RestartSec=5
 
@@ -696,7 +711,7 @@ print_success_box() {
     echo "  Commands:  dnsttEx-deploy  |  systemctl status $SERVICE_NAME  |  journalctl -u $SERVICE_NAME -f"
     if [[ "$TUNNEL_MODE" == "socks" ]]; then
         echo ""
-        echo "  SOCKS proxy: 127.0.0.1:1080  (systemctl status danted)"
+        echo "  SOCKS proxy: 127.0.0.1:1080  (run dnsttEx-client with -tunnel socks; recommended)"
     fi
     echo ""
     echo -e "${GREEN}+============================================================================+${NC}"
@@ -716,12 +731,16 @@ main() {
     save_config
     configure_firewall
     if [[ "$TUNNEL_MODE" == "socks" ]]; then
-        setup_dante
-    else
+        # In socks tunnel mode, the SOCKS5 server runs on the client side
+        # (dnsttEx-client -tunnel socks). The server does not require a local
+        # danted instance.
         if systemctl is-active --quiet danted 2>/dev/null; then
             systemctl stop danted 2>/dev/null
             systemctl disable danted 2>/dev/null
         fi
+    else
+        # Non-socks modes keep the legacy server-side SOCKS proxy.
+        setup_dante
     fi
     create_systemd_service
     print_success_box

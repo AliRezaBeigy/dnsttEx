@@ -14,13 +14,14 @@ import (
 
 	"dnsttEx/dns"
 
+	socks5 "github.com/things-go/go-socks5"
 	"github.com/xtaci/smux"
 )
 
 // Logging constants for DNSTT_LOG_RX_DATA.
 const (
-	peekSize             = 4096
-	logFirstChunks       = 5
+	peekSize              = 4096
+	logFirstChunks        = 5
 	minChunkBytesForCount = 4
 )
 
@@ -155,20 +156,12 @@ type kcpMTUHint interface {
 	KCPMTUHint() int
 }
 
-func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn) error {
-	defer pconn.Close()
-
-	ln, err := net.ListenTCP("tcp", localAddr)
-	if err != nil {
-		return fmt.Errorf("opening local listener: %v", err)
-	}
-	defer ln.Close()
-
+func clientKCPMTU(domain dns.Name, pconn net.PacketConn) (int, error) {
 	capacity := nameCapacity(domain)
 	overhead := 8 + 1 + numPadding + 1
 	maxPayloadInName := capacity - overhead
 	if maxPayloadInName < 1 {
-		return fmt.Errorf("domain %s leaves no room for payload (capacity %d)", domain, capacity)
+		return 0, fmt.Errorf("domain %s leaves no room for payload (capacity %d)", domain, capacity)
 	}
 	mtu := maxPacketSize
 	if maxPayloadInName < mtu {
@@ -182,7 +175,23 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 		}
 	}
 	if mtu < minKCPMTU {
-		return fmt.Errorf("tunnel MTU %d bytes is below KCP minimum (%d); use a shorter domain or larger path MTU", mtu, minKCPMTU)
+		return 0, fmt.Errorf("tunnel MTU %d bytes is below KCP minimum (%d); use a shorter domain or larger path MTU", mtu, minKCPMTU)
+	}
+	return mtu, nil
+}
+
+func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn) error {
+	defer pconn.Close()
+
+	ln, err := net.ListenTCP("tcp", localAddr)
+	if err != nil {
+		return fmt.Errorf("opening local listener: %v", err)
+	}
+	defer ln.Close()
+
+	mtu, err := clientKCPMTU(domain, pconn)
+	if err != nil {
+		return err
 	}
 	log.Printf("Tunnel MTU: %d bytes", mtu)
 
@@ -242,4 +251,50 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 			}
 		}()
 	}
+}
+
+// runSocks runs SOCKS5 on localAddr; each CONNECT/UDP relay uses the DNS tunnel (server must use -tunnel socks).
+func runSocks(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn) error {
+	defer pconn.Close()
+
+	mtu, err := clientKCPMTU(domain, pconn)
+	if err != nil {
+		return err
+	}
+	log.Printf("Tunnel MTU: %d bytes (SOCKS5 on %s)", mtu, localAddr.String())
+
+	sm := newSessionManager(pubkey, domain, remoteAddr, pconn, mtu)
+	defer sm.closeSession("tunnel shutting down")
+
+	t := newSocksTunnel(sm)
+	opts := []socks5.Option{
+		socks5.WithConnectHandle(t.connectHandle),
+		socks5.WithAssociateHandle(t.associateHandle),
+	}
+	if ip := localAddr.IP; len(ip) > 0 && !ip.IsUnspecified() {
+		opts = append(opts, socks5.WithBindIP(ip))
+	}
+	srv := socks5.NewServer(opts...)
+
+	l, err := net.Listen("tcp", localAddr.String())
+	if err != nil {
+		return fmt.Errorf("SOCKS5 listen: %v", err)
+	}
+	defer l.Close()
+	log.Printf("SOCKS5 listening on %s (tunnel socks mode)", l.Addr())
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.Serve(l) }()
+
+	if dpc, ok := pconn.(packetConnWithDone); ok {
+		select {
+		case <-dpc.Done():
+			_ = l.Close()
+			<-errCh
+			return nil
+		case err := <-errCh:
+			return err
+		}
+	}
+	return <-errCh
 }

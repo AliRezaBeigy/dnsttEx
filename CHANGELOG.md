@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-03-17
+### Changed
+- **Default tunnel mode is SOCKS** — Client and server default `-tunnel` to `socks` instead of `tcp`.
+
+### Added
+- **Client-side SOCKS tunnel mode (`-tunnel socks`)** — The client runs a SOCKS5 server and sends the destination per stream; the server dials the requested target directly to reduce extra SOCKS/SSH handshakes crossing the DNS tunnel.
+
 ## [1.3.3] - 2026-03-16
 
 ### Changed
@@ -129,7 +136,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.3.3...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.4.0...HEAD
+[1.3.3]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.3.3...v1.4.0
 [1.3.3]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.3.2...v1.3.3
 [1.3.2]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.3.1...v1.3.2
 [1.3.1]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.3.0...v1.3.1

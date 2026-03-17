@@ -10,6 +10,7 @@ This fork adds the following on top of upstream dnstt (after commit ae95dda):
 - **Multi-resolver pool** — Client accepts multiple `-doh`/`-dot`/`-udp` flags and/or a `-resolvers-file`. Resolvers are multiplexed via a `ResolverPool` with three selection policies: `round-robin`, `least-ping`, and `weighted-traffic`. A background health checker probes UDP endpoints every 15 s and tracks RTT; unhealthy endpoints are skipped with automatic fallback. Use `-scan` to filter the list to only resolvers that reach the server before starting.
 - **Cache bust** — Idle poll queries include random bytes in the DNS name so each query is unique; resolvers and DNS caches cannot return stale responses.
 - **Per-resolver MTU discovery** — The client discovers **server MTU** (max DNS response payload that gets through) and **client MTU** (max **question QNAME** wire length that still gets a PONG). Many DPI systems limit the query name size, not the full UDP packet; client MTU matches that (RFC 1035 QNAME ≤ 255 octets). Full DNS message size can be larger (header + OPT, etc.). Use `-mtu N` to set max QNAME length yourself (0 = discover).
+- **Client-side SOCKS tunnel mode** — In `-tunnel socks` mode, the **client** runs a SOCKS5 server and sends the destination per stream; the **server** dials the requested target directly. This removes the need for a server-side SOCKS/SSH hop and reduces extra SOCKS handshakes crossing the DNS tunnel. In this fork, both client and server default `-tunnel` to `socks`.
 
 See [CHANGELOG.md](CHANGELOG.md) for version history and details.
 
