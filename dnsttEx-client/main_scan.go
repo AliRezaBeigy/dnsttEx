@@ -20,6 +20,25 @@ import (
 	"dnsttEx/turbotunnel"
 )
 
+// shouldReportScanProgress returns true when a progress line should be logged
+// (first, last, and roughly every 2% of total, interval capped).
+func shouldReportScanProgress(done, total uint64) bool {
+	if total == 0 {
+		return false
+	}
+	if total == 1 || done == 1 || done == total {
+		return true
+	}
+	interval := total / 50
+	if interval < 1 {
+		interval = 1
+	}
+	if interval > 100 {
+		interval = 100
+	}
+	return done%interval == 0
+}
+
 // parseResolversFile parses a resolvers file and appends to specs.
 // Format: one resolver per line, prefix doh:, dot:, or udp:. A bare IP or
 // hostname with no prefix is treated as udp:host:53.
@@ -77,12 +96,23 @@ func scanResolvers(endpoints []*poolEndpoint, domain dns.Name, timeout time.Dura
 	var mu sync.Mutex
 	var passed []*poolEndpoint
 	var wg sync.WaitGroup
+	var scanDone atomic.Uint64
+	totalEP := uint64(len(endpoints))
 
 	for _, ep := range endpoints {
 		ep := ep
 		wg.Add(1)
 		go func() {
-			defer wg.Done()
+			defer func() {
+				n := scanDone.Add(1)
+				if shouldReportScanProgress(n, totalEP) {
+					mu.Lock()
+					p := len(passed)
+					mu.Unlock()
+					log.Printf("Scan: progress %d/%d resolver(s) (%d passed so far)", n, totalEP, p)
+				}
+				wg.Done()
+			}()
 
 			if ep.probeConn == nil {
 				log.Printf("Scan: %s (DoH/DoT) cannot probe; assumed OK", ep.name)
@@ -112,11 +142,6 @@ func scanResolvers(endpoints []*poolEndpoint, domain dns.Name, timeout time.Dura
 							return
 						}
 						continue
-					}
-					if checks == 1 && retriesPerCheck == 0 {
-						log.Printf("Scan: %s ← PING sent", ep.name)
-					} else {
-						log.Printf("Scan: %s ← PING sent (check %d/%d, attempt %d)", ep.name, round+1, checks, attempt+1)
 					}
 					if dnsttDebug() {
 						log.Printf("DNSTT_DEBUG: PING to %s (health probe, no requested payload size)", ep.name)
@@ -229,11 +254,6 @@ func scanUDPSingleConn(udpAddrStr string, domain dns.Name, timeout time.Duration
 					return false
 				}
 				continue
-			}
-			if checks == 1 && retriesPerCheck == 0 {
-				log.Printf("Scan: %s ← PING sent", logName)
-			} else {
-				log.Printf("Scan: %s ← PING sent (check %d/%d, attempt %d)", logName, round+1, checks, attempt+1)
 			}
 			if dnsttDebug() {
 				log.Printf("DNSTT_DEBUG: PING to %s (health probe, no requested payload size)", logName)
@@ -406,30 +426,43 @@ func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration, clien
 			ep.name, mtuProbeSuccessesRequired, mtuProbeAfterTimeoutRetries)
 	}
 
+	log.Printf("MTU discovery: %s — probing max DNS response payload (trying largest sizes first)…", ep.name)
 	serverMTU := 0
 	for i := len(serverSizes) - 1; i >= 0; i-- {
 		size := serverSizes[i]
+		log.Printf("MTU discovery: %s — response payload trial: up to %d bytes (need %d OK exchanges)…", ep.name, size, mtuProbeSuccessesRequired)
 		if mtuSizePassesProbes(ep, domain, probeID, size, true, timeout) {
 			serverMTU = size
+			log.Printf("MTU discovery: %s — response payload %d bytes: OK", ep.name, size)
 			if dnsttDebug() {
 				log.Printf("DNSTT_DEBUG: MTU probe %s: max response wire %d bytes (passed %d probes)", ep.name, size, mtuProbeSuccessesRequired)
 			}
 			break
+		}
+		if i > 0 {
+			log.Printf("MTU discovery: %s — response payload %d bytes: no stable path, trying smaller", ep.name, size)
 		}
 	}
 
 	clientMTU := 0
 	if clientMTUOverride > 0 {
 		clientMTU = clientMTUOverride
+		log.Printf("MTU discovery: %s — client query QNAME length fixed at %d bytes (-mtu)", ep.name, clientMTUOverride)
 	} else {
+		log.Printf("MTU discovery: %s — probing max query QNAME wire length…", ep.name)
 		for i := len(clientSizes) - 1; i >= 0; i-- {
 			size := clientSizes[i]
+			log.Printf("MTU discovery: %s — QNAME length trial: ≥%d bytes (need %d OK exchanges)…", ep.name, size, mtuProbeSuccessesRequired)
 			if mtuSizePassesProbes(ep, domain, probeID, size, false, timeout) {
 				clientMTU = size
+				log.Printf("MTU discovery: %s — max QNAME length %d bytes: OK", ep.name, size)
 				if dnsttDebug() {
 					log.Printf("DNSTT_DEBUG: MTU probe %s: max query QNAME %d bytes (passed %d probes)", ep.name, size, mtuProbeSuccessesRequired)
 				}
 				break
+			}
+			if i > 0 {
+				log.Printf("MTU discovery: %s — QNAME %d bytes: no stable path, trying smaller", ep.name, size)
 			}
 		}
 	}
@@ -573,6 +606,8 @@ Examples:
 	sem := make(chan struct{}, scanParallel)
 	var wg sync.WaitGroup
 	var doneUDP atomic.Uint64
+	var passedUDP atomic.Uint64
+	totalUDP := uint64(len(udpSpecs))
 
 	log.Printf("Scan: %d UDP resolver(s), %d parallel, %d check(s) each, up to %d retries per check",
 		len(udpSpecs), scanParallel, scanChecks, scanRetry)
@@ -583,15 +618,17 @@ Examples:
 		sem <- struct{}{}
 		go func() {
 			defer func() { <-sem; wg.Done() }()
-			if scanUDPSingleConn(spec.addr, domain, timeout, scanChecks, scanRetry, "udp "+spec.addr) {
+			ok := scanUDPSingleConn(spec.addr, domain, timeout, scanChecks, scanRetry, "udp "+spec.addr)
+			if ok {
 				line := resolverLineForScanOutput(spec.addr)
 				linesMu.Lock()
 				lines = append(lines, line)
 				linesMu.Unlock()
+				passedUDP.Add(1)
 			}
 			n := doneUDP.Add(1)
-			if n%500 == 0 || n == uint64(len(udpSpecs)) {
-				log.Printf("Scan: progress %d/%d UDP", n, len(udpSpecs))
+			if shouldReportScanProgress(n, totalUDP) {
+				log.Printf("Scan: progress %d/%d UDP (%d passed)", n, totalUDP, passedUDP.Load())
 			}
 		}()
 	}

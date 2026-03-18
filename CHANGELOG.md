@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Scan and MTU discovery progress logs** — `scan` and `-scan` log periodic progress (resolver count and UDP pass count for bulk `scan`). MTU discovery logs each response-size and QNAME trial so long probes are visibly advancing; tunnel startup logs when discovery begins for N resolvers.
+
 ## [1.4.1] - 2026-03-17
 
 ### Changed

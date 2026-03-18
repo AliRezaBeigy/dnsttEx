@@ -70,6 +70,7 @@ func runTunnel(
 	}
 
 	mtuTimeout := mtuProbeTimeout()
+	log.Printf("MTU discovery: starting for %d resolver(s); watch below for per-resolver progress", len(endpoints))
 	var wg sync.WaitGroup
 	for _, ep := range endpoints {
 		ep := ep
