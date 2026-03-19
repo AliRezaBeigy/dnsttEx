@@ -885,6 +885,12 @@ func (r *countingUDPRelay) Addr() string {
 	return r.ln.LocalAddr().String()
 }
 
+// Sent returns total bytes forwarded client → server (for speedtest logging).
+func (r *countingUDPRelay) Sent() int64 { return r.sent.Load() }
+
+// Received returns total bytes forwarded server → client (for speedtest logging).
+func (r *countingUDPRelay) Received() int64 { return r.received.Load() }
+
 // Close shuts down the relay.
 func (r *countingUDPRelay) Close() {
 	close(r.done)
@@ -937,6 +943,110 @@ func (r *countingUDPRelay) loop() {
 		r.clientAddr = clientAddr
 		r.mu.Unlock()
 		serverConn.WriteToUDP(buf[:n], r.serverAddr)
+	}
+}
+
+// delayedCountingUDPRelay is like countingUDPRelay but delays every packet by
+// oneWayDelay in each direction, so effective RTT = 2*oneWayDelay. Use to
+// simulate real-world latency and reproduce slow throughput (e.g. 2 KB/s).
+type delayedCountingUDPRelay struct {
+	ln               *net.UDPConn
+	serverAddr       *net.UDPAddr
+	upstreamBindAddr *net.UDPAddr
+	advertiseAddr    string
+	oneWayDelay      time.Duration
+
+	sent     atomic.Int64
+	received atomic.Int64
+
+	mu         sync.Mutex
+	clientAddr *net.UDPAddr
+
+	done chan struct{}
+}
+
+func newDelayedCountingUDPRelay(t testing.TB, serverAddrStr string, oneWayDelay time.Duration) *delayedCountingUDPRelay {
+	t.Helper()
+	serverAddr, err := net.ResolveUDPAddr("udp", serverAddrStr)
+	if err != nil {
+		t.Fatalf("resolve server addr: %v", err)
+	}
+	listenAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("resolve relay listen addr: %v", err)
+	}
+	ln, err := net.ListenUDP("udp", listenAddr)
+	if err != nil {
+		t.Fatalf("relay listen: %v", err)
+	}
+	r := &delayedCountingUDPRelay{
+		ln:               ln,
+		serverAddr:       serverAddr,
+		upstreamBindAddr: &net.UDPAddr{IP: listenAddr.IP, Port: 0, Zone: listenAddr.Zone},
+		advertiseAddr:    ln.LocalAddr().String(),
+		oneWayDelay:      oneWayDelay,
+		done:             make(chan struct{}),
+	}
+	go r.loop()
+	return r
+}
+
+func (r *delayedCountingUDPRelay) Addr() string {
+	return r.advertiseAddr
+}
+
+func (r *delayedCountingUDPRelay) Sent() int64    { return r.sent.Load() }
+func (r *delayedCountingUDPRelay) Received() int64 { return r.received.Load() }
+
+func (r *delayedCountingUDPRelay) Close() {
+	close(r.done)
+	r.ln.Close()
+}
+
+func (r *delayedCountingUDPRelay) loop() {
+	serverConn, err := net.ListenUDP("udp", r.upstreamBindAddr)
+	if err != nil {
+		return
+	}
+	defer serverConn.Close()
+
+	buf := make([]byte, 4096)
+
+	// Server → client: delay then forward
+	go func() {
+		buf2 := make([]byte, 4096)
+		for {
+			n, _, err := serverConn.ReadFromUDP(buf2)
+			if err != nil {
+				return
+			}
+			r.received.Add(int64(n))
+			payload := append([]byte(nil), buf2[:n]...)
+			r.mu.Lock()
+			clientAddr := r.clientAddr
+			r.mu.Unlock()
+			if clientAddr != nil {
+				time.AfterFunc(r.oneWayDelay, func() {
+					r.ln.WriteToUDP(payload, clientAddr)
+				})
+			}
+		}
+	}()
+
+	// Client → server: delay then forward
+	for {
+		n, clientAddr, err := r.ln.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		r.sent.Add(int64(n))
+		r.mu.Lock()
+		r.clientAddr = clientAddr
+		r.mu.Unlock()
+		payload := append([]byte(nil), buf[:n]...)
+		time.AfterFunc(r.oneWayDelay, func() {
+			serverConn.WriteToUDP(payload, r.serverAddr)
+		})
 	}
 }
 
