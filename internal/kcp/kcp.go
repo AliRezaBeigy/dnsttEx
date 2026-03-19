@@ -25,6 +25,8 @@ package kcp
 import (
 	"container/heap"
 	"encoding/binary"
+	"os"
+	"strconv"
 	"sync/atomic"
 	"time"
 )
@@ -55,10 +57,10 @@ const (
 	// Compact wire format for DNS-sized paths (dnstt):
 	// conv(2) + cmd/frg(1) + wnd(1) + ts(2) + sn(2) + una(2) + len(2) = 12 bytes.
 	// Wire conv is 16 bits; use matching low 16 bits on both peers (see NewConn2).
-	IKCP_ACK_FAST    = 3      // fast retransmit trigger threshold (duplicate ACK count)
-	IKCP_INTERVAL    = 100    // default flush interval (ms)
+	IKCP_ACK_FAST    = 3   // fast retransmit trigger threshold (duplicate ACK count)
+	IKCP_INTERVAL    = 100 // default flush interval (ms)
 	IKCP_OVERHEAD    = 12
-	IKCP_DEADLINK    = 20     // max retransmissions before declaring dead link
+	IKCP_DEADLINK    = 20     // max retransmissions before dropping that segment (session stays open)
 	IKCP_THRESH_INIT = 2      // initial slow-start threshold (packets)
 	IKCP_THRESH_MIN  = 2      // minimum slow-start threshold (packets)
 	IKCP_PROBE_INIT  = 500    // initial window probe timeout (ms)
@@ -196,7 +198,7 @@ type KCP struct {
 	conv  uint32 // conversation id, must be equal on both sides
 	mtu   uint32 // maximum transmission unit (bytes)
 	mss   uint32 // maximum segment size = mtu - IKCP_OVERHEAD
-	state uint32 // connection state, 0 = active, 0xFFFFFFFF = dead link
+	state uint32 // connection state, 0 = active, 0xFFFFFFFF = dead link (unused when segment drop is used)
 
 	// Sequence numbers and acknowledgment tracking
 	snd_una uint32 // oldest unacknowledged sequence number
@@ -272,6 +274,18 @@ func NewKCP(conv uint32, output output_callback) *KCP {
 	kcp.ts_flush = IKCP_INTERVAL
 	kcp.ssthresh = IKCP_THRESH_INIT
 	kcp.dead_link = IKCP_DEADLINK
+	if s := os.Getenv("DNSTT_KCP_DEAD_LINK"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil {
+			const minDeadLink, maxDeadLink = 1, 500
+			if n < minDeadLink {
+				n = minDeadLink
+			}
+			if n > maxDeadLink {
+				n = maxDeadLink
+			}
+			kcp.dead_link = uint32(n)
+		}
+	}
 	kcp.output = output
 	kcp.snd_buf = NewRingBuffer[segment](IKCP_WND_SND * 2)
 	kcp.rcv_queue = NewRingBuffer[segment](IKCP_WND_RCV * 2)
@@ -892,6 +906,7 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 	nextUpdate = kcp.interval
 
 	if flushType == IKCP_FLUSH_FULL {
+		var dropFrontSegment bool
 		for segment := range kcp.snd_buf.ForEach {
 			needsend := false
 			if segment.acked == 1 {
@@ -942,8 +957,10 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 
 				kcp.debugLog(IKCP_LOG_OUT_PUSH, "conv", segment.conv, "sn", segment.sn, "frg", segment.frg, "una", segment.una, "ts", segment.ts, "xmit", segment.xmit, "datalen", len(segment.data))
 
+				// After max retransmits without ACK, drop this segment only (do not close session).
+				// Keeps session alive for high-latency/lossy networks and middleware with many clients.
 				if segment.xmit >= kcp.dead_link {
-					kcp.state = 0xFFFFFFFF // mark connection as dead
+					dropFrontSegment = true
 				}
 			}
 
@@ -951,6 +968,12 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 			if rto := _itimediff(segment.resendts, current); rto > 0 && uint32(rto) < nextUpdate {
 				nextUpdate = uint32(rto)
 			}
+		}
+		if dropFrontSegment {
+			if seg, ok := kcp.snd_buf.Pop(); ok {
+				kcp.recycleSegment(&seg)
+			}
+			kcp.shrink_buf()
 		}
 	}
 

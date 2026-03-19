@@ -1192,6 +1192,24 @@ func computeMaxEncodedPayload(limit int) int {
 	return low
 }
 
+// fecShardsFromEnv returns (dataShards, parityShards) from DNSTT_FEC_DATA and
+// DNSTT_FEC_PARITY. Default (2, 1) enables FEC for lossy networks; set both to 0 to disable.
+func fecShardsFromEnv() (dataShards, parityShards int) {
+	dataShards = 2
+	parityShards = 1
+	if s := os.Getenv("DNSTT_FEC_DATA"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n >= 0 && n <= 10 {
+			dataShards = n
+		}
+	}
+	if s := os.Getenv("DNSTT_FEC_PARITY"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n >= 0 && n <= 10 {
+			parityShards = n
+		}
+	}
+	return dataShards, parityShards
+}
+
 func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketConn, fallbackAddr *net.UDPAddr, socksTunnel bool) error {
 	defer dnsConn.Close()
 
@@ -1224,7 +1242,9 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 
 	// Start up the virtual PacketConn for turbotunnel.
 	ttConn := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, idleTimeout*2)
-	ln, err := kcp.ServeConn(nil, 0, 0, ttConn)
+	dataShards, parityShards := fecShardsFromEnv()
+	log.Printf("FEC dataShards=%d parityShards=%d", dataShards, parityShards)
+	ln, err := kcp.ServeConn(nil, dataShards, parityShards, ttConn)
 	if err != nil {
 		return fmt.Errorf("opening KCP listener: %v", err)
 	}

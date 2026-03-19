@@ -7,9 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.2] - 2026-03-19
+
 ### Added
 
 - **Scan and MTU discovery progress logs** — `scan` and `-scan` log periodic progress (resolver count and UDP pass count for bulk `scan`). MTU discovery logs each response-size and QNAME trial so long probes are visibly advancing; tunnel startup logs when discovery begins for N resolvers.
+
+- **Configurable KCP segment drop (`DNSTT_KCP_DEAD_LINK`)** — Max retransmits per segment before it is dropped (default 20). Use 50–100 on high-latency or lossy networks so segments are not dropped too early. Both client and server read this env var.
+
+- **FEC (Forward Error Correction) configurable and on by default** — `DNSTT_FEC_DATA` and `DNSTT_FEC_PARITY` control KCP FEC shards on client and server. Default is (2, 1): 2 data + 1 parity shard for lossy paths. Set both to 0 to disable FEC.
+
+- **Configurable queue size (`DNSTT_QUEUE_SIZE`)** — Send/receive queue size per peer (default 1024). Use 2048–4096 on high-latency or lossy networks to reduce drops when KCP retransmits. Applied in turbotunnel (client and server).
+
+### Changed
+
+- **KCP: drop segment only on max retransmits, keep session open** — When a segment hits the dead-link retry limit, only that segment is dropped from the send buffer and the session stays open. Other traffic and other clients (e.g. middleware/xray) are unaffected; no session close.
 
 ## [1.4.1] - 2026-03-17
 
@@ -148,7 +160,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.4.1...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.4.2...HEAD
+[1.4.2]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.3.3...v1.4.0
 [1.3.3]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.3.2...v1.3.3

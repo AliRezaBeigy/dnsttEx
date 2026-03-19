@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,6 +26,24 @@ const (
 	// so each KCP segment fits inside one DNS query.
 	minKCPMTU = 13
 )
+
+// fecShardsFromEnv returns (dataShards, parityShards) for KCP FEC from DNSTT_FEC_DATA
+// and DNSTT_FEC_PARITY. Must match server. Default (2, 1) enables FEC; set both to 0 to disable.
+func fecShardsFromEnv() (dataShards, parityShards int) {
+	dataShards = 2
+	parityShards = 1
+	if s := os.Getenv("DNSTT_FEC_DATA"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n >= 0 && n <= 10 {
+			dataShards = n
+		}
+	}
+	if s := os.Getenv("DNSTT_FEC_PARITY"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n >= 0 && n <= 10 {
+			parityShards = n
+		}
+	}
+	return dataShards, parityShards
+}
 
 // dnsttDebug returns true when DNSTT_DEBUG is set (for verbose PING/PONG and MTU discovery logs).
 func dnsttDebug() bool { return os.Getenv("DNSTT_DEBUG") != "" }

@@ -75,7 +75,8 @@ func (sm *sessionManager) closeSessionLocked(reason string) {
 // createSessionUnlocked creates a new KCP connection, Noise channel, and smux
 // session. It does not touch sm.mu and must be called without holding it.
 func (sm *sessionManager) createSessionUnlocked() (*kcp.UDPSession, io.ReadWriteCloser, *smux.Session, uint32, error) {
-	conn, err := kcp.NewConn2(sm.remoteAddr, nil, 0, 0, sm.pconn)
+	dataShards, parityShards := fecShardsFromEnv()
+	conn, err := kcp.NewConn2(sm.remoteAddr, nil, dataShards, parityShards, sm.pconn)
 	if err != nil {
 		return nil, nil, nil, 0, fmt.Errorf("opening KCP conn: %v", err)
 	}

@@ -4,12 +4,30 @@
 // https://github.com/net4people/bbs/issues/9
 package turbotunnel
 
-import "errors"
+import (
+	"errors"
+	"os"
+	"strconv"
+)
 
 // QueueSize is the size of send and receive queues in QueuePacketConn and
 // RemoteMap. Must be at least as large as the KCP window size to prevent
 // silent drops from starving KCP retransmission.
-const QueueSize = 1024
+// Override at process start with DNSTT_QUEUE_SIZE (e.g. 2048, 4096) for
+// high-latency or lossy networks to reduce drops when KCP retransmits.
+var QueueSize = 4096
+
+func init() {
+	if s := os.Getenv("DNSTT_QUEUE_SIZE"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n >= 256 {
+			const maxQueueSize = 65536
+			if n > maxQueueSize {
+				n = maxQueueSize
+			}
+			QueueSize = n
+		}
+	}
+}
 
 var errClosedPacketConn = errors.New("operation on closed connection")
 var errNotImplemented = errors.New("not implemented")
