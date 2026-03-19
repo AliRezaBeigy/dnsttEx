@@ -395,14 +395,6 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 			}
 		}
 		if len(packets) > 0 {
-			c.pendingRetryMu.Lock()
-			c.pendingRetry = make([][]byte, len(packets))
-			for i, p := range packets {
-				c.pendingRetry[i] = make([]byte, len(p))
-				copy(c.pendingRetry[i], p)
-			}
-			c.pendingRetryCount = 0
-			c.pendingRetryMu.Unlock()
 			lastTunnelSend = time.Now()
 		}
 		if err := c.send(transport, packets, addr, maxRespOverride, maxReqOverride); err != nil {

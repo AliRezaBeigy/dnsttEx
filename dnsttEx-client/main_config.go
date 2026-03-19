@@ -16,8 +16,6 @@ import (
 // Session and MTU tuning constants.
 const (
 	idleTimeout = 2 * time.Minute
-	// mtuProbeNXDOMAINRetries: when request-size MTU probe gets NXDOMAIN, retry this many times before giving up.
-	mtuProbeNXDOMAINRetries = 3
 	// mtuProbeSuccessesRequired: a candidate size is accepted only after this many successful probe exchanges.
 	mtuProbeSuccessesRequired = 3
 	// mtuProbeAfterTimeoutRetries: per trial, after a read timeout, repeat send+read this many extra times (1 = one retry).

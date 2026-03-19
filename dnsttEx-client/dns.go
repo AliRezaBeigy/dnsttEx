@@ -48,9 +48,6 @@ const (
 	// Consecutive send errors before we back off poll rate (resolver rate limiting).
 	rateLimitBackoffThreshold  = 3
 	rateLimitBackoffMultiplier = 2.0
-
-	// nxdomainRetryMax: when we receive NXDOMAIN, re-queue the last data batch and retry up to this many times before giving up.
-	nxdomainRetryMax = 3
 )
 
 // DNSPacketConn sends and receives tunnel payload over DNS. Upstream is Base36 in the
@@ -77,10 +74,6 @@ type DNSPacketConn struct {
 	inFlightCap    int32
 	inFlightCount  atomic.Int32
 	inFlightSignal chan struct{}
-	// pendingRetryMu protects pendingRetry and pendingRetryCount (NXDOMAIN retry).
-	pendingRetryMu    sync.Mutex
-	pendingRetry      [][]byte // copy of last sent data batch, for re-queue on NXDOMAIN
-	pendingRetryCount int      // number of times we've re-queued this batch due to NXDOMAIN
 	// TC=1 (truncated) response handling: resolver truncated a response that was
 	// too large. We track this to dynamically reduce maxResponseSize and trigger re-polls.
 	truncatedCount atomic.Uint64 // total TC=1 responses seen (for logging)

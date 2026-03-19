@@ -159,24 +159,7 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 			if rcode == dns.RcodeNameError {
 				rcodeStr = "NXDOMAIN (No such name)"
 			}
-			c.pendingRetryMu.Lock()
-			if c.pendingRetry != nil && c.pendingRetryCount < nxdomainRetryMax {
-				for _, p := range c.pendingRetry {
-					c.WriteTo(p, addr)
-				}
-				c.pendingRetryCount++
-				retryNum := c.pendingRetryCount
-				c.pendingRetryMu.Unlock()
-				log.Printf("DNS response %s (rcode %d) for query %s — retrying (%d/%d)", rcodeStr, rcode, qName, retryNum, nxdomainRetryMax)
-			} else {
-				if c.pendingRetry != nil && c.pendingRetryCount >= nxdomainRetryMax {
-					log.Printf("DNS response %s (rcode %d) for query %s — gave up after %d retries", rcodeStr, rcode, qName, nxdomainRetryMax)
-					c.pendingRetry = nil
-				} else {
-					log.Printf("DNS response %s (rcode %d) for query %s — check server logs for reason", rcodeStr, rcode, qName)
-				}
-				c.pendingRetryMu.Unlock()
-			}
+			log.Printf("DNS response %s (rcode %d) for query %s — treating like timeout", rcodeStr, rcode, qName)
 			continue
 		}
 

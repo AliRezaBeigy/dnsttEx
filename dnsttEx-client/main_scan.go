@@ -304,10 +304,9 @@ func scanUDPSingleConn(udpAddrStr string, domain dns.Name, timeout time.Duration
 
 // mtuProbeOneExchange sends one probe and waits for a matching response until timeout.
 // Returns (true, false) on success; (false, true) if the path definitively rejects this size;
-// (false, false) on timeout, I/O error, or (client) NXDOMAIN after exhausting NXDOMAIN retries.
+// (false, false) on timeout, I/O error, or NXDOMAIN/DNS error (treated like timeout).
 func mtuProbeOneExchange(ep *poolEndpoint, domain dns.Name, probeID turbotunnel.ClientID, size int, isServer bool, timeout time.Duration) (ok, permanentFail bool) {
 	buf := make([]byte, 8192)
-	nxCount := 0
 
 	for {
 		var msg []byte
@@ -352,12 +351,9 @@ func mtuProbeOneExchange(ep *poolEndpoint, domain dns.Name, probeID turbotunnel.
 				return false, true
 			}
 			rcode := resp.Flags & 0x000f
-			if rcode == dns.RcodeNameError {
-				nxCount++
-				if nxCount > mtuProbeNXDOMAINRetries {
-					return false, false
-				}
-				break // new query with fresh noise
+			if rcode != dns.RcodeNoError {
+				// NXDOMAIN or other DNS error: treat like timeout.
+				return false, false
 			}
 			if VerifyProbeResponse(buf[:n], domain) {
 				return true, false

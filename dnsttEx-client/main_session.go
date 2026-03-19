@@ -10,7 +10,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -94,14 +93,6 @@ func (sm *sessionManager) createSessionUnlocked() (*kcp.UDPSession, io.ReadWrite
 		2,  // resend=2: fast retransmit after 2 ACK gaps (0 = disabled)
 		1,  // nc=1: congestion window off
 	)
-	// DNS can take many seconds to respond; set minimum RTO so we don't retransmit too soon and burst.
-	kcpMinRTO := uint32(1000)
-	if s := os.Getenv("DNSTT_KCP_MIN_RTO_MS"); s != "" {
-		if ms, err := strconv.ParseUint(s, 10, 32); err == nil {
-			kcpMinRTO = uint32(ms)
-		}
-	}
-	conn.SetMinRTO(kcpMinRTO)
 	conn.SetWindowSize(512, 512) // was QueueSize/2=64; larger window for high-latency DNS
 	if !conn.SetMtu(sm.mtu) {
 		conn.Close()
