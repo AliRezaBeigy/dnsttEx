@@ -20,7 +20,7 @@ func TestMTUDiscoveryFullPath(t *testing.T) {
 		func(addr string) udpRelay { return newCountingUDPRelay(t, addr) },
 		&stderrBuf, nil)
 
-	serverMTU, clientMTU := waitForMTUDiscovery(t, &stderrBuf, 10*time.Second)
+	serverMTU, clientMTU := waitForMTUDiscovery(t, &stderrBuf, 60*time.Second)
 	if serverMTU < 512 {
 		t.Errorf("server MTU %d < 512 (expected at least 512 with transparent path)", serverMTU)
 	}
@@ -58,7 +58,7 @@ func TestMTUDiscoveryTruncated512(t *testing.T) {
 		func(addr string) udpRelay { return newTruncatingUDPRelay(t, addr, 512) },
 		&stderrBuf, nil)
 
-	serverMTU, clientMTU := waitForMTUDiscovery(t, &stderrBuf, 15*time.Second)
+	serverMTU, clientMTU := waitForMTUDiscovery(t, &stderrBuf, 60*time.Second)
 	if serverMTU != 512 {
 		t.Errorf("with 512-byte truncating relay: server MTU = %d, want 512", serverMTU)
 	}

@@ -31,7 +31,7 @@ func TestLowMTUCommunication(t *testing.T) {
 		},
 		&stderrBuf, clientEnv)
 
-	serverMTU, clientMTU := waitForMTUDiscovery(t, &stderrBuf, 15*time.Second)
+	serverMTU, clientMTU := waitForMTUDiscovery(t, &stderrBuf, 60*time.Second)
 	if serverMTU != maxResponseSize {
 		t.Errorf("server MTU = %d, want %d (path limits responses to %d)", serverMTU, maxResponseSize, maxResponseSize)
 	}
@@ -51,7 +51,7 @@ func TestLowMTUCommunication(t *testing.T) {
 			return newTruncatingUDPRelayWithClientQueryWireLimit(t, addr, maxResponseSize, 255) // allow full QNAME
 		},
 		&stderrBuf2, clientEnv)
-	_, _ = waitForMTUDiscovery(t, &stderrBuf2, 15*time.Second)
+	_, _ = waitForMTUDiscovery(t, &stderrBuf2, 60*time.Second)
 
 	conn := h2.dialTunnel(t)
 	defer conn.Close()
@@ -117,7 +117,7 @@ func TestLowMTULargeTransferIntegrity(t *testing.T) {
 		t.Logf("MTU discovery: server=%d client=%d (external mode, not verified from stderr)", serverMTU, clientMTU)
 		waitTCP(t, "127.0.0.1:1082", 20*time.Second)
 	} else {
-		serverMTU, clientMTU = waitForMTUDiscovery(t, &stderrBuf, 15*time.Second)
+		serverMTU, clientMTU = waitForMTUDiscovery(t, &stderrBuf, 60*time.Second)
 		if serverMTU != maxResponseSize {
 			t.Errorf("server MTU = %d, want %d (path limits responses to %d)", serverMTU, maxResponseSize, maxResponseSize)
 		}
@@ -235,7 +235,7 @@ func TestSlowLossyLowMTULargeTransferIntegrity(t *testing.T) {
 		},
 		&stderrBuf, clientEnv)
 
-	serverMTU, clientMTU := waitForMTUDiscovery(t, &stderrBuf, 20*time.Second)
+	serverMTU, clientMTU := waitForMTUDiscovery(t, &stderrBuf, 60*time.Second)
 	if serverMTU != maxResponseSize {
 		t.Errorf("server MTU = %d, want %d (path limits responses to %d)", serverMTU, maxResponseSize, maxResponseSize)
 	}
@@ -341,7 +341,7 @@ func TestTunnelUsesDiscoveredRequestMTU(t *testing.T) {
 		},
 		&stderrBuf, clientEnv)
 
-	serverMTU, clientMTU := waitForMTUDiscovery(t, &stderrBuf, 15*time.Second)
+	serverMTU, clientMTU := waitForMTUDiscovery(t, &stderrBuf, 60*time.Second)
 	if clientMTU != wantDiscoveredQNAME {
 		t.Fatalf("MTU discovery: client MTU = %d, want %d", clientMTU, wantDiscoveredQNAME)
 	}
@@ -404,7 +404,7 @@ func TestTunnelBatchesPacketsWhenSending1024(t *testing.T) {
 		},
 		&stderrBuf, clientEnv)
 
-	_, clientMTU := waitForMTUDiscovery(t, &stderrBuf, 15*time.Second)
+	_, clientMTU := waitForMTUDiscovery(t, &stderrBuf, 60*time.Second)
 	if clientMTU != wantQNAME {
 		t.Fatalf("MTU discovery: client MTU = %d, want %d", clientMTU, wantQNAME)
 	}

@@ -302,6 +302,129 @@ func scanUDPSingleConn(udpAddrStr string, domain dns.Name, timeout time.Duration
 	return true
 }
 
+// mtuProbeResult is the result of one probe exchange in a concurrent round.
+type mtuProbeResult int
+
+const (
+	mtuProbeResultTimeout mtuProbeResult = iota
+	mtuProbeOK
+	mtuProbePermanentFail
+)
+
+// serverMTUProbeRound sends one probe per size (each with unique QNAME), then reads until
+// a response or timeout for each. Returns per-size result. Sizes not in the result timed out.
+func serverMTUProbeRound(ep *poolEndpoint, domain dns.Name, probeID turbotunnel.ClientID, sizes []int, timeout time.Duration) map[int]mtuProbeResult {
+	expectedToSize := make(map[string]int)
+	for _, size := range sizes {
+		msg, err := BuildMTUProbeMessage(domain, probeID, size)
+		if err != nil {
+			continue
+		}
+		var expectedName string
+		if q, e := dns.MessageFromWireFormat(msg); e == nil && len(q.Question) == 1 {
+			expectedName = strings.ToLower(q.Question[0].Name.String())
+		}
+		if expectedName == "" {
+			continue
+		}
+		if _, err := ep.probeConn.WriteTo(msg, ep.addr); err != nil {
+			continue
+		}
+		expectedToSize[expectedName] = size
+	}
+	if len(expectedToSize) == 0 {
+		return nil
+	}
+	deadline := time.Now().Add(timeout)
+	ep.probeConn.SetDeadline(deadline)
+	buf := make([]byte, 8192)
+	results := make(map[int]mtuProbeResult)
+	for _, size := range expectedToSize {
+		results[size] = mtuProbeResultTimeout
+	}
+	for len(expectedToSize) > 0 {
+		n, _, err := ep.probeConn.ReadFrom(buf)
+		if err != nil {
+			break
+		}
+		resp, parseErr := dns.MessageFromWireFormat(buf[:n])
+		if parseErr != nil || len(resp.Question) != 1 {
+			continue
+		}
+		expectedName := strings.ToLower(resp.Question[0].Name.String())
+		size, ok := expectedToSize[expectedName]
+		if !ok {
+			continue
+		}
+		delete(expectedToSize, expectedName)
+		if VerifyMTUProbeResponse(buf[:n], domain, size) {
+			results[size] = mtuProbeOK
+		} else {
+			results[size] = mtuProbePermanentFail
+		}
+	}
+	ep.probeConn.SetDeadline(time.Time{})
+	return results
+}
+
+// clientMTUProbeRound is like serverMTUProbeRound but for client QNAME size probes.
+func clientMTUProbeRound(ep *poolEndpoint, domain dns.Name, probeID turbotunnel.ClientID, sizes []int, timeout time.Duration) map[int]mtuProbeResult {
+	expectedToSize := make(map[string]int)
+	for _, size := range sizes {
+		msg, err := BuildProbeMessageWithRequestSize(domain, probeID, size)
+		if err != nil {
+			continue
+		}
+		var expectedName string
+		if q, e := dns.MessageFromWireFormat(msg); e == nil && len(q.Question) == 1 {
+			expectedName = strings.ToLower(q.Question[0].Name.String())
+		}
+		if expectedName == "" {
+			continue
+		}
+		if _, err := ep.probeConn.WriteTo(msg, ep.addr); err != nil {
+			continue
+		}
+		expectedToSize[expectedName] = size
+	}
+	if len(expectedToSize) == 0 {
+		return nil
+	}
+	deadline := time.Now().Add(timeout)
+	ep.probeConn.SetDeadline(deadline)
+	buf := make([]byte, 8192)
+	results := make(map[int]mtuProbeResult)
+	for _, size := range expectedToSize {
+		results[size] = mtuProbeResultTimeout
+	}
+	for len(expectedToSize) > 0 {
+		n, _, err := ep.probeConn.ReadFrom(buf)
+		if err != nil {
+			break
+		}
+		resp, parseErr := dns.MessageFromWireFormat(buf[:n])
+		if parseErr != nil || len(resp.Question) != 1 {
+			continue
+		}
+		expectedName := strings.ToLower(resp.Question[0].Name.String())
+		size, ok := expectedToSize[expectedName]
+		if !ok {
+			continue
+		}
+		delete(expectedToSize, expectedName)
+		rcode := resp.Flags & 0x000f
+		if rcode != dns.RcodeNoError {
+			results[size] = mtuProbeResultTimeout
+		} else if VerifyProbeResponse(buf[:n], domain) {
+			results[size] = mtuProbeOK
+		} else {
+			results[size] = mtuProbePermanentFail
+		}
+	}
+	ep.probeConn.SetDeadline(time.Time{})
+	return results
+}
+
 // mtuProbeOneExchange sends one probe and waits for a matching response until timeout.
 // Returns (true, false) on success; (false, true) if the path definitively rejects this size;
 // (false, false) on timeout, I/O error, or NXDOMAIN/DNS error (treated like timeout).
@@ -404,10 +527,13 @@ func mtuSizePassesProbes(ep *poolEndpoint, domain dns.Name, probeID turbotunnel.
 	return true
 }
 
+// mtuMaxConcurrentRounds limits how many rounds we run when a size keeps timing out.
+const mtuMaxConcurrentRounds = 6
+
 // discoverMTU finds max DNS response wire (server MTU) and max question QNAME length (client MTU)
-// that work for this resolver. Each candidate size must pass mtuProbeSuccessesRequired consecutive
-// successful exchanges; timeouts trigger one extra send/read per trial (mtuProbeAfterTimeoutRetries).
-// If clientMTUOverride > 0, client request size is not probed.
+// that work for this resolver. All candidate sizes are probed concurrently each round; each size
+// must pass mtuProbeSuccessesRequired successful exchanges (across rounds). If clientMTUOverride > 0,
+// client request size is not probed.
 func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration, clientMTUOverride int) {
 	if ep.probeConn == nil {
 		return
@@ -418,26 +544,16 @@ func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration, clien
 	clientSizes := []int{32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 255}
 
 	if dnsttDebug() {
-		log.Printf("DNSTT_DEBUG: MTU discovery %s: server sizes (descending) then client QNAME sizes (descending), %d successes each, %d timeout-retries/trial",
-			ep.name, mtuProbeSuccessesRequired, mtuProbeAfterTimeoutRetries)
+		log.Printf("DNSTT_DEBUG: MTU discovery %s: concurrent rounds, %d successes per size, max %d rounds",
+			ep.name, mtuProbeSuccessesRequired, mtuMaxConcurrentRounds)
 	}
 
-	log.Printf("MTU discovery: %s — probing max DNS response payload (trying largest sizes first)…", ep.name)
-	serverMTU := 0
-	for i := len(serverSizes) - 1; i >= 0; i-- {
-		size := serverSizes[i]
-		log.Printf("MTU discovery: %s — response payload trial: up to %d bytes (need %d OK exchanges)…", ep.name, size, mtuProbeSuccessesRequired)
-		if mtuSizePassesProbes(ep, domain, probeID, size, true, timeout) {
-			serverMTU = size
-			log.Printf("MTU discovery: %s — response payload %d bytes: OK", ep.name, size)
-			if dnsttDebug() {
-				log.Printf("DNSTT_DEBUG: MTU probe %s: max response wire %d bytes (passed %d probes)", ep.name, size, mtuProbeSuccessesRequired)
-			}
-			break
-		}
-		if i > 0 {
-			log.Printf("MTU discovery: %s — response payload %d bytes: no stable path, trying smaller", ep.name, size)
-		}
+	log.Printf("MTU discovery: %s — probing max DNS response payload (all sizes concurrently)…", ep.name)
+	serverMTU := discoverMTUConcurrent(ep, domain, probeID, serverSizes, true, timeout, func(size int, okCount int) {
+		log.Printf("MTU discovery: %s — response payload %d bytes: %d/%d OK", ep.name, size, okCount, mtuProbeSuccessesRequired)
+	})
+	if serverMTU > 0 {
+		log.Printf("MTU discovery: %s — response payload %d bytes: OK", ep.name, serverMTU)
 	}
 
 	clientMTU := 0
@@ -445,26 +561,63 @@ func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration, clien
 		clientMTU = clientMTUOverride
 		log.Printf("MTU discovery: %s — client query QNAME length fixed at %d bytes (-mtu)", ep.name, clientMTUOverride)
 	} else {
-		log.Printf("MTU discovery: %s — probing max query QNAME wire length…", ep.name)
-		for i := len(clientSizes) - 1; i >= 0; i-- {
-			size := clientSizes[i]
-			log.Printf("MTU discovery: %s — QNAME length trial: ≥%d bytes (need %d OK exchanges)…", ep.name, size, mtuProbeSuccessesRequired)
-			if mtuSizePassesProbes(ep, domain, probeID, size, false, timeout) {
-				clientMTU = size
-				log.Printf("MTU discovery: %s — max QNAME length %d bytes: OK", ep.name, size)
-				if dnsttDebug() {
-					log.Printf("DNSTT_DEBUG: MTU probe %s: max query QNAME %d bytes (passed %d probes)", ep.name, size, mtuProbeSuccessesRequired)
-				}
-				break
-			}
-			if i > 0 {
-				log.Printf("MTU discovery: %s — QNAME %d bytes: no stable path, trying smaller", ep.name, size)
-			}
+		log.Printf("MTU discovery: %s — probing max query QNAME wire length (all sizes concurrently)…", ep.name)
+		clientMTU = discoverMTUConcurrent(ep, domain, probeID, clientSizes, false, timeout, func(size int, okCount int) {
+			log.Printf("MTU discovery: %s — QNAME ≥%d bytes: %d/%d OK", ep.name, size, okCount, mtuProbeSuccessesRequired)
+		})
+		if clientMTU > 0 {
+			log.Printf("MTU discovery: %s — max QNAME length %d bytes: OK", ep.name, clientMTU)
 		}
 	}
 
 	ep.setMaxSizes(serverMTU, clientMTU)
 	log.Printf("MTU discovery: %s → max response wire %d bytes, max query QNAME %d bytes", ep.name, serverMTU, clientMTU)
+}
+
+// discoverMTUConcurrent runs concurrent probe rounds for the given sizes (descending order).
+// It returns the largest size that achieved mtuProbeSuccessesRequired OKs. progress is called when
+// a size gets another OK (okCount is the new count for that size).
+func discoverMTUConcurrent(ep *poolEndpoint, domain dns.Name, probeID turbotunnel.ClientID, sizes []int, isServer bool, timeout time.Duration, progress func(size int, okCount int)) int {
+	okCount := make(map[int]int)
+	failed := make(map[int]bool)
+	for _, s := range sizes {
+		okCount[s] = 0
+	}
+	for round := 0; round < mtuMaxConcurrentRounds; round++ {
+		var toProbe []int
+		for _, s := range sizes {
+			if !failed[s] && okCount[s] < mtuProbeSuccessesRequired {
+				toProbe = append(toProbe, s)
+			}
+		}
+		if len(toProbe) == 0 {
+			break
+		}
+		var results map[int]mtuProbeResult
+		if isServer {
+			results = serverMTUProbeRound(ep, domain, probeID, toProbe, timeout)
+		} else {
+			results = clientMTUProbeRound(ep, domain, probeID, toProbe, timeout)
+		}
+		for size, res := range results {
+			switch res {
+			case mtuProbeOK:
+				okCount[size]++
+				if progress != nil {
+					progress(size, okCount[size])
+				}
+			case mtuProbePermanentFail:
+				failed[size] = true
+			}
+		}
+	}
+	// Largest size with required OKs (sizes are in ascending order, so iterate backwards).
+	for i := len(sizes) - 1; i >= 0; i-- {
+		if okCount[sizes[i]] >= mtuProbeSuccessesRequired {
+			return sizes[i]
+		}
+	}
+	return 0
 }
 
 // RunScanCommand runs the standalone "scan" subcommand (args = os.Args[2:]).

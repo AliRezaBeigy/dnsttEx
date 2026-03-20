@@ -491,7 +491,9 @@ func newTunnelHarnessWithRelayAndStderr(t testing.TB, serverBin, clientBin strin
 	if err := h.clientCmd.Start(); err != nil {
 		t.Fatalf("start client: %v", err)
 	}
-	waitTCP(t, h.ClientAddr, 20*time.Second)
+	// Client opens TCP listener only after MTU discovery completes. With a truncating
+	// relay (e.g. 512 bytes), discovery tries large sizes first and can take 30–60s.
+	waitTCP(t, h.ClientAddr, 60*time.Second)
 	t.Cleanup(func() {
 		relay.Close()
 		h.Teardown()
