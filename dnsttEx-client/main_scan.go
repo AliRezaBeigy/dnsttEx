@@ -311,37 +311,41 @@ const (
 	mtuProbePermanentFail
 )
 
-// serverMTUProbeRound sends one probe per size (each with unique QNAME), then reads until
-// a response or timeout for each. Returns per-size result. Sizes not in the result timed out.
-func serverMTUProbeRound(ep *poolEndpoint, domain dns.Name, probeID turbotunnel.ClientID, sizes []int, timeout time.Duration) map[int]mtuProbeResult {
+// serverMTUProbeRound sends attemptsBySize[size] probes for each size (unique QNAME per probe),
+// then reads responses until timeout. It returns successful response count and permanent failures.
+func serverMTUProbeRound(ep *poolEndpoint, domain dns.Name, probeID turbotunnel.ClientID, sizes []int, attemptsBySize map[int]int, timeout time.Duration) (map[int]int, map[int]bool) {
 	expectedToSize := make(map[string]int)
 	for _, size := range sizes {
-		msg, err := BuildMTUProbeMessage(domain, probeID, size)
-		if err != nil {
-			continue
+		attempts := attemptsBySize[size]
+		if attempts < 1 {
+			attempts = 1
 		}
-		var expectedName string
-		if q, e := dns.MessageFromWireFormat(msg); e == nil && len(q.Question) == 1 {
-			expectedName = strings.ToLower(q.Question[0].Name.String())
+		for i := 0; i < attempts; i++ {
+			msg, err := BuildMTUProbeMessage(domain, probeID, size)
+			if err != nil {
+				continue
+			}
+			var expectedName string
+			if q, e := dns.MessageFromWireFormat(msg); e == nil && len(q.Question) == 1 {
+				expectedName = strings.ToLower(q.Question[0].Name.String())
+			}
+			if expectedName == "" {
+				continue
+			}
+			if _, err := ep.probeConn.WriteTo(msg, ep.addr); err != nil {
+				continue
+			}
+			expectedToSize[expectedName] = size
 		}
-		if expectedName == "" {
-			continue
-		}
-		if _, err := ep.probeConn.WriteTo(msg, ep.addr); err != nil {
-			continue
-		}
-		expectedToSize[expectedName] = size
 	}
 	if len(expectedToSize) == 0 {
-		return nil
+		return map[int]int{}, map[int]bool{}
 	}
 	deadline := time.Now().Add(timeout)
 	ep.probeConn.SetDeadline(deadline)
 	buf := make([]byte, 8192)
-	results := make(map[int]mtuProbeResult)
-	for _, size := range expectedToSize {
-		results[size] = mtuProbeResultTimeout
-	}
+	okCount := make(map[int]int)
+	permanentFail := make(map[int]bool)
 	for len(expectedToSize) > 0 {
 		n, _, err := ep.probeConn.ReadFrom(buf)
 		if err != nil {
@@ -358,45 +362,49 @@ func serverMTUProbeRound(ep *poolEndpoint, domain dns.Name, probeID turbotunnel.
 		}
 		delete(expectedToSize, expectedName)
 		if VerifyMTUProbeResponse(buf[:n], domain, size) {
-			results[size] = mtuProbeOK
+			okCount[size]++
 		} else {
-			results[size] = mtuProbePermanentFail
+			permanentFail[size] = true
 		}
 	}
 	ep.probeConn.SetDeadline(time.Time{})
-	return results
+	return okCount, permanentFail
 }
 
 // clientMTUProbeRound is like serverMTUProbeRound but for client QNAME size probes.
-func clientMTUProbeRound(ep *poolEndpoint, domain dns.Name, probeID turbotunnel.ClientID, sizes []int, timeout time.Duration) map[int]mtuProbeResult {
+func clientMTUProbeRound(ep *poolEndpoint, domain dns.Name, probeID turbotunnel.ClientID, sizes []int, attemptsBySize map[int]int, timeout time.Duration) (map[int]int, map[int]bool) {
 	expectedToSize := make(map[string]int)
 	for _, size := range sizes {
-		msg, err := BuildProbeMessageWithRequestSize(domain, probeID, size)
-		if err != nil {
-			continue
+		attempts := attemptsBySize[size]
+		if attempts < 1 {
+			attempts = 1
 		}
-		var expectedName string
-		if q, e := dns.MessageFromWireFormat(msg); e == nil && len(q.Question) == 1 {
-			expectedName = strings.ToLower(q.Question[0].Name.String())
+		for i := 0; i < attempts; i++ {
+			msg, err := BuildProbeMessageWithRequestSize(domain, probeID, size)
+			if err != nil {
+				continue
+			}
+			var expectedName string
+			if q, e := dns.MessageFromWireFormat(msg); e == nil && len(q.Question) == 1 {
+				expectedName = strings.ToLower(q.Question[0].Name.String())
+			}
+			if expectedName == "" {
+				continue
+			}
+			if _, err := ep.probeConn.WriteTo(msg, ep.addr); err != nil {
+				continue
+			}
+			expectedToSize[expectedName] = size
 		}
-		if expectedName == "" {
-			continue
-		}
-		if _, err := ep.probeConn.WriteTo(msg, ep.addr); err != nil {
-			continue
-		}
-		expectedToSize[expectedName] = size
 	}
 	if len(expectedToSize) == 0 {
-		return nil
+		return map[int]int{}, map[int]bool{}
 	}
 	deadline := time.Now().Add(timeout)
 	ep.probeConn.SetDeadline(deadline)
 	buf := make([]byte, 8192)
-	results := make(map[int]mtuProbeResult)
-	for _, size := range expectedToSize {
-		results[size] = mtuProbeResultTimeout
-	}
+	okCount := make(map[int]int)
+	permanentFail := make(map[int]bool)
 	for len(expectedToSize) > 0 {
 		n, _, err := ep.probeConn.ReadFrom(buf)
 		if err != nil {
@@ -414,15 +422,15 @@ func clientMTUProbeRound(ep *poolEndpoint, domain dns.Name, probeID turbotunnel.
 		delete(expectedToSize, expectedName)
 		rcode := resp.Flags & 0x000f
 		if rcode != dns.RcodeNoError {
-			results[size] = mtuProbeResultTimeout
+			continue
 		} else if VerifyProbeResponse(buf[:n], domain) {
-			results[size] = mtuProbeOK
+			okCount[size]++
 		} else {
-			results[size] = mtuProbePermanentFail
+			permanentFail[size] = true
 		}
 	}
 	ep.probeConn.SetDeadline(time.Time{})
-	return results
+	return okCount, permanentFail
 }
 
 // mtuProbeOneExchange sends one probe and waits for a matching response until timeout.
@@ -585,30 +593,33 @@ func discoverMTUConcurrent(ep *poolEndpoint, domain dns.Name, probeID turbotunne
 	}
 	for round := 0; round < mtuMaxConcurrentRounds; round++ {
 		var toProbe []int
+		attemptsBySize := make(map[int]int)
 		for _, s := range sizes {
 			if !failed[s] && okCount[s] < mtuProbeSuccessesRequired {
 				toProbe = append(toProbe, s)
+				attemptsBySize[s] = mtuProbeSuccessesRequired - okCount[s]
 			}
 		}
 		if len(toProbe) == 0 {
 			break
 		}
-		var results map[int]mtuProbeResult
+		var roundOK map[int]int
+		var roundPermanentFail map[int]bool
 		if isServer {
-			results = serverMTUProbeRound(ep, domain, probeID, toProbe, timeout)
+			roundOK, roundPermanentFail = serverMTUProbeRound(ep, domain, probeID, toProbe, attemptsBySize, timeout)
 		} else {
-			results = clientMTUProbeRound(ep, domain, probeID, toProbe, timeout)
+			roundOK, roundPermanentFail = clientMTUProbeRound(ep, domain, probeID, toProbe, attemptsBySize, timeout)
 		}
-		for size, res := range results {
-			switch res {
-			case mtuProbeOK:
+		for size, n := range roundOK {
+			for i := 0; i < n && okCount[size] < mtuProbeSuccessesRequired; i++ {
 				okCount[size]++
 				if progress != nil {
 					progress(size, okCount[size])
 				}
-			case mtuProbePermanentFail:
-				failed[size] = true
 			}
+		}
+		for size := range roundPermanentFail {
+			failed[size] = true
 		}
 	}
 	// Largest size with required OKs (sizes are in ascending order, so iterate backwards).

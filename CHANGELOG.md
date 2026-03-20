@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **MTU discovery faster convergence (`3/3` in one timeout window)** — For each candidate response size and QNAME size, the client now sends all remaining required probe attempts concurrently in the same round instead of waiting for one probe per round.
+
 - **Downstream empty marker semantics (`TXT(0x00)`)** — The client now treats a single-byte `0x00` TXT payload as an explicit empty-response marker (poll/ACK) rather than a tunnel data packet.
 
 - **Latency-first downstream response utilization** — In server `sendLoop`, when per-client collection lock contention occurs (`TryLock` fails), the server now performs a zero-wait dequeue probe (`Unstash` then `OutgoingQueue`) before falling back to the empty marker. This keeps low latency while reducing missed chances to return real data.
