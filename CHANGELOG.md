@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-03-20
+
+### Changed
+
+- **Optional no-ACK downstream mode (experimental)** — Added KCP toggles to support a one-way downstream model where the server can treat sent `PUSH` segments as delivered immediately (`SetAssumeDeliveredAfterSend`) and the client can suppress outgoing ACK generation (`SetSuppressOutgoingACK`). This is intended for constrained paths where client→server return traffic is expensive.
+
+- **Loss-avoidance via backpressure in no-retransmit paths** — The KCP post-processing enqueue path now avoids silent drops when assume-delivered mode is active; packets are backpressured instead of discarded. This prevents unrecoverable stream stalls that would otherwise occur when retransmission is disabled.
+
+- **Queue path hardening against silent drops** — `QueuePacketConn` enqueue operations now prefer backpressure over drop-on-full behavior, and downstream stash handling in server `sendLoop` now uses a non-dropping backpressure helper. This reduces hidden packet loss under burst load.
+
 ## [1.4.4] - 2026-03-20
 
 ### Changed
@@ -182,7 +192,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.4.4...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.4.4...v1.5.0
 [1.4.4]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.4.3...v1.4.4
 [1.4.3]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.4.2...v1.4.3
 [1.4.2]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.4.1...v1.4.2

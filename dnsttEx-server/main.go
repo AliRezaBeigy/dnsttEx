@@ -385,6 +385,9 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string, 
 			1,  // nc=1: congestion window off
 		)
 		conn.SetWindowSize(512, 512) // was QueueSize/2=64; larger window for high-latency DNS
+		// Custom mode: do not wait for client ACK for sent KCP PUSH segments.
+		// Once placed on wire, sender considers segment delivered (no retransmit).
+		conn.SetAssumeDeliveredAfterSend(true)
 		if rc := conn.SetMtu(mtu); !rc {
 			panic(rc)
 		}
@@ -610,6 +613,14 @@ func dequeueOneDownstreamNonBlocking(ttConn *turbotunnel.QueuePacketConn, client
 	default:
 	}
 	return nil, false
+}
+
+// stashDownstreamWithBackpressure stores packet in per-client stash without loss.
+// In high-burst mode we prefer backpressure over silent drops.
+func stashDownstreamWithBackpressure(ttConn *turbotunnel.QueuePacketConn, clientID turbotunnel.ClientID, p []byte) {
+	for !ttConn.Stash(p, clientID) {
+		time.Sleep(1 * time.Millisecond)
+	}
 }
 
 // --- Fallback NAT logic for non-DNS packets ---
@@ -979,7 +990,7 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 							binary.Write(&payload, binary.BigEndian, uint16(len(p)))
 							payload.Write(p)
 						} else {
-							ttConn.Stash(p, rec.ClientID)
+							stashDownstreamWithBackpressure(ttConn, rec.ClientID, p)
 						}
 					}
 					payloadBytes := payload.Bytes()
@@ -1042,7 +1053,7 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 
 						packetSize := 2 + len(p)
 						if limit < packetSize {
-							ttConn.Stash(p, rec.ClientID)
+							stashDownstreamWithBackpressure(ttConn, rec.ClientID, p)
 							break
 						}
 						limit -= packetSize

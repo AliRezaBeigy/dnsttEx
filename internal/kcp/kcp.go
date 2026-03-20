@@ -231,6 +231,8 @@ type KCP struct {
 	fastresend int32  // fast retransmit trigger count, 0 = disabled
 	nocwnd     int32  // 1 = disable congestion control
 	stream     int32  // 1 = stream mode (no message boundaries), 0 = message mode
+	assumeDeliveredAfterSend bool // when true, sender drops PUSH segments right after first transmit (no ACK wait/retransmit)
+	suppressOutgoingACK      bool // when true, do not emit ACKs for received PUSH segments
 
 	// Logging
 	logmask KCPLogType
@@ -559,6 +561,23 @@ func (kcp *KCP) parse_una(una uint32) int {
 	return count
 }
 
+// discardFrontAcked removes contiguous acked segments from the front of snd_buf.
+// Returns the number of discarded segments.
+func (kcp *KCP) discardFrontAcked() int {
+	count := 0
+	for seg := range kcp.snd_buf.ForEach {
+		if seg.acked == 1 {
+			count++
+		} else {
+			break
+		}
+	}
+	if count > 0 {
+		kcp.snd_buf.Discard(count)
+	}
+	return count
+}
+
 // ack append
 func (kcp *KCP) ack_push(sn, ts uint32) {
 	kcp.acklist = append(kcp.acklist, ackItem{sn, ts})
@@ -668,7 +687,9 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 		case IKCP_CMD_PUSH:
 			repeat := true
 			if _itimediff(sn, kcp.rcv_nxt+kcp.rcv_wnd) < 0 {
-				kcp.ack_push(sn, ts)
+				if !kcp.suppressOutgoingACK {
+					kcp.ack_push(sn, ts)
+				}
 				if _itimediff(sn, kcp.rcv_nxt) >= 0 {
 					repeat = kcp.parse_data(segment{
 						conv: conv, cmd: cmd, frg: frg, wnd: wnd,
@@ -962,6 +983,12 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 				if segment.xmit >= kcp.dead_link {
 					dropFrontSegment = true
 				}
+				// Optional lossy mode: as soon as we put a PUSH segment on wire once,
+				// consider it delivered and stop waiting for peer ACKs.
+				if kcp.assumeDeliveredAfterSend && segment.cmd == IKCP_CMD_PUSH {
+					segment.acked = 1
+					kcp.recycleSegment(segment)
+				}
 			}
 
 			// get the nearest rto
@@ -974,6 +1001,11 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 				kcp.recycleSegment(&seg)
 			}
 			kcp.shrink_buf()
+		}
+		if kcp.assumeDeliveredAfterSend {
+			if kcp.discardFrontAcked() > 0 {
+				kcp.shrink_buf()
+			}
 		}
 	}
 
@@ -1019,6 +1051,18 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 	}
 
 	return nextUpdate
+}
+
+// SetAssumeDeliveredAfterSend toggles sender behavior that drops PUSH segments
+// from the send buffer right after first transmit, without waiting for ACKs.
+func (kcp *KCP) SetAssumeDeliveredAfterSend(enable bool) {
+	kcp.assumeDeliveredAfterSend = enable
+}
+
+// SetSuppressOutgoingACK toggles ACK emission for received PUSH segments.
+// When enabled, this endpoint will not send KCP ACK packets.
+func (kcp *KCP) SetSuppressOutgoingACK(enable bool) {
+	kcp.suppressOutgoingACK = enable
 }
 
 // (deprecated)

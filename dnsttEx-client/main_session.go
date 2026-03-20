@@ -95,6 +95,8 @@ func (sm *sessionManager) createSessionUnlocked() (*kcp.UDPSession, io.ReadWrite
 		1,  // nc=1: congestion window off
 	)
 	conn.SetWindowSize(512, 512) // was QueueSize/2=64; larger window for high-latency DNS
+	// Custom mode: suppress client ACK packets for received downstream KCP PUSH.
+	conn.SetSuppressOutgoingACK(true)
 	if !conn.SetMtu(sm.mtu) {
 		conn.Close()
 		return nil, nil, nil, 0, fmt.Errorf("KCP SetMtu(%d) failed (minimum %d)", sm.mtu, minKCPMTU)

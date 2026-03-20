@@ -232,14 +232,24 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 			// copy the data to a new buffer, and reserve header space
 			copy(bts[sess.headerSize:], buf)
 
-			// delivery to post processing (non-blocking to avoid deadlock under lock)
-			select {
-			case sess.chPostProcessing <- sendRequest{bts, false}:
-			case <-sess.die:
-				return
-			default:
-				// drop and recycle to avoid blocking; KCP will retransmit if needed
-				defaultBufferPool.Put(bts)
+			// Delivery to post-processing queue.
+			// In normal reliable mode we keep non-blocking behavior and let KCP retransmit on drop.
+			// In assume-delivered mode, dropping here is fatal (no retransmit), so apply backpressure.
+			if sess.kcp.assumeDeliveredAfterSend {
+				select {
+				case sess.chPostProcessing <- sendRequest{bts, false}:
+				case <-sess.die:
+					return
+				}
+			} else {
+				select {
+				case sess.chPostProcessing <- sendRequest{bts, false}:
+				case <-sess.die:
+					return
+				default:
+					// drop and recycle to avoid blocking; KCP will retransmit if needed
+					defaultBufferPool.Put(bts)
+				}
 			}
 		}
 	})
@@ -565,6 +575,21 @@ func (s *UDPSession) SetDUP(dup int) {
 func (s *UDPSession) SetNoDelay(nodelay, interval, resend, nc int) {
 	s.mu.Lock()
 	s.kcp.NoDelay(nodelay, interval, resend, nc)
+	s.mu.Unlock()
+}
+
+// SetAssumeDeliveredAfterSend enables/disables lossy TX mode:
+// segments are dropped from sender buffer right after first send, without ACK wait.
+func (s *UDPSession) SetAssumeDeliveredAfterSend(enable bool) {
+	s.mu.Lock()
+	s.kcp.SetAssumeDeliveredAfterSend(enable)
+	s.mu.Unlock()
+}
+
+// SetSuppressOutgoingACK enables/disables ACK emission for received PUSH segments.
+func (s *UDPSession) SetSuppressOutgoingACK(enable bool) {
+	s.mu.Lock()
+	s.kcp.SetSuppressOutgoingACK(enable)
 	s.mu.Unlock()
 }
 

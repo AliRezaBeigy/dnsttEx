@@ -141,7 +141,9 @@ func (inner *remoteMapInner) Lookup(addr net.Addr, now time.Time) *remoteRecord 
 			Addr:      addr,
 			LastSeen:  now,
 			SendQueue: make(chan []byte, QueueSize),
-			Stash:     make(chan []byte, 1),
+			// Keep stash depth aligned with QueueSize to avoid silent loss when
+			// callers need to put back more than one packet under bursty load.
+			Stash: make(chan []byte, QueueSize),
 		}
 		heap.Push(inner, record)
 	}

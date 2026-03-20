@@ -72,8 +72,8 @@ func (c *QueuePacketConn) QueueIncoming(p []byte, addr net.Addr) {
 	copy(buf, p)
 	select {
 	case c.recvQueue <- taggedPacket{buf, addr}:
-	default:
-		// Drop the incoming packet if the receive queue is full.
+	case <-c.closed:
+		// Closed while waiting to enqueue.
 	}
 }
 
@@ -127,8 +127,9 @@ func (c *QueuePacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	// Copy the slice so that the caller may reuse it.
 	buf := make([]byte, len(p))
 	copy(buf, p)
+	sendQueue := c.remotes.SendQueue(addr)
 	select {
-	case c.remotes.SendQueue(addr) <- buf:
+	case sendQueue <- buf:
 		if traceQueue {
 			n := c.traceEnqueues.Add(1)
 			d := c.traceDrops.Load()
@@ -137,15 +138,8 @@ func (c *QueuePacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 			}
 		}
 		return len(buf), nil
-	default:
-		// Drop the outgoing packet if the send queue is full.
-		if traceQueue {
-			c.traceDrops.Add(1)
-			n := c.traceEnqueues.Load()
-			d := c.traceDrops.Load()
-			log.Printf("DNSTT_TRACE_QUEUE: WriteTo DROP (queue full) enqueued=%d drops=%d", n, d)
-		}
-		return len(buf), nil
+	case <-c.closed:
+		return 0, &net.OpError{Op: "write", Net: c.LocalAddr().Network(), Addr: c.LocalAddr(), Err: c.err.Load().(error)}
 	}
 }
 
