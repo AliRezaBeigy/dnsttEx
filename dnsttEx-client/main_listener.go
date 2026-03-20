@@ -158,7 +158,9 @@ type kcpMTUHint interface {
 
 func clientKCPMTU(domain dns.Name, pconn net.PacketConn) (int, error) {
 	capacity := nameCapacity(domain)
-	overhead := 8 + 1 + numPadding + 1
+	// v2 query framing adds 3 bytes ahead of packet framing:
+	// [marker 0xFD][hint_hi][hint_lo].
+	overhead := 8 + 1 + 2 + 1 + numPadding + 1
 	maxPayloadInName := capacity - overhead
 	if maxPayloadInName < 1 {
 		return 0, fmt.Errorf("domain %s leaves no room for payload (capacity %d)", domain, capacity)

@@ -482,12 +482,9 @@ func TestRecvLoopInjectsPackets(t *testing.T) {
 	ch := make(chan *record, 64)
 
 	// Start recvLoop in a goroutine. It returns when dnsConn is closed.
-	clientCache := ttlcache.New[turbotunnel.ClientID, *clientState](
-		ttlcache.WithTTL[turbotunnel.ClientID, *clientState](2*time.Minute),
-	)
 	done := make(chan error, 1)
 	go func() {
-		done <- recvLoop(domain, dnsConn, ttConn, ch, nil, clientCache)
+		done <- recvLoop(domain, dnsConn, ttConn, ch, nil)
 	}()
 
 	// Build a query that carries a real KCP-style packet.
@@ -609,12 +606,9 @@ func TestPongResponseSize(t *testing.T) {
 	defer ttConn.Close()
 
 	ch := make(chan *record, 64)
-	clientCache := ttlcache.New[turbotunnel.ClientID, *clientState](
-		ttlcache.WithTTL[turbotunnel.ClientID, *clientState](2*time.Minute),
-	)
 	done := make(chan error, 1)
 	go func() {
-		done <- recvLoop(domain, dnsConn, ttConn, ch, nil, clientCache)
+		done <- recvLoop(domain, dnsConn, ttConn, ch, nil)
 	}()
 
 	// PING with requested response size 5: clientID(8) + 0xFF + size_hi(1) + size_lo(1) + 6 noise = 17 bytes.

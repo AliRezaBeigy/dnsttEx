@@ -138,17 +138,20 @@ func TestPollPayloadNoise(t *testing.T) {
 	if bytes.Equal(p1, p2) {
 		t.Error("buildUpstreamPayload(nil,0) returned identical payloads twice; poll should include random noise")
 	}
-	// Legacy poll: clientID(8) + 0 + noise(6) = at least 15 bytes
-	if len(p1) < 9+probeNoiseLen || len(p2) < 9+probeNoiseLen {
-		t.Errorf("poll payload too short: %d, %d (want >= %d)", len(p1), len(p2), 9+probeNoiseLen)
+	// v2 poll: clientID(8) + marker(1) + hint(2) + poll(1) + noise(6) = at least 18 bytes
+	if len(p1) < 12+probeNoiseLen || len(p2) < 12+probeNoiseLen {
+		t.Errorf("poll payload too short: %d, %d (want >= %d)", len(p1), len(p2), 12+probeNoiseLen)
 	}
-	// With hint: clientID(8) + 0xFE + hint(2) + noise(6) = at least 17 bytes
+	// With explicit hint: same v2 layout, but hint bytes must match.
 	h1 := conn.buildUpstreamPayload(nil, 512)
-	if len(h1) < 11+probeNoiseLen {
-		t.Errorf("hint-poll payload too short: %d (want >= %d)", len(h1), 11+probeNoiseLen)
+	if len(h1) < 12+probeNoiseLen {
+		t.Errorf("hint-poll payload too short: %d (want >= %d)", len(h1), 12+probeNoiseLen)
 	}
-	if h1[8] != probeModeHintPoll {
-		t.Errorf("hint-poll mode byte = 0x%02x, want 0x%02x", h1[8], probeModeHintPoll)
+	if h1[8] != probeModeSizedFrame {
+		t.Errorf("framing marker byte = 0x%02x, want 0x%02x", h1[8], probeModeSizedFrame)
+	}
+	if h1[11] != probeModePoll {
+		t.Errorf("poll frame byte = 0x%02x, want 0x%02x", h1[11], probeModePoll)
 	}
 	gotHint := int(h1[9])<<8 | int(h1[10])
 	if gotHint != 512 {

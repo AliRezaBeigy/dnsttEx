@@ -61,7 +61,6 @@ import (
 	"os"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"dnsttEx/dns"
@@ -76,12 +75,9 @@ import (
 const (
 	upstreamEDNSOptionCode   = 0xFF00
 	downstreamEDNSOptionCode = 0xFF01
+	probeModeSizedFrame      = 0xFD
 	// Health-check probe: client sends payload with mode byte 0xFF (PING), server responds with "PONG".
 	probeModePING = 0xFF
-	// Poll with in-band response-size hint (mode byte 0xFE): client embeds
-	// its discovered max response size in the QNAME payload so the server
-	// sees it even when recursive resolvers rewrite the OPT Class field.
-	probeModeHintPoll = 0xFE
 )
 
 const (
@@ -114,8 +110,7 @@ var (
 // should be evicted when the client goes idle. Stored in a TTL cache keyed by
 // ClientID so memory is bounded under high client churn.
 type clientState struct {
-	mu       sync.Mutex   // serializes data collection in sendLoop (TryLock)
-	respHint atomic.Int32 // in-band max response size from MTU discovery; 0 = not yet known
+	mu sync.Mutex // serializes data collection in sendLoop (TryLock)
 }
 
 var (
@@ -754,7 +749,7 @@ func (m *FallbackManager) forwardReplies(proxyConn net.PacketConn, clientAddr ne
 // the incoming DNS queries, and puts them on ttConn's incoming queue. Whenever
 // a query calls for a response, constructs a partial response and passes it to
 // sendLoop over ch. Invalid DNS packets are passed to the FallbackManager.
-func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, fallbackMgr *FallbackManager, clientCache *ttlcache.Cache[turbotunnel.ClientID, *clientState]) error {
+func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, fallbackMgr *FallbackManager) error {
 	for {
 		var buf [4096]byte
 		n, addr, err := dnsConn.ReadFrom(buf[:])
@@ -812,45 +807,45 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 				}
 				continue
 			}
-			// Compact framing: first byte 0 = poll; 0xFE = poll with response-size hint;
-			// 1–223 = single packet length; 224+ = legacy (padding then [len+packet]*).
-			if first == probeModeHintPoll {
-				// Poll with in-band response-size hint from client MTU discovery.
-				// Store the minimum across all hints for this client so responses
-				// are safe regardless of which resolver they traverse (ResolverPool
-				// rotates queries across resolvers with different truncation limits).
-				if len(body) >= 3 {
-					hint := int32(int(body[1])<<8 | int(body[2]))
-					if hint >= 512 {
-						item := clientCache.Get(clientID)
-						if item == nil {
-							item, _ = clientCache.GetOrSet(clientID, &clientState{})
+			// In-band response-size hint is carried per query:
+			// [0xFD][hint_hi][hint_lo][frame...]
+			// frame: 0=poll, 1..223=single packet length, 224+=legacy packed.
+			if first == probeModeSizedFrame && len(body) >= 4 {
+				hint := int(body[1])<<8 | int(body[2])
+				if hint >= 512 && hint < maxRespSize {
+					maxRespSize = hint
+				}
+				frame := body[3:]
+				frameFirst := frame[0]
+				if frameFirst == 0 {
+					// Poll: no packets
+				} else if frameFirst >= 1 && frameFirst < 224 {
+					// Single packet of length frameFirst
+					if len(frame) >= 1+int(frameFirst) {
+						p := frame[1 : 1+frameFirst]
+						ttConn.QueueIncoming(p, clientID)
+					}
+				} else {
+					// Legacy: padding byte + padding bytes + [len+packet]*
+					r := bytes.NewReader(frame)
+					for {
+						p, err := nextPacket(r)
+						if err != nil {
+							break
 						}
-						cs := item.Value()
-						for {
-							old := cs.respHint.Load()
-							if old != 0 && hint >= old {
-								break
-							}
-							if cs.respHint.CompareAndSwap(old, hint) {
-								if os.Getenv("DNSTT_DEBUG") != "" {
-									log.Printf("DNSTT_DEBUG: client %s in-band response hint %d bytes", clientID, hint)
-								}
-								break
-							}
-						}
+						ttConn.QueueIncoming(p, clientID)
 					}
 				}
 			} else if first == 0 {
-				// Poll: no packets
+				// Backward-compat poll: no packets.
 			} else if first >= 1 && first < 224 {
-				// Single packet of length first
+				// Backward-compat single packet of length first.
 				if len(body) >= 1+int(first) {
 					p := body[1 : 1+first]
 					ttConn.QueueIncoming(p, clientID)
 				}
 			} else {
-				// Legacy: padding byte + padding bytes + [len+packet]*
+				// Backward-compat legacy: padding byte + padding bytes + [len+packet]*.
 				r := bytes.NewReader(body)
 				for {
 					p, err := nextPacket(r)
@@ -868,18 +863,10 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 				log.Printf("NXDOMAIN: payload too short for ClientID+mode (payload %d bytes) query %s", len(payload), query.Question[0].Name)
 			}
 		}
-		// Apply per-client response-size hint (from in-band MTU discovery).
-		// This caps the response even when the resolver rewrites OPT Class.
-		effectiveMaxResp := maxRespSize
-		if item := clientCache.Get(clientID); item != nil {
-			if h := int(item.Value().respHint.Load()); h > 0 && h < effectiveMaxResp {
-				effectiveMaxResp = h
-			}
-		}
 		// If a response is called for, pass it to sendLoop via the channel.
 		if resp != nil {
 			select {
-			case ch <- &record{Resp: resp, Addr: addr, ClientID: clientID, MaxResponseSize: effectiveMaxResp}:
+			case ch <- &record{Resp: resp, Addr: addr, ClientID: clientID, MaxResponseSize: maxRespSize}:
 			default:
 				// sendLoop is busy; drop this response opportunity.
 				// The client will retry after its poll timer fires.
@@ -1370,7 +1357,7 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 		}()
 	}
 
-	return recvLoop(domain, dnsConn, ttConn, ch, fallbackMgr, clientCache)
+	return recvLoop(domain, dnsConn, ttConn, ch, fallbackMgr)
 }
 
 func main() {

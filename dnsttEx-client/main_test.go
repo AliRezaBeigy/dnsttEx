@@ -18,7 +18,7 @@ func TestRunRejectsLowMTU(t *testing.T) {
 		t.Fatalf("ParseName: %v", err)
 	}
 	capacity := nameCapacity(domain)
-	overhead := 8 + 1 + numPadding + 1
+	overhead := 8 + 1 + 2 + 1 + numPadding + 1
 	maxPayloadInName := capacity - overhead
 	if maxPayloadInName >= minKCPMTU {
 		t.Skipf("domain capacity gives mtu %d >= minKCPMTU %d; need longer domain", maxPayloadInName, minKCPMTU)
@@ -43,8 +43,8 @@ func TestRunRejectsLowMTU(t *testing.T) {
 	if err == nil {
 		t.Fatal("run: expected error for low MTU domain")
 	}
-	if !strings.Contains(err.Error(), "below KCP minimum") {
-		t.Errorf("run: error %v does not mention KCP minimum", err)
+	if !strings.Contains(err.Error(), "below KCP minimum") && !strings.Contains(err.Error(), "leaves no room for payload") {
+		t.Errorf("run: error %v does not mention low-MTU condition", err)
 	}
 }
 
@@ -52,7 +52,7 @@ func TestNamePayloadCapacity(t *testing.T) {
 	// Name-based encoding: ensure capacity fits ClientID + padding + at least one small packet.
 	domain, _ := dns.ParseName("t.example.com")
 	cap := nameCapacity(domain)
-	minNeed := 8 + 1 + numPadding + 1 + 1
+	minNeed := 8 + 1 + 2 + 1 + numPadding + 1 + 1
 	if cap < minNeed {
 		t.Errorf("nameCapacity(%s) = %d < %d", domain, cap, minNeed)
 	}

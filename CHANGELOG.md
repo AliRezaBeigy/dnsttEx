@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-03-20
+
+### Changed
+
+- **Per-query response-size hint for all tunnel queries** — Normal client queries now always carry an unsigned 2-byte max-response hint in-band (`[clientID][0xFD][hint_hi][hint_lo][frame...]`) for both idle polls and data-carrying queries, so server response sizing no longer depends on recursive resolver behavior for OPT Class.
+
+- **Server response sizing is stateless per request** — Removed server-side cached client response-hint state; each response is now capped directly from the current query’s in-band hint (with existing bounds), eliminating cross-query cache assumptions.
+
 ## [1.5.0] - 2026-03-20
 
 ### Changed
@@ -192,7 +200,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.1...HEAD
+[1.5.1]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.4.4...v1.5.0
 [1.4.4]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.4.3...v1.4.4
 [1.4.3]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.4.2...v1.4.3

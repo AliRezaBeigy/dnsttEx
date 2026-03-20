@@ -19,9 +19,9 @@ import (
 
 // Probe mode bytes (first byte of payload after clientID).
 const (
-	probeModePoll     = 0    // normal idle poll
-	probeModeHintPoll = 0xFE // poll with 2-byte max-response-size hint (survives OPT Class rewriting by resolvers)
-	probeModePING     = 0xFF // health-check PING; server must respond with PONG
+	probeModePoll       = 0    // frame marker: normal idle poll
+	probeModeSizedFrame = 0xFD // v2 framing: [0xFD][hint_hi][hint_lo][frame...]
+	probeModePING       = 0xFF // health-check PING; server must respond with PONG
 )
 
 // buildQueryWire builds the DNS query wire bytes from decoded upstream payload.
@@ -129,14 +129,20 @@ func (c *DNSPacketConn) effectiveSendCapacity() int {
 func (c *DNSPacketConn) buildUpstreamPayload(packets [][]byte, maxRespHint int) []byte {
 	var buf bytes.Buffer
 	buf.Write(c.clientID[:])
+	buf.WriteByte(probeModeSizedFrame)
+	if maxRespHint <= 0 {
+		maxRespHint = c.maxResponseSize
+	}
+	if maxRespHint < 512 {
+		maxRespHint = 512
+	}
+	if maxRespHint > 0xFFFF {
+		maxRespHint = 0xFFFF
+	}
+	buf.WriteByte(byte(maxRespHint >> 8))
+	buf.WriteByte(byte(maxRespHint))
 	if len(packets) == 0 {
-		if maxRespHint > 0 && maxRespHint <= 0xFFFF {
-			buf.WriteByte(probeModeHintPoll)
-			buf.WriteByte(byte(maxRespHint >> 8))
-			buf.WriteByte(byte(maxRespHint))
-		} else {
-			buf.WriteByte(0)
-		}
+		buf.WriteByte(probeModePoll)
 		noise := make([]byte, probeNoiseLen)
 		if _, err := rand.Read(noise); err == nil {
 			buf.Write(noise)
@@ -195,7 +201,7 @@ func (c *DNSPacketConn) send(transport net.PacketConn, packets [][]byte, addr ne
 		if !qok {
 			return fmt.Errorf("send: built query has no parsable QNAME")
 		}
-		sendAnyway := len(packets) == 0 && len(decoded) <= 11+probeNoiseLen
+		sendAnyway := len(packets) == 0 && len(decoded) <= 12+probeNoiseLen
 		if maxReq <= 0 || qnl <= maxReq || sendAnyway {
 			if dnsttDebug() && len(packets) > 0 {
 				log.Printf("DNSTT_DEBUG: send: QNAME %d bytes, query wire %d (max QNAME %d)", qnl, len(buf), maxReq)
@@ -267,7 +273,7 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 				capacity = c.maxDecodedPayloadForMaxQName(maxReqOverride)
 			}
 		}
-		overhead := 8 + 1 + numPadding
+		overhead := 8 + 1 + 2 + 1 + numPadding
 		payloadLimit := capacity - overhead
 		if payloadLimit < 0 {
 			payloadLimit = 0

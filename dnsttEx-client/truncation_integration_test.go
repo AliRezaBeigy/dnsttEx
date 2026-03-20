@@ -647,8 +647,8 @@ func TestHintPollWithReducedResponseSize(t *testing.T) {
 	// Read initial poll and extract the hint from the QNAME payload.
 	query1, clientAddr := readQuery()
 
-	// Decode the QNAME payload to extract the hint. The poll payload is:
-	// clientID(8) + mode(1) + [hint_hi(1) + hint_lo(1) if mode==0xFE] + noise
+	// Decode the QNAME payload to extract the hint. v2 poll payload is:
+	// clientID(8) + marker(0xFD) + hint_hi + hint_lo + frame(0=poll) + noise
 	qname := query1.Question[0].Name
 	prefixLabels, ok := qname.TrimSuffix(domain)
 	if !ok {
@@ -663,12 +663,14 @@ func TestHintPollWithReducedResponseSize(t *testing.T) {
 	if err := base36Decode(decoded, encoded); err != nil {
 		t.Fatalf("base36Decode: %v", err)
 	}
-	if len(decoded) < 11 {
+	if len(decoded) < 12 {
 		t.Fatalf("decoded payload too short: %d bytes", len(decoded))
 	}
-	mode := decoded[8]
-	if mode != probeModeHintPoll {
-		t.Skipf("first poll is not a hint-poll (mode=0x%02x); skipping hint verification", mode)
+	if decoded[8] != probeModeSizedFrame {
+		t.Skipf("first poll is not v2-framed (marker=0x%02x); skipping hint verification", decoded[8])
+	}
+	if decoded[11] != probeModePoll {
+		t.Skipf("first frame is not poll (frame=0x%02x); skipping hint verification", decoded[11])
 	}
 	hint1 := int(decoded[9])<<8 | int(decoded[10])
 	t.Logf("initial hint in poll QNAME: %d", hint1)
@@ -703,7 +705,7 @@ func TestHintPollWithReducedResponseSize(t *testing.T) {
 	if err := base36Decode(decoded2, encoded2); err != nil {
 		t.Fatalf("base36Decode: %v", err)
 	}
-	if len(decoded2) >= 11 && decoded2[8] == probeModeHintPoll {
+	if len(decoded2) >= 12 && decoded2[8] == probeModeSizedFrame && decoded2[11] == probeModePoll {
 		hint2 := int(decoded2[9])<<8 | int(decoded2[10])
 		t.Logf("hint after TC=1 in poll QNAME: %d (was %d)", hint2, hint1)
 		if hint2 >= hint1 {
@@ -712,6 +714,13 @@ func TestHintPollWithReducedResponseSize(t *testing.T) {
 	} else {
 		// Re-poll might be a data query (if KCP had data queued). That's OK
 		// as long as the OPT Class was reduced (tested in TestTruncatedOptClassInQueries).
-		t.Logf("re-poll is not a hint-poll (mode=0x%02x); OPT Class reduction tested separately", decoded2[8])
+		marker, frame := byte(0), byte(0)
+		if len(decoded2) > 8 {
+			marker = decoded2[8]
+		}
+		if len(decoded2) > 11 {
+			frame = decoded2[11]
+		}
+		t.Logf("re-poll is not a v2 poll frame (marker=0x%02x frame=0x%02x); OPT Class reduction tested separately", marker, frame)
 	}
 }
