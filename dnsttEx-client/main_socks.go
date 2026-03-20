@@ -47,41 +47,55 @@ func (t *socksTunnel) connectHandle(ctx context.Context, w io.Writer, req *socks
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
 		_ = socks5.SendReply(w, statute.RepAddrTypeNotSupported, nil)
+		log.Printf("socks tcp parse dest %q: %v", addr, err)
 		return err
 	}
 	p64, err := strconv.ParseUint(portStr, 10, 16)
 	if err != nil {
 		_ = socks5.SendReply(w, statute.RepAddrTypeNotSupported, nil)
+		log.Printf("socks tcp parse port %q from %q: %v", portStr, addr, err)
 		return err
 	}
+	dest := net.JoinHostPort(host, strconv.Itoa(int(p64)))
 
-	stream, _, err := t.sm.openStream()
+	stream, conv, err := t.sm.openStream()
 	if err != nil {
 		_ = socks5.SendReply(w, statute.RepServerFailure, nil)
+		log.Printf("socks tcp open stream for %s: %v", dest, err)
 		return err
 	}
 	if err := tunnelproto.WriteTCPOpen(stream, host, uint16(p64)); err != nil {
 		stream.Close()
 		_ = socks5.SendReply(w, statute.RepServerFailure, nil)
+		log.Printf("socks tcp %08x:%d send open %s: %v", conv, stream.ID(), dest, err)
 		return err
 	}
 	ok, err := tunnelproto.ReadAck(stream)
-	if err != nil || !ok {
+	if err != nil {
+		stream.Close()
+		// Protocol/read failure while waiting for server dial ack is a tunnel/server
+		// failure, not a destination reachability result.
+		_ = socks5.SendReply(w, statute.RepServerFailure, nil)
+		log.Printf("socks tcp %08x:%d read ack for %s: %v", conv, stream.ID(), dest, err)
+		return err
+	}
+	if !ok {
 		stream.Close()
 		_ = socks5.SendReply(w, statute.RepHostUnreachable, nil)
-		if err != nil {
-			return err
-		}
+		log.Printf("socks tcp %08x:%d remote rejected %s (ack fail)", conv, stream.ID(), dest)
 		return fmt.Errorf("remote dial failed")
 	}
+	log.Printf("socks tcp %08x:%d connected %s", conv, stream.ID(), dest)
 
 	clientConn, ok := w.(net.Conn)
 	if !ok {
 		stream.Close()
+		log.Printf("socks tcp %08x:%d %s: expected net.Conn writer", conv, stream.ID(), dest)
 		return fmt.Errorf("socks: expected net.Conn writer")
 	}
 	if err := socks5.SendReply(w, statute.RepSuccess, clientConn.LocalAddr()); err != nil {
 		stream.Close()
+		log.Printf("socks tcp %08x:%d send success reply for %s: %v", conv, stream.ID(), dest, err)
 		return err
 	}
 

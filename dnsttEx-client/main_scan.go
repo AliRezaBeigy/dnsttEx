@@ -588,8 +588,13 @@ func discoverMTU(ep *poolEndpoint, domain dns.Name, timeout time.Duration, clien
 func discoverMTUConcurrent(ep *poolEndpoint, domain dns.Name, probeID turbotunnel.ClientID, sizes []int, isServer bool, timeout time.Duration, progress func(size int, okCount int)) int {
 	okCount := make(map[int]int)
 	failed := make(map[int]bool)
+	sizeIndex := make(map[int]int, len(sizes))
+	noLargerProgressRounds := 0
 	for _, s := range sizes {
 		okCount[s] = 0
+	}
+	for i, s := range sizes {
+		sizeIndex[s] = i
 	}
 	for round := 0; round < mtuMaxConcurrentRounds; round++ {
 		var toProbe []int
@@ -610,7 +615,9 @@ func discoverMTUConcurrent(ep *poolEndpoint, domain dns.Name, probeID turbotunne
 		} else {
 			roundOK, roundPermanentFail = clientMTUProbeRound(ep, domain, probeID, toProbe, attemptsBySize, timeout)
 		}
+		roundProgress := make(map[int]int, len(roundOK))
 		for size, n := range roundOK {
+			roundProgress[size] = n
 			for i := 0; i < n && okCount[size] < mtuProbeSuccessesRequired; i++ {
 				okCount[size]++
 				if progress != nil {
@@ -620,6 +627,73 @@ func discoverMTUConcurrent(ep *poolEndpoint, domain dns.Name, probeID turbotunne
 		}
 		for size := range roundPermanentFail {
 			failed[size] = true
+			// assumption: once one size is definitively rejected, all larger
+			// sizes are rejected too for the same path.
+			idx := sizeIndex[size]
+			for j := idx + 1; j < len(sizes); j++ {
+				failed[sizes[j]] = true
+			}
+		}
+		// Aggressive fast path: once we have any fully accepted size, if the next
+		// larger tier cannot complete all attempts in this round, prune it (and larger).
+		// This treats timeout/loss at larger tiers as practical MTU failure to avoid
+		// long tail waits.
+		bestIdxNow := -1
+		for i := len(sizes) - 1; i >= 0; i-- {
+			if okCount[sizes[i]] >= mtuProbeSuccessesRequired {
+				bestIdxNow = i
+				break
+			}
+		}
+		if bestIdxNow >= 0 {
+			for i := bestIdxNow + 1; i < len(sizes); i++ {
+				s := sizes[i]
+				attempted := attemptsBySize[s]
+				if attempted == 0 {
+					continue
+				}
+				if roundOK[s] < attempted {
+					failed[s] = true
+					for j := i + 1; j < len(sizes); j++ {
+						failed[sizes[j]] = true
+					}
+					break
+				}
+			}
+		}
+		// If we already have a best accepted size and all larger sizes are failed,
+		// further rounds cannot improve the result.
+		bestIdx := -1
+		for i := len(sizes) - 1; i >= 0; i-- {
+			if okCount[sizes[i]] >= mtuProbeSuccessesRequired {
+				bestIdx = i
+				break
+			}
+		}
+		if bestIdx >= 0 {
+			allLargerFailed := true
+			largerProgress := false
+			for i := bestIdx + 1; i < len(sizes); i++ {
+				if !failed[sizes[i]] {
+					allLargerFailed = false
+				}
+				if roundProgress[sizes[i]] > 0 {
+					largerProgress = true
+				}
+			}
+			if allLargerFailed {
+				break
+			}
+			if largerProgress {
+				noLargerProgressRounds = 0
+			} else {
+				noLargerProgressRounds++
+				if noLargerProgressRounds >= 1 {
+					break
+				}
+			}
+		} else {
+			noLargerProgressRounds = 0
 		}
 	}
 	// Largest size with required OKs (sizes are in ascending order, so iterate backwards).

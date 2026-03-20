@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.4] - 2026-03-20
+
+### Changed
+
+- **MTU pruning for faster convergence** — When a candidate size is definitively rejected (verification/permanent failure), the client now marks all larger sizes as failed in the same discovery run. This follows MTU monotonicity (if one tier is truly too large, larger tiers are too) and reduces wasted timeout rounds.
+
+- **SOCKS CONNECT failure classification (client)** — In `-tunnel socks` mode, client-side CONNECT now distinguishes tunnel/protocol ACK read failures from remote dial rejection. ACK read/protocol failures are reported as SOCKS server failure, while explicit remote dial reject remains host unreachable.
+
+- **SOCKS relay ACK behavior hardening (server)** — In SOCKS tunnel mode, server now best-effort returns explicit failure ACK on open-parse/unsupported-network paths (instead of closing silently), reducing client-side "closed pipe while waiting for ACK" ambiguity.
+
 ## [1.4.3] - 2026-03-20
 
 ### Changed
@@ -172,7 +182,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.4.3...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.4.4...HEAD
+[1.4.4]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.4.3...v1.4.4
 [1.4.3]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.4.2...v1.4.3
 [1.4.2]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.4.0...v1.4.1

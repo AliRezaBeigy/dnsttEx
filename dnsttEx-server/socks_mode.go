@@ -17,6 +17,9 @@ import (
 func handleSocksRelay(stream *smux.Stream, conv uint32) {
 	netw, addr, err := tunnelproto.ReadOpen(stream)
 	if err != nil {
+		// Best effort: send explicit failure so client can map failure reason
+		// instead of observing a bare closed pipe while waiting for ACK.
+		_ = tunnelproto.WriteAck(stream, false)
 		log.Printf("socks stream %08x:%d read open: %v", conv, stream.ID(), err)
 		return
 	}
@@ -26,7 +29,10 @@ func handleSocksRelay(stream *smux.Stream, conv uint32) {
 	}
 	if netw == "udp" {
 		handleSocksUDPRelay(stream, addr, conv)
+		return
 	}
+	_ = tunnelproto.WriteAck(stream, false)
+	log.Printf("socks stream %08x:%d unsupported network %q for %s", conv, stream.ID(), netw, addr)
 }
 
 func handleSocksTCPRelay(stream *smux.Stream, addr string, conv uint32) {
@@ -37,8 +43,16 @@ func handleSocksTCPRelay(stream *smux.Stream, addr string, conv uint32) {
 		log.Printf("socks tcp %08x:%d dial %s: %v", conv, stream.ID(), addr, err)
 		return
 	}
-	tcpc := c.(*net.TCPConn)
+	log.Printf("socks tcp %08x:%d dial ok %s", conv, stream.ID(), addr)
+	tcpc, ok := c.(*net.TCPConn)
+	if !ok {
+		_ = tunnelproto.WriteAck(stream, false)
+		log.Printf("socks tcp %08x:%d unexpected conn type %T for %s", conv, stream.ID(), c, addr)
+		c.Close()
+		return
+	}
 	if err := tunnelproto.WriteAck(stream, true); err != nil {
+		log.Printf("socks tcp %08x:%d write ack ok for %s: %v", conv, stream.ID(), addr, err)
 		tcpc.Close()
 		return
 	}
@@ -73,7 +87,9 @@ func handleSocksUDPRelay(stream *smux.Stream, addr string, conv uint32) {
 		log.Printf("socks udp %08x:%d dial %s: %v", conv, stream.ID(), addr, err)
 		return
 	}
+	log.Printf("socks udp %08x:%d dial ok %s", conv, stream.ID(), addr)
 	if err := tunnelproto.WriteAck(stream, true); err != nil {
+		log.Printf("socks udp %08x:%d write ack ok for %s: %v", conv, stream.ID(), addr, err)
 		c.Close()
 		return
 	}
