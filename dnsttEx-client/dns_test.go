@@ -262,3 +262,22 @@ func TestBuildProbeMessageWithRequestSizeMinPadding(t *testing.T) {
 		}
 	}
 }
+
+func TestIsExplicitEmptyMarker(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload []byte
+		want    bool
+	}{
+		{name: "nil", payload: nil, want: false},
+		{name: "empty", payload: []byte{}, want: false},
+		{name: "single zero", payload: []byte{0x00}, want: true},
+		{name: "single non-zero", payload: []byte{0x01}, want: false},
+		{name: "two bytes starts zero", payload: []byte{0x00, 0x00}, want: false},
+	}
+	for _, tc := range tests {
+		if got := isExplicitEmptyMarker(tc.payload); got != tc.want {
+			t.Errorf("%s: isExplicitEmptyMarker(%x) = %v, want %v", tc.name, tc.payload, got, tc.want)
+		}
+	}
+}

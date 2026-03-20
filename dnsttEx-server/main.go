@@ -594,6 +594,24 @@ type record struct {
 	PongPayloadSize int  // when > 0, response payload is this many bytes (for MTU discovery); else literal "PONG"
 }
 
+// dequeueOneDownstreamNonBlocking attempts a zero-wait read from per-client
+// unstash first, then outgoing queue. It returns (packet, true) on success.
+func dequeueOneDownstreamNonBlocking(ttConn *turbotunnel.QueuePacketConn, clientID turbotunnel.ClientID) ([]byte, bool) {
+	unstash := ttConn.Unstash(clientID)
+	select {
+	case p := <-unstash:
+		return p, true
+	default:
+	}
+	outgoing := ttConn.OutgoingQueue(clientID)
+	select {
+	case p := <-outgoing:
+		return p, true
+	default:
+	}
+	return nil, false
+}
+
 // --- Fallback NAT logic for non-DNS packets ---
 
 // UDPAddrKey is a comparable struct that can be used as a map key to represent
@@ -929,6 +947,7 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 					if minimalWireSize+len(pongEnc) <= maxSize {
 						rec.Resp.Answer[0].Data = pongEnc
 					} else {
+						// Wire contract: {0x00} means explicit empty marker.
 						rec.Resp.Answer[0].Data = dns.EncodeRDataTXT([]byte{0})
 					}
 					if os.Getenv("DNSTT_DEBUG") != "" {
@@ -947,7 +966,28 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 				}
 				cs := item.Value()
 				if !cs.mu.TryLock() {
-					rec.Resp.Answer[0].Data = dns.EncodeRDataTXT([]byte{0})
+					// Latency-first contention path: do a zero-wait probe for one
+					// packet before falling back to explicit empty marker.
+					var payload bytes.Buffer
+					limit := maxPayloadForReq
+					if limit > maxEncodedPayload {
+						limit = maxEncodedPayload
+					}
+					if p, ok := dequeueOneDownstreamNonBlocking(ttConn, rec.ClientID); ok {
+						packetSize := 2 + len(p)
+						if packetSize <= limit {
+							binary.Write(&payload, binary.BigEndian, uint16(len(p)))
+							payload.Write(p)
+						} else {
+							ttConn.Stash(p, rec.ClientID)
+						}
+					}
+					payloadBytes := payload.Bytes()
+					if len(payloadBytes) == 0 {
+						// Wire contract: {0x00} means explicit empty marker.
+						payloadBytes = []byte{0}
+					}
+					rec.Resp.Answer[0].Data = dns.EncodeRDataTXT(payloadBytes)
 				} else {
 					var payload bytes.Buffer
 					limit := maxPayloadForReq
@@ -989,6 +1029,14 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 						timer.Reset(0)
 
 						if len(p) == 0 {
+							// Timer/channel wakeup may race with packet arrival.
+							// One final zero-wait probe avoids wasting this
+							// response opportunity when data is already queued.
+							if p2, ok := dequeueOneDownstreamNonBlocking(ttConn, rec.ClientID); ok {
+								p = p2
+							}
+						}
+						if len(p) == 0 {
 							break
 						}
 
@@ -1009,6 +1057,7 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 
 					payloadBytes := payload.Bytes()
 					if len(payloadBytes) == 0 {
+						// Wire contract: {0x00} means explicit empty marker.
 						payloadBytes = []byte{0}
 					}
 					rec.Resp.Answer[0].Data = dns.EncodeRDataTXT(payloadBytes)

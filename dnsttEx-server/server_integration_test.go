@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"net"
 	"testing"
 	"time"
@@ -683,6 +684,109 @@ func TestPongResponseSize(t *testing.T) {
 
 	dnsConn.Close()
 	<-done
+}
+
+// TestSendLoopTryLockContentionStillSendsData verifies latency-first contention
+// behavior: when per-client lock is busy, sendLoop still attempts a zero-wait
+// dequeue and can return downstream payload instead of empty marker.
+func TestSendLoopTryLockContentionStillSendsData(t *testing.T) {
+	domain, err := dns.ParseName("t.test.invalid")
+	if err != nil {
+		t.Fatalf("ParseName: %v", err)
+	}
+	dnsConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen dnsConn: %v", err)
+	}
+	defer dnsConn.Close()
+	clientConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen clientConn: %v", err)
+	}
+	defer clientConn.Close()
+
+	clientID := turbotunnel.NewClientID()
+	ttConn := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, 2*time.Minute)
+	defer ttConn.Close()
+	wantPacket := []byte{0xde, 0xad, 0xbe, 0xef}
+	_, _ = ttConn.WriteTo(wantPacket, clientID)
+
+	name, err := dns.NewName(append([][]byte{[]byte("t")}, domain...))
+	if err != nil {
+		t.Fatalf("NewName: %v", err)
+	}
+	resp := &dns.Message{
+		ID:    0x4242,
+		Flags: 0x8000 | dns.RcodeNoError | 0x0400, // QR + NOERROR + AA
+		Question: []dns.Question{
+			{Name: name, Type: dns.RRTypeTXT, Class: dns.ClassIN},
+		},
+	}
+	rec := &record{
+		Resp:            resp,
+		Addr:            clientConn.LocalAddr(),
+		ClientID:        clientID,
+		MaxResponseSize: 1232,
+	}
+
+	clientCache := ttlcache.New(
+		ttlcache.WithTTL[turbotunnel.ClientID, *clientState](2 * time.Minute),
+	)
+	item, _ := clientCache.GetOrSet(clientID, &clientState{})
+	cs := item.Value()
+	cs.mu.Lock() // Force TryLock failure in sendLoop.
+	defer cs.mu.Unlock()
+
+	ch := make(chan *record, 1)
+	ch <- rec
+	close(ch)
+	done := make(chan error, 1)
+	go func() {
+		done <- sendLoop(dnsConn, ttConn, ch, 1200, clientCache)
+	}()
+
+	buf := make([]byte, 4096)
+	_ = clientConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, _, err := clientConn.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("clientConn.ReadFrom: %v", err)
+	}
+	msg, err := dns.MessageFromWireFormat(buf[:n])
+	if err != nil {
+		t.Fatalf("MessageFromWireFormat: %v", err)
+	}
+	if len(msg.Answer) != 1 {
+		t.Fatalf("answer count = %d, want 1", len(msg.Answer))
+	}
+	decoded, err := dns.DecodeRDataTXT(msg.Answer[0].Data)
+	if err != nil {
+		t.Fatalf("DecodeRDataTXT: %v", err)
+	}
+	if len(decoded) == 1 && decoded[0] == 0x00 {
+		t.Fatal("got explicit empty marker, expected queued data packet")
+	}
+	if len(decoded) < 2 {
+		t.Fatalf("decoded payload too short: %d", len(decoded))
+	}
+	gotLen := int(binary.BigEndian.Uint16(decoded[:2]))
+	if gotLen != len(wantPacket) {
+		t.Fatalf("length prefix = %d, want %d", gotLen, len(wantPacket))
+	}
+	if len(decoded) < 2+gotLen {
+		t.Fatalf("decoded payload truncated: have %d want %d", len(decoded), 2+gotLen)
+	}
+	if !bytes.Equal(decoded[2:2+gotLen], wantPacket) {
+		t.Fatalf("packet = %x, want %x", decoded[2:2+gotLen], wantPacket)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("sendLoop returned error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("sendLoop did not exit after channel close")
+	}
 }
 
 // isClosedError returns true if err indicates a closed network connection,

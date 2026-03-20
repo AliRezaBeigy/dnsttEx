@@ -13,6 +13,10 @@ import (
 	"dnsttEx/dns"
 )
 
+func isExplicitEmptyMarker(payload []byte) bool {
+	return len(payload) == 1 && payload[0] == 0x00
+}
+
 // dnsResponsePayload extracts downstream payload. Prefers TXT Answer (works with
 // all resolvers); falls back to EDNS option 0xFF01 if present.
 func dnsResponsePayload(resp *dns.Message, domain dns.Name) []byte {
@@ -174,6 +178,14 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 			}
 		}
 		if len(payload) == 0 {
+			continue
+		}
+		// Wire contract: TXT payload exactly {0x00} is an explicit empty marker.
+		// It is not a length-prefixed tunnel packet and should not be queued.
+		if isExplicitEmptyMarker(payload) {
+			if dnsttLogRxData() {
+				log.Printf("DNSTT_RX_POLL_EMPTY ← from %s | explicit empty marker (0x00)", addr)
+			}
 			continue
 		}
 		if bytes.Equal(payload, ProbeResponsePONG) {
