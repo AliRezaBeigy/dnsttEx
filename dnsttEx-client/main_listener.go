@@ -4,11 +4,14 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,7 +32,7 @@ const firstDownstreamGatherMin = 10
 
 // copyUpstreamWithLog copies from local to stream and, when DNSTT_LOG_RX_DATA is set,
 // logs the first few chunks using FormatUpstreamForSocksLog.
-func copyUpstreamWithLog(stream *smux.Stream, local *net.TCPConn, conv uint32, streamID uint32) (int64, error) {
+func copyUpstreamWithLog(stream *smux.Stream, local io.Reader, conv uint32, streamID uint32) (int64, error) {
 	buf := make([]byte, peekSize)
 	var total int64
 	logCount := 0
@@ -107,10 +110,55 @@ func copyDownstreamWithLog(local *net.TCPConn, stream *smux.Stream, conv uint32,
 }
 
 func handle(local *net.TCPConn, sm *sessionManager) error {
+	// While the tunnel session is being created, read from the local TCP in the
+	// background. If the user aborts (e.g. curl Ctrl+C), we close the in-flight
+	// KCP handshake so the next connection is not stuck behind createMu.
+	quitEarlyRead := make(chan struct{})
+	var earlyWG sync.WaitGroup
+	var earlyMu sync.Mutex
+	var earlyData []byte
+	earlyWG.Add(1)
+	go func() {
+		defer earlyWG.Done()
+		buf := make([]byte, 32*1024)
+		for {
+			select {
+			case <-quitEarlyRead:
+				return
+			default:
+			}
+			_ = local.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+			n, err := local.Read(buf)
+			_ = local.SetReadDeadline(time.Time{})
+			if n > 0 {
+				earlyMu.Lock()
+				earlyData = append(earlyData, buf[:n]...)
+				earlyMu.Unlock()
+			}
+			if err == nil {
+				continue
+			}
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			sm.closeSession("local closed during tunnel setup")
+			return
+		}
+	}()
+
 	stream, conv, err := sm.openStream()
+	close(quitEarlyRead)
+	_ = local.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
+	earlyWG.Wait()
+
 	if err != nil {
 		return fmt.Errorf("opening stream: %v", err)
 	}
+	earlyMu.Lock()
+	prefix := earlyData
+	earlyMu.Unlock()
+	upstream := io.MultiReader(bytes.NewReader(prefix), local)
+
 	defer func() {
 		log.Printf("connection closed: stream %08x:%d — ended", conv, stream.ID())
 		stream.Close()
@@ -121,7 +169,7 @@ func handle(local *net.TCPConn, sm *sessionManager) error {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, err := copyUpstreamWithLog(stream, local, conv, stream.ID())
+		_, err := copyUpstreamWithLog(stream, upstream, conv, stream.ID())
 		if err == io.EOF {
 			err = nil
 		}
@@ -182,7 +230,35 @@ func clientKCPMTU(domain dns.Name, pconn net.PacketConn) (int, error) {
 	return mtu, nil
 }
 
-func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn) error {
+// applyTunnelWarmupEnv starts tunnel handshake per DNSTT_TUNNEL_WARMUP.
+// socksMode: when true and env is unset, block until the tunnel exists before accepting
+// SOCKS connections (browsers open many TCPs at once; async warmup often loses the race).
+//   (unset) — SOCKS: sync warmup; TCP forward: async warmup in background
+//   sync    — always block until handshake completes before serving
+//   async   — always background warmup (SOCKS may stall parallel CONNECTs on first handshake)
+//   off     — no warmup; first connection pays full handshake
+func applyTunnelWarmupEnv(sm *sessionManager, socksMode bool) error {
+	s := strings.ToLower(strings.TrimSpace(os.Getenv("DNSTT_TUNNEL_WARMUP")))
+	switch s {
+	case "off", "0", "false", "no":
+		return nil
+	case "sync":
+		log.Printf("tunnel: DNSTT_TUNNEL_WARMUP=sync — completing handshake before SOCKS Accept loop")
+		return sm.warmupTunnelSync()
+	case "async":
+		sm.warmupTunnelAsync()
+		return nil
+	default:
+		if socksMode {
+			log.Printf("tunnel: SOCKS default warmup — completing handshake before Accept (set DNSTT_TUNNEL_WARMUP=async to accept immediately)")
+			return sm.warmupTunnelSync()
+		}
+		sm.warmupTunnelAsync()
+		return nil
+	}
+}
+
+func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn, usePlain bool) error {
 	defer pconn.Close()
 
 	ln, err := net.ListenTCP("tcp", localAddr)
@@ -197,8 +273,11 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 	}
 	log.Printf("Tunnel MTU: %d bytes", mtu)
 
-	sm := newSessionManager(pubkey, domain, remoteAddr, pconn, mtu)
+	sm := newSessionManager(pubkey, domain, remoteAddr, pconn, mtu, usePlain)
 	defer sm.closeSession("tunnel shutting down")
+	if err := applyTunnelWarmupEnv(sm, false); err != nil {
+		return err
+	}
 
 	if dpc, ok := pconn.(packetConnWithDone); ok {
 		acceptCh := make(chan net.Conn, 1)
@@ -256,7 +335,7 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 }
 
 // runSocks runs SOCKS5 on localAddr; each CONNECT/UDP relay uses the DNS tunnel (server must use -tunnel socks).
-func runSocks(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn) error {
+func runSocks(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn, usePlain bool) error {
 	defer pconn.Close()
 
 	mtu, err := clientKCPMTU(domain, pconn)
@@ -265,8 +344,11 @@ func runSocks(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr
 	}
 	log.Printf("Tunnel MTU: %d bytes (SOCKS5 on %s)", mtu, localAddr.String())
 
-	sm := newSessionManager(pubkey, domain, remoteAddr, pconn, mtu)
+	sm := newSessionManager(pubkey, domain, remoteAddr, pconn, mtu, usePlain)
 	defer sm.closeSession("tunnel shutting down")
+	if err := applyTunnelWarmupEnv(sm, true); err != nil {
+		return err
+	}
 
 	t := newSocksTunnel(sm)
 	opts := []socks5.Option{

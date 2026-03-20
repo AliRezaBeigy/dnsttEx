@@ -31,6 +31,7 @@ func runTunnel(
 	clientMTUFlag int,
 	sendParallel int,
 	tunnelMode string,
+	noNoise bool,
 ) error {
 	endpoints := make([]*poolEndpoint, 0, len(specs))
 	for _, spec := range specs {
@@ -145,7 +146,7 @@ func runTunnel(
 
 	pconn = NewDNSPacketConn(pconn, remoteAddr, domain, effectiveMaxResponse, effectiveMaxRequest)
 	if tunnelMode == "socks" {
-		return runSocks(pubkey, domain, localAddr, remoteAddr, pconn)
+		return runSocks(pubkey, domain, localAddr, remoteAddr, pconn, noNoise)
 	}
-	return run(pubkey, domain, localAddr, remoteAddr, pconn)
+	return run(pubkey, domain, localAddr, remoteAddr, pconn, noNoise)
 }

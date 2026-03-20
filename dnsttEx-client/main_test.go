@@ -39,7 +39,7 @@ func TestRunRejectsLowMTU(t *testing.T) {
 	privkey, _ := noise.GeneratePrivkey()
 	pubkey := noise.PubkeyFromPrivkey(privkey)
 
-	err = run(pubkey, domain, addr, turbotunnel.DummyAddr{}, pconn)
+	err = run(pubkey, domain, addr, turbotunnel.DummyAddr{}, pconn, false)
 	if err == nil {
 		t.Fatal("run: expected error for low MTU domain")
 	}

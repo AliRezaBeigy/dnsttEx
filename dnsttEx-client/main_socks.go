@@ -11,6 +11,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"time"
 
 	"dnsttEx/internal/tunnelproto"
 
@@ -58,12 +59,21 @@ func (t *socksTunnel) connectHandle(ctx context.Context, w io.Writer, req *socks
 	}
 	dest := net.JoinHostPort(host, strconv.Itoa(int(p64)))
 
+	client := ""
+	if req.RemoteAddr != nil {
+		client = req.RemoteAddr.String()
+	}
+	log.Printf("socks: CONNECT %s from %s", dest, client)
+
+	t0 := time.Now()
 	stream, conv, err := t.sm.openStream()
 	if err != nil {
 		_ = socks5.SendReply(w, statute.RepServerFailure, nil)
 		log.Printf("socks tcp open stream for %s: %v", dest, err)
 		return err
 	}
+	// One outer KCP session ("begin session"); each SOCKS CONNECT is a new smux stream on top.
+	log.Printf("begin stream %08x:%d (socks → %s) after %s", conv, stream.ID(), dest, time.Since(t0).Round(time.Millisecond))
 	if err := tunnelproto.WriteTCPOpen(stream, host, uint16(p64)); err != nil {
 		stream.Close()
 		_ = socks5.SendReply(w, statute.RepServerFailure, nil)

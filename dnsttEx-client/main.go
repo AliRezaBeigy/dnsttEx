@@ -33,10 +33,15 @@
 // Lines starting with # or blank lines are ignored.
 //
 // You can give the server's public key as a file or as a hex string. Use
-// "dnstt-server -gen-key" to get the public key.
+// "dnstt-server -gen-key" to get the public key. (Not used with -no-noise.)
 //
 //	-pubkey-file server.pub
 //	-pubkey 0000111122223333444455556666777788889999aaaabbbbccccddddeeeeffff
+//
+// Plaintext tunnel (no Noise): use -no-noise on the client; the server accepts
+// the negotiated plaintext mode automatically. There is no encryption or
+// authentication on the tunnel — only for constrained environments where Noise
+// handshake cost must be avoided.
 //
 // DOMAIN is the root of the DNS zone reserved for the tunnel. See README for
 // instructions on setting it up.
@@ -117,6 +122,7 @@ func main() {
 	var scanChecks int
 	var clientMTUFlag int
 	var tunnelMode string
+	var noNoise bool
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
@@ -174,6 +180,7 @@ Known TLS fingerprints for -utls are:
 	flag.IntVar(&clientMTUFlag, "mtu", 0,
 		"max question QNAME wire length in bytes (what many DPI systems limit—not full UDP size). 0 = discover per resolver. Response size is still discovered.")
 	flag.StringVar(&tunnelMode, "tunnel", "socks", "tcp: LOCALADDR is plain TCP forward; socks: LOCALADDR is SOCKS5 (server needs -tunnel socks)")
+	flag.BoolVar(&noNoise, "no-noise", false, "omit Noise (plaintext smux over KCP/DNS); do not use -pubkey (no tunnel encryption or authentication)")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.LUTC)
@@ -190,6 +197,11 @@ Known TLS fingerprints for -utls are:
 	localAddr, err := net.ResolveTCPAddr("tcp", flag.Arg(1))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	if noNoise && (pubkeyFilename != "" || pubkeyString != "") {
+		fmt.Fprintf(os.Stderr, "-no-noise cannot be combined with -pubkey or -pubkey-file\n")
 		os.Exit(1)
 	}
 
@@ -212,9 +224,12 @@ Known TLS fingerprints for -utls are:
 			os.Exit(1)
 		}
 	}
-	if len(pubkey) == 0 {
-		fmt.Fprintf(os.Stderr, "the -pubkey or -pubkey-file option is required\n")
+	if !noNoise && len(pubkey) == 0 {
+		fmt.Fprintf(os.Stderr, "the -pubkey or -pubkey-file option is required (or use -no-noise for plaintext tunnel)\n")
 		os.Exit(1)
+	}
+	if noNoise {
+		log.Printf("WARNING: -no-noise: tunnel has no encryption or authentication")
 	}
 
 	utlsClientHelloID, err := sampleUTLSDistribution(utlsDistribution)
@@ -266,7 +281,7 @@ Known TLS fingerprints for -utls are:
 		os.Exit(1)
 	}
 
-	err = runTunnel(domain, localAddr, pubkey, utlsClientHelloID, specs, resolverPolicy, doScan, scanChecks, clientMTUFlag, sendParallel, tunnelMode)
+	err = runTunnel(domain, localAddr, pubkey, utlsClientHelloID, specs, resolverPolicy, doScan, scanChecks, clientMTUFlag, sendParallel, tunnelMode, noNoise)
 	if err != nil {
 		log.Fatal(err)
 	}

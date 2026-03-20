@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.3] - 2026-03-20
+
+### Added
+
+- **Optional plaintext transport (no Noise)** — Client `-no-noise` sends a 3-byte preamble then runs smux directly on KCP (skips Noise NK). The server always accepts this negotiation when offered. Default remains Noise-only for clients that do not send the preamble; this mode removes crypto and server authentication from the tunnel (dangerous). Wire negotiation uses an impossible Noise first-message length (`u16(1)` + mode byte) so existing Noise clients remain compatible.
+
+### Changed
+
+- **SOCKS5 tunnel warmup** — SOCKS mode now completes the Noise+smux handshake before opening the local listener (unless `DNSTT_TUNNEL_WARMUP=async` or `off`), so browsers that open many parallel connections no longer all block on the first handshake. TCP forward mode still uses async warmup by default.
+
 ## [1.5.2] - 2026-03-20
 
 ### Changed
@@ -211,7 +221,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.2...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.3...HEAD
+[1.5.3]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.2...v1.5.3
 [1.5.2]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.4.4...v1.5.0

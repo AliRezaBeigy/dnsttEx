@@ -42,7 +42,7 @@ func TestSessionManagerNoDeadlock(t *testing.T) {
 	}
 	pubkey := noise.PubkeyFromPrivkey(privkey)
 	mtu := maxPacketSize
-	sm := newSessionManager(pubkey, domain, turbotunnel.DummyAddr{}, dnsConn, mtu)
+	sm := newSessionManager(pubkey, domain, turbotunnel.DummyAddr{}, dnsConn, mtu, false)
 
 	const goroutines = 4
 	var wg sync.WaitGroup
@@ -91,7 +91,7 @@ func TestSessionManagerCloseSession(t *testing.T) {
 	privkey, _ := noise.GeneratePrivkey()
 	pubkey := noise.PubkeyFromPrivkey(privkey)
 	mtu := maxPacketSize
-	sm := newSessionManager(pubkey, domain, turbotunnel.DummyAddr{}, pconn, mtu)
+	sm := newSessionManager(pubkey, domain, turbotunnel.DummyAddr{}, pconn, mtu, false)
 
 	// closeSession on a manager with no session should not panic.
 	sm.closeSession("")
@@ -102,9 +102,10 @@ func TestSessionManagerCloseSession(t *testing.T) {
 	sessNil := sm.sess == nil
 	connNil := sm.conn == nil
 	rwNil := sm.rw == nil
+	handshakeNil := sm.handshakeConn == nil
 	sm.mu.RUnlock()
 
-	if !sessNil || !connNil || !rwNil {
+	if !sessNil || !connNil || !rwNil || !handshakeNil {
 		t.Error("closeSession did not clear all fields")
 	}
 }
@@ -141,7 +142,7 @@ func TestRunLifecycle(t *testing.T) {
 	go func() {
 		// run() calls defer pconn.Close() on its argument (dnsConn), and
 		// blocks on ln.Accept(). It will exit when dnsConn is closed.
-		runDone <- run(pubkey, domain, localAddr, turbotunnel.DummyAddr{}, dnsConn)
+		runDone <- run(pubkey, domain, localAddr, turbotunnel.DummyAddr{}, dnsConn, false)
 	}()
 
 	// Poll until the TCP listener is up (or 5s timeout).
@@ -261,7 +262,7 @@ func TestOpenStreamRecreatesSession(t *testing.T) {
 	dnsConn := NewDNSPacketConn(pconn, remoteAddr, domain, 0, 0)
 	defer dnsConn.Close()
 
-	sm := newSessionManager(pubkey, domain, turbotunnel.DummyAddr{}, dnsConn, mtu)
+	sm := newSessionManager(pubkey, domain, turbotunnel.DummyAddr{}, dnsConn, mtu, false)
 	defer sm.closeSession("test done")
 
 	// openStream will call getSession → createSession. The session will be

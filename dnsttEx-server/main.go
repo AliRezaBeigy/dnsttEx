@@ -14,6 +14,8 @@
 //
 //	dnstt-server -udp :53 -privkey-file server.key -fallback 127.0.0.1:8888 t.example.com 127.0.0.1:8000
 //
+// Plaintext tunnel (client -no-noise): server accepts negotiated plaintext smux (no tunnel crypto).
+//
 // To generate a persistent server private key, first run with the -gen-key
 // option. By default the generated private and public keys are printed to
 // standard output. To save them to files instead, use the -privkey-file and
@@ -307,17 +309,18 @@ func handleStream(stream *smux.Stream, upstream string, conv uint32) error {
 	return nil
 }
 
-// acceptStreams wraps a KCP session in a Noise channel and an smux.Session,
-// then awaits smux streams. In tcp tunnel mode each stream is relayed to upstream;
-// in socks mode the client sends destination per stream (tunnelproto).
+// acceptStreams negotiates Noise vs plaintext transport, wraps in smux, then
+// awaits streams. Client may negotiate plaintext smux (see client -no-noise).
 func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string, socksTunnel bool) error {
-	// Put a Noise channel on top of the KCP conn.
-	rw, err := noise.NewServer(conn, privkey)
+	rw, plain, err := noise.NegotiateServerTransport(conn, privkey)
 	if err != nil {
 		return err
 	}
+	if plain {
+		log.Printf("session %08x transport=plaintext (no Noise; smux only) — INSECURE", conn.GetConv())
+	}
 
-	// Put an smux session on top of the encrypted Noise channel.
+	// Put an smux session on top of the Noise channel or raw KCP (plaintext).
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.Version = 2
 	smuxConfig.KeepAliveInterval = 15 * time.Second // send PING every 15s

@@ -6,9 +6,12 @@ package main
 import (
 	"encoding/hex"
 	"fmt"
+	"log"
+	"net"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"dnsttEx/noise"
@@ -64,6 +67,28 @@ func dnsttDebug() bool { return os.Getenv("DNSTT_DEBUG") != "" }
 // dnsttLogRxData enables DNS payload tracing: RX (answers) and TX (data sends only; idle polls not logged).
 // Set DNSTT_LOG_RX_DATA=1. Lines: DNSTT_TX_DATA → (tunnel upstream), DNSTT_RX_* ← (downstream).
 func dnsttLogRxData() bool { return os.Getenv("DNSTT_LOG_RX_DATA") != "" }
+
+// dnsttHandshakeDiag enables extra logs explaining handshake stalls: KCP Read/Write under Noise,
+// and throttled lines for idle DNS polls (which DNSTT_LOG_RX_DATA omits). Set DNSTT_HANDSHAKE_DIAG=1.
+func dnsttHandshakeDiag() bool { return os.Getenv("DNSTT_HANDSHAKE_DIAG") != "" }
+
+var handshakeDiagPollMu sync.Mutex
+var handshakeDiagPollNext time.Time
+
+// logHandshakeDiagIdlePoll logs at most once per 3s that an outgoing DNS query carried no tunnel segment.
+func logHandshakeDiagIdlePoll(addr net.Addr) {
+	if !dnsttHandshakeDiag() {
+		return
+	}
+	handshakeDiagPollMu.Lock()
+	defer handshakeDiagPollMu.Unlock()
+	now := time.Now()
+	if now.Before(handshakeDiagPollNext) {
+		return
+	}
+	handshakeDiagPollNext = now.Add(3 * time.Second)
+	log.Printf("tunnel: diag idle DNS query (poll) → %s | no KCP segment in this send (recv path still active; long gaps without DNSTT_TX_DATA often mean Noise is blocked in Read for server reply)", addr)
+}
 
 // dnsttTrace returns true when DNSTT_TRACE is set (for full path tracing to diagnose failures).
 func dnsttTrace() bool { return os.Getenv("DNSTT_TRACE") != "" }

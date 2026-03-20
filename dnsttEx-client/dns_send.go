@@ -403,6 +403,9 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 				log.Printf("DNSTT_DEBUG: sendLoop: sending poll (idle)")
 			}
 		}
+		if len(packets) == 0 {
+			logHandshakeDiagIdlePoll(addr)
+		}
 		if len(packets) > 0 {
 			lastTunnelSend = time.Now()
 		}
