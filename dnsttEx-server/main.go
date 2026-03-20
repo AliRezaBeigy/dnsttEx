@@ -1240,10 +1240,10 @@ func computeMaxEncodedPayload(limit int) int {
 }
 
 // fecShardsFromEnv returns (dataShards, parityShards) from DNSTT_FEC_DATA and
-// DNSTT_FEC_PARITY. Default (2, 1) enables FEC for lossy networks; set both to 0 to disable.
+// DNSTT_FEC_PARITY. Default (0, 0) disables FEC; e.g. use 2 and 1 on both client and server for lossy paths.
 func fecShardsFromEnv() (dataShards, parityShards int) {
-	dataShards = 2
-	parityShards = 1
+	dataShards = 0
+	parityShards = 0
 	if s := os.Getenv("DNSTT_FEC_DATA"); s != "" {
 		if n, err := strconv.Atoi(s); err == nil && n >= 0 && n <= 10 {
 			dataShards = n

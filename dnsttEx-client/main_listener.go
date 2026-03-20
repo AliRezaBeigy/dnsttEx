@@ -158,9 +158,9 @@ type kcpMTUHint interface {
 
 func clientKCPMTU(domain dns.Name, pconn net.PacketConn) (int, error) {
 	capacity := nameCapacity(domain)
-	// v2 query framing adds 3 bytes ahead of packet framing:
-	// [marker 0xFD][hint_hi][hint_lo].
-	overhead := 8 + 1 + 2 + 1 + numPadding + 1
+	// Decoded upstream before Base36: clientID + v2 marker + hint + 1-byte
+	// segment length + payload (same as DNSPacketConn.KCPMTUHint / sendLoop).
+	overhead := 8 + 1 + 2 + 1 + numPadding
 	maxPayloadInName := capacity - overhead
 	if maxPayloadInName < 1 {
 		return 0, fmt.Errorf("domain %s leaves no room for payload (capacity %d)", domain, capacity)
@@ -176,8 +176,8 @@ func clientKCPMTU(domain dns.Name, pconn net.PacketConn) (int, error) {
 			log.Printf("DNSTT_TRACE: client run: ignoring request-path MTU hint %d below KCP minimum %d", hint, minKCPMTU)
 		}
 	}
-	if mtu < minKCPMTU {
-		return 0, fmt.Errorf("tunnel MTU %d bytes is below KCP minimum (%d); use a shorter domain or larger path MTU", mtu, minKCPMTU)
+	if minOuter := minOuterTunnelMTUForKCP(); mtu < minOuter {
+		return 0, fmt.Errorf("tunnel MTU %d bytes is below minimum (%d) for KCP over DNS with current FEC settings; use a shorter domain, a larger query path, or disable FEC (DNSTT_FEC_DATA=0 DNSTT_FEC_PARITY=0)", mtu, minOuter)
 	}
 	return mtu, nil
 }

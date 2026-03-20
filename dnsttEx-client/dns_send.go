@@ -273,7 +273,10 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 				capacity = c.maxDecodedPayloadForMaxQName(maxReqOverride)
 			}
 		}
-		overhead := 8 + 1 + 2 + 1 + numPadding
+		// Prefix before the first (1+len) tunnel segment: clientID + v2 marker + maxResp
+		// hint. Each segment then contributes 1+len(p) in used (length byte + payload).
+		// Total decoded = 8+1+2+1+len = 12+len — must not double-count the length byte here.
+		overhead := 8 + 1 + 2 + numPadding
 		payloadLimit := capacity - overhead
 		if payloadLimit < 0 {
 			payloadLimit = 0

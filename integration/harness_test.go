@@ -1263,7 +1263,10 @@ func (r *slowLossyTruncatingUDPRelay) clientToServerLoop() {
 			}
 		}
 		seq := int(r.clientPackets.Add(1))
-		if seq > r.dropClientEvery*2 && r.dropClientEvery > 0 && seq%r.dropClientEvery == 0 {
+		// MTU discovery sends many concurrent probes; 2*dropClientEvery is too small and
+		// causes flaky discovery (e.g. 128-byte QNAME tier stuck at 2/3). Warm up before loss.
+		const clientDropWarmupPackets = 2500
+		if seq > clientDropWarmupPackets && r.dropClientEvery > 0 && seq%r.dropClientEvery == 0 {
 			continue
 		}
 		r.sent.Add(int64(n))

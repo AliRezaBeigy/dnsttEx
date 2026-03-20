@@ -94,8 +94,14 @@ type DNSPacketConn struct {
 // KCPMTUHint returns the largest single tunnel packet that can fit in one DNS
 // query on the current request path, after accounting for DNSPacketConn's
 // clientID/mode framing and any request-size cap discovered by MTU probing.
+//
+// This MUST match buildUpstreamPayload for one segment: clientID(8) + v2 marker(1) +
+// maxResp hint(2) + 1-byte length prefix(1) + numPadding + payload.
+// sendLoop uses overhead 8+1+2+numPadding and per-segment used += 1+len(p); same total 12+len.
+// If hint is too large, send() will stash every full-MSS segment and spin on poll+unstash (no timer).
 func (c *DNSPacketConn) KCPMTUHint() int {
-	hint := c.effectiveSendCapacity() - (8 + 1)
+	framing := 8 + 1 + 2 + 1 + numPadding
+	hint := c.effectiveSendCapacity() - framing
 	if hint < 0 {
 		return 0
 	}

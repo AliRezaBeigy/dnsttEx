@@ -194,6 +194,37 @@ func TestEffectiveSendCapacityRespectsMTU(t *testing.T) {
 	}
 }
 
+// TestKCPMTUHintMatchesUpstreamFraming ensures a full-MSS segment from KCP still
+// fits in effectiveSendCapacity after buildUpstreamPayload's single-packet encoding.
+// If hint is too large, send() stashes every segment and sendLoop spins on poll+unstash.
+func TestKCPMTUHintMatchesUpstreamFraming(t *testing.T) {
+	pconn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket: %v", err)
+	}
+	defer pconn.Close()
+	domain, err := dns.ParseName("hint.test.")
+	if err != nil {
+		t.Fatalf("ParseName: %v", err)
+	}
+	conn := NewDNSPacketConn(pconn, pconn.LocalAddr(), domain, 4096, 120)
+	defer conn.Close()
+
+	cap := conn.effectiveSendCapacity()
+	hint := conn.KCPMTUHint()
+	if hint < 1 {
+		t.Fatalf("KCPMTUHint() = %d, want >= 1 for this test domain", hint)
+	}
+	seg := make([]byte, hint)
+	for i := range seg {
+		seg[i] = byte(i)
+	}
+	decoded := conn.buildUpstreamPayload([][]byte{seg}, 512)
+	if len(decoded) > cap {
+		t.Fatalf("buildUpstreamPayload(max segment) len %d > effectiveSendCapacity %d (hint=%d)", len(decoded), cap, hint)
+	}
+}
+
 // TestBuildQueryWireUsesOptMaxResp verifies that buildQueryWire(decoded, optMaxResp)
 // sets the OPT RR Class (max response size) to optMaxResp when optMaxResp > 0.
 func TestBuildQueryWireUsesOptMaxResp(t *testing.T) {

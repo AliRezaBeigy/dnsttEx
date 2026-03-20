@@ -28,10 +28,11 @@ const (
 )
 
 // fecShardsFromEnv returns (dataShards, parityShards) for KCP FEC from DNSTT_FEC_DATA
-// and DNSTT_FEC_PARITY. Must match server. Default (2, 1) enables FEC; set both to 0 to disable.
+// and DNSTT_FEC_PARITY. Must match server. Default (0, 0) disables FEC; e.g. set 2 and 1
+// on both sides for lossy paths.
 func fecShardsFromEnv() (dataShards, parityShards int) {
-	dataShards = 2
-	parityShards = 1
+	dataShards = 0
+	parityShards = 0
 	if s := os.Getenv("DNSTT_FEC_DATA"); s != "" {
 		if n, err := strconv.Atoi(s); err == nil && n >= 0 && n <= 10 {
 			dataShards = n
@@ -43,6 +44,18 @@ func fecShardsFromEnv() (dataShards, parityShards int) {
 		}
 	}
 	return dataShards, parityShards
+}
+
+// minOuterTunnelMTUForKCP is the smallest value clientKCPMTU may return such that
+// UDPSession.SetMtu succeeds: KCP needs inner MTU ≥ minKCPMTU, and when FEC is
+// enabled the session prepends fecHeaderSizePlus2 (8) before each KCP frame
+// (nil BlockCrypt on this path). Must stay aligned with internal/kcp.
+func minOuterTunnelMTUForKCP() int {
+	d, p := fecShardsFromEnv()
+	if d > 0 && p > 0 {
+		return minKCPMTU + 8
+	}
+	return minKCPMTU
 }
 
 // dnsttDebug returns true when DNSTT_DEBUG is set (for verbose PING/PONG and MTU discovery logs).

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-03-20
+
+### Changed
+
+- **FEC disabled by default** — `DNSTT_FEC_DATA` and `DNSTT_FEC_PARITY` default to 0 on client and server. Set e.g. `DNSTT_FEC_DATA=2` and `DNSTT_FEC_PARITY=1` on both sides when you want Reed–Solomon parity on lossy links (values must match).
+
+### Fixed
+
+- **Client DNS `sendLoop` batching vs framing** — Per-query tunnel budget now matches upstream framing (`8+1+2` prefix plus `1+len` per segment) so the length byte is not double-counted. This removes a tight stash/poll/unstash loop on very low request MTU that could flood resolvers with useless queries.
+
+
 ## [1.5.1] - 2026-03-20
 
 ### Changed
@@ -200,7 +211,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.1...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.2...HEAD
+[1.5.2]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.4.4...v1.5.0
 [1.4.4]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.4.3...v1.4.4
