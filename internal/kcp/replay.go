@@ -3,11 +3,21 @@
 
 package kcp
 
-import "sync"
+import (
+	"os"
+	"strconv"
+	"sync"
+)
 
 const (
-	defaultReplayMaxEntries = 2048
-	defaultReplayMaxBytes   = 2048 * 1024
+	defaultReplayMaxEntries = 8192
+	defaultReplayMaxBytes   = 8 * 1024 * 1024
+)
+
+var (
+	replayLimitsOnce      sync.Once
+	replayMaxEntriesValue int
+	replayMaxBytesValue   int
 )
 
 type downstreamReplay struct {
@@ -22,11 +32,44 @@ type downstreamReplay struct {
 }
 
 func newDownstreamReplay() *downstreamReplay {
+	maxEntries, maxBytes := replayLimits()
 	return &downstreamReplay{
-		maxEntries: defaultReplayMaxEntries,
-		maxBytes:   defaultReplayMaxBytes,
+		maxEntries: maxEntries,
+		maxBytes:   maxBytes,
 		bySN:       make(map[uint32][]byte),
 	}
+}
+
+func replayLimits() (maxEntries int, maxBytes int) {
+	replayLimitsOnce.Do(func() {
+		replayMaxEntriesValue = defaultReplayMaxEntries
+		replayMaxBytesValue = defaultReplayMaxBytes
+
+		if s := os.Getenv("DNSTT_KCP_REPLAY_MAX_ENTRIES"); s != "" {
+			if n, err := strconv.Atoi(s); err == nil {
+				replayMaxEntriesValue = n
+			}
+		}
+		if replayMaxEntriesValue < 256 {
+			replayMaxEntriesValue = 256
+		}
+		if replayMaxEntriesValue > 262144 {
+			replayMaxEntriesValue = 262144
+		}
+
+		if s := os.Getenv("DNSTT_KCP_REPLAY_MAX_BYTES"); s != "" {
+			if n, err := strconv.Atoi(s); err == nil {
+				replayMaxBytesValue = n
+			}
+		}
+		if replayMaxBytesValue < 256*1024 {
+			replayMaxBytesValue = 256 * 1024
+		}
+		if replayMaxBytesValue > 512*1024*1024 {
+			replayMaxBytesValue = 512 * 1024 * 1024
+		}
+	})
+	return replayMaxEntriesValue, replayMaxBytesValue
 }
 
 func (r *downstreamReplay) Add(sn uint32, payload []byte) {

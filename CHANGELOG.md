@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.14] - 2026-03-21
+
+### Added
+
+- **`IKCP_CMD_NMIS` (86) — server replay miss notify** — When the client’s `NREQ` asks for a head downstream segment that is **not** in `downstreamReplay`, the server sends a compact no-payload `NMIS` frame (same 16-bit `sn` form as `NREQ`, duplicated `DNSTT_KCP_REPLAY_SEND_COPIES` times like replay). The client accepts `NMIS`, expands `sn` with `rcv_nxt`, and logs a throttled line (`server replay miss` / `missing_sn`) so empty DNS polls are not mistaken for a silent server. **`DNSTT_KCP_REPLAY_MISS_NOTIFY=0`** (or `false` / `off` / `no`) on the **server** disables `NMIS` for peers on an older client that rejects unknown KCP command bytes.
+
+### Changed
+
+- **Downstream replay capacity (server)** — Default replay cache raised to **8192** entries and **8 MiB** total payload (was 2048 / 2 MiB). Override with **`DNSTT_KCP_REPLAY_MAX_ENTRIES`** and **`DNSTT_KCP_REPLAY_MAX_BYTES`** (bounded clamps apply).
+
+### Fixed
+
+- **NREQ replay when the head segment is missing** — If the first missing `sn` is not in the replay map, the server no longer replays **later** segments for that `NREQ` (they cannot unblock `rcv_nxt` and only added duplicate out-of-order downstream). Combined with `NMIS`, the client gets an explicit signal instead of endless “empty” poll responses.
+
 ## [1.5.13] - 2026-03-21
 
 ### Fixed
@@ -295,7 +309,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.13...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.14...HEAD
+[1.5.14]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.13...v1.5.14
 [1.5.13]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.12...v1.5.13
 [1.5.12]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.11...v1.5.12
 [1.5.11]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.10...v1.5.11

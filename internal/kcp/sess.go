@@ -54,6 +54,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -304,6 +305,17 @@ func serverDownstreamReplayEnabled() bool {
 	return true
 }
 
+// replayMissNotifyEnabled controls IKCP_CMD_NMIS (server → client). Disable if peers run an older
+// client that rejects unknown KCP command bytes (Input returns error for cmd 86).
+func replayMissNotifyEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("DNSTT_KCP_REPLAY_MISS_NOTIFY"))) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
 var (
 	replaySendCopiesOnce sync.Once
 	replaySendCopiesVal  int
@@ -343,6 +355,15 @@ func (s *UDPSession) handleDownstreamNREQ(wireFirstMissingSN, maxSegments uint32
 	if !ok {
 		firstFull = expandSN16(s.kcp.snd_nxt, wireFirstMissingSN)
 	}
+	// The client is blocked specifically on the first missing sequence.
+	// If that head segment is unavailable on the server, replaying later
+	// segments only creates duplicate out-of-order traffic and cannot unblock.
+	if _, found := s.downstreamReplay.payloadForNREQ(firstFull); !found {
+		if replayMissNotifyEnabled() {
+			s.enqueueReplayMissNotify(wireFirstMissingSN)
+		}
+		return
+	}
 	copies := replaySendCopies()
 	for i := uint32(0); i < maxSegments; i++ {
 		sn := firstFull + i
@@ -354,6 +375,26 @@ func (s *UDPSession) handleDownstreamNREQ(wireFirstMissingSN, maxSegments uint32
 		for c := 0; c < copies; c++ {
 			s.enqueuePlainKCP(plain)
 		}
+	}
+}
+
+// enqueueReplayMissNotify tells the client (IKCP_CMD_NMIS) that the NREQ head segment
+// is not in the server replay cache. wireSN is the same 16-bit form as in the client's NREQ.
+func (s *UDPSession) enqueueReplayMissNotify(wireSN uint32) {
+	var seg segment
+	seg.conv = s.kcp.conv
+	seg.cmd = IKCP_CMD_NMIS
+	seg.sn = wireSN & (kcpSNMod - 1)
+	seg.frg = 0
+	seg.wnd = uint16(min(int(s.kcp.wnd_unused()), 255))
+	seg.ts = currentMs()
+	seg.una = 0
+	seg.data = nil
+	out := make([]byte, IKCP_OVERHEAD)
+	seg.encode(out)
+	copies := replaySendCopies()
+	for c := 0; c < copies; c++ {
+		s.enqueuePlainKCP(out)
 	}
 }
 
@@ -1140,7 +1181,7 @@ func (s *UDPSession) packetInput(data []byte) {
 //   - 0xf3 (typeOOB): out-of-band packet (unreliable, bypasses KCP)
 //   - other values: raw KCP packet (no FEC)
 //
-// Note: KCP cmd values [81-85] with frg [0-255] do not collide with
+// Note: KCP cmd values [81-86] with frg [0-255] do not collide with
 // FEC type markers 0x00f1/0x00f2/0x00f3 in little-endian.
 func (s *UDPSession) kcpInput(data []byte) {
 	atomic.AddUint64(&DefaultSnmp.InPkts, 1)

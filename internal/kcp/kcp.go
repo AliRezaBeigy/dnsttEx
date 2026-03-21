@@ -49,6 +49,9 @@ const (
 	// IKCP_CMD_NREQ: client asks server to resend downstream PUSH payloads starting at sn (header sn),
 	// up to una (header una) segments. No payload. dnstt extension; peers must both support it.
 	IKCP_CMD_NREQ = 85
+	// IKCP_CMD_NMIS: server tells client the NREQ head segment is not in the downstream replay cache.
+	// No payload. Wire sn is the same 16-bit form as in NREQ; client expands with rcv_nxt. dnstt extension.
+	IKCP_CMD_NMIS = 86
 	// maxNreqSegments caps how many sequence numbers one NREQ may cover.
 	maxNreqSegments = 128
 
@@ -283,6 +286,9 @@ type KCP struct {
 	logmask KCPLogType
 	// recvGapLogged: with DNSTT_KCP_RECV_GAP, log at most once per stalled rcv_nxt (same hole).
 	recvGapLogged bool
+	// Throttle client log for IKCP_CMD_NMIS (server replay miss) per missing sn.
+	lastReplayMissFullSn uint32 // 0xFFFFFFFF = unset
+	lastReplayMissLogMs  uint32
 
 	// Data queues and buffers
 	snd_queue *RingBuffer[segment] // send queue: segments waiting to enter the send window
@@ -369,6 +375,7 @@ func NewKCP(conv uint32, output output_callback) *KCP {
 	kcp.nreqWireCopies = nreqWireCopiesFromEnv()
 	kcp.nreqStallCapMs = nreqStallCapMsFromEnv()
 	kcp.nreqIdleHeadAfterMs = nreqIdleHeadAfterMsFromEnv()
+	kcp.lastReplayMissFullSn = 0xFFFFFFFF
 	return kcp
 }
 
@@ -867,7 +874,8 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 		}
 
 		if cmd != IKCP_CMD_PUSH && cmd != IKCP_CMD_ACK &&
-			cmd != IKCP_CMD_WASK && cmd != IKCP_CMD_WINS && cmd != IKCP_CMD_NREQ {
+			cmd != IKCP_CMD_WASK && cmd != IKCP_CMD_WINS && cmd != IKCP_CMD_NREQ &&
+			cmd != IKCP_CMD_NMIS {
 			return -3
 		}
 
@@ -875,8 +883,8 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 		if pktType == IKCP_PACKET_REGULAR {
 			kcp.rmt_wnd = uint32(wnd)
 		}
-		// NREQ reuses header fields; do not treat `una` as KCP cumulative ACK.
-		if cmd != IKCP_CMD_NREQ {
+		// NREQ/NMIS reuse header fields; do not treat `una` as KCP cumulative ACK.
+		if cmd != IKCP_CMD_NREQ && cmd != IKCP_CMD_NMIS {
 			if kcp.parse_una(expandSN16(kcp.snd_una, una)) > 0 {
 				flushSegments |= 1
 			}
@@ -932,6 +940,20 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 				// sn is only 16 bits on the wire; the server resolves the full sequence number
 				// against the replay map (see handleDownstreamNREQ / resolveWireSN).
 				kcp.onResendRequest(sn, cnt)
+			}
+		case IKCP_CMD_NMIS:
+			if length != 0 {
+				return -2
+			}
+			fullSn := expandSN16(kcp.rcv_nxt, sn)
+			now := currentMs()
+			throttle := kcp.lastReplayMissFullSn == fullSn && kcp.lastReplayMissLogMs != 0 &&
+				_itimediff(now, kcp.lastReplayMissLogMs) < 3000
+			if !throttle {
+				log.Printf("kcp: server replay miss conv=%08x missing_sn=%d — head segment not in server replay cache; NREQ cannot recover this gap",
+					kcp.conv&0xFFFFFFFF, fullSn)
+				kcp.lastReplayMissFullSn = fullSn
+				kcp.lastReplayMissLogMs = now
 			}
 		default:
 			return -3
@@ -1453,6 +1475,8 @@ func (kcp *KCP) maybeRetryNreqOnStall() {
 
 func (kcp *KCP) resetNreqRetryAfterProgress() {
 	kcp.lastRcvNxtAdvanceMs = currentMs()
+	kcp.lastReplayMissFullSn = 0xFFFFFFFF
+	kcp.lastReplayMissLogMs = 0
 	if !kcp.clientSendNreq {
 		return
 	}
