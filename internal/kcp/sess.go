@@ -788,6 +788,34 @@ func (s *UDPSession) Control(f func(conn net.PacketConn) error) error {
 	return f(s.conn)
 }
 
+// captureReplayFromOutboundBuf records every PUSH in the plaintext KCP blob before encryption.
+// See captureOutboundKCPPushes. No-op when replay is disabled, OOB, or FEC is enabled (different framing).
+func (s *UDPSession) captureReplayFromOutboundBuf(buf []byte) {
+	if s.downstreamReplay == nil || len(buf) < IKCP_OVERHEAD {
+		return
+	}
+	var kcpPlain []byte
+	switch block := s.block.(type) {
+	case nil:
+		kcpPlain = buf
+	case *aeadCrypt:
+		ns := block.NonceSize()
+		if len(buf) <= ns {
+			return
+		}
+		kcpPlain = buf[ns:]
+	default:
+		if len(buf) <= cryptHeaderSize {
+			return
+		}
+		kcpPlain = buf[cryptHeaderSize:]
+	}
+	if len(kcpPlain) < IKCP_OVERHEAD {
+		return
+	}
+	captureOutboundKCPPushes(s.downstreamReplay, kcpPlain)
+}
+
 // postProcess is the goroutine that handles the outgoing packet pipeline.
 // It runs the following stages sequentially for each packet:
 //  1. FEC encoding   — generate parity shards (Reed-Solomon)
@@ -806,6 +834,12 @@ func (s *UDPSession) postProcess() {
 		case req := <-s.chPostProcessing: // dequeue from post processing
 			buf := req.buffer
 			oob := req.oob
+
+			// Mirror outbound PUSH into downstream replay from the same bytes we encrypt, so NREQ
+			// can always resend what actually left the server (belt-and-suspenders with onOutboundPush).
+			if s.fecEncoder == nil && !oob {
+				s.captureReplayFromOutboundBuf(buf)
+			}
 
 			var ecc [][]byte
 

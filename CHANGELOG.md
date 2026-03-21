@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.10] - 2026-03-21
+
+### Fixed
+
+- **Downstream replay capture vs wire** — The server still mirrored PUSH payloads only via `onOutboundPush` inside `kcp.flush`. The post-process path now **parses the plaintext KCP blob again immediately before encryption** and calls the same `downstreamReplay.Add` for every PUSH. That keeps the NREQ replay map aligned with bytes that actually leave the machine (including coalesced multi-segment outputs), closing holes where `rcv_nxt==0` but `sn` 0/1 were missing from the cache even though they had been sent.
+
 ## [1.5.9] - 2026-03-21
 
 ### Fixed
@@ -271,7 +277,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.9...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.10...HEAD
+[1.5.10]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.9...v1.5.10
 [1.5.9]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.8...v1.5.9
 [1.5.8]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.7...v1.5.8
 [1.5.7]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.6...v1.5.7
