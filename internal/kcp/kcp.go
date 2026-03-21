@@ -128,6 +128,31 @@ func _itimediff(later, earlier uint32) int32 {
 	return (int32)(later - earlier)
 }
 
+const kcpSNMod = 65536 // wire carries sn/una in 16 bits (see encodeWireHeader)
+
+// expandSN16 maps a 16-bit-on-wire sequence number into the same epoch as anchor
+// (typically rcv_nxt for downstream PUSH, snd_una for ACK/UNA, snd_nxt for NREQ).
+func expandSN16(anchor, wire uint32) uint32 {
+	w := wire & (kcpSNMod - 1)
+	al := int64(anchor & (kcpSNMod - 1))
+	wl := int64(w)
+	d := wl - al
+	if d > 32767 {
+		d -= kcpSNMod
+	}
+	if d < -32768 {
+		d += kcpSNMod
+	}
+	out := int64(anchor) + d
+	if out < 0 {
+		if anchor > 0 {
+			return anchor - 1
+		}
+		return ^uint32(0)
+	}
+	return uint32(out)
+}
+
 // segment defines a KCP segment
 type segment struct {
 	conv     uint32
@@ -530,20 +555,7 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 		}
 	}
 
-	// move available data from rcv_buf -> rcv_queue
-	for kcp.rcv_buf.Len() > 0 {
-		seg := heap.Pop(kcp.rcv_buf).(segment)
-		if seg.sn == kcp.rcv_nxt && kcp.rcv_queue.Len() < int(kcp.rcv_wnd) {
-			kcp.rcv_queue.Push(seg)
-			kcp.rcv_nxt++
-			kcp.recvGapLogged = false
-			kcp.resetNreqRetryAfterProgress()
-		} else {
-			// push back segment
-			heap.Push(kcp.rcv_buf, seg)
-			break
-		}
-	}
+	kcp.advanceRcvBufToQueue()
 
 	// fast recover
 	if kcp.rcv_queue.Len() < int(kcp.rcv_wnd) && fast_recover {
@@ -751,42 +763,52 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 			log.Printf("kcp: recv beyond window conv=%08x rcv_nxt=%d rcv_wnd=%d got_sn=%d — segment dropped (too far ahead)",
 				kcp.conv&0xFFFFFFFF, kcp.rcv_nxt, kcp.rcv_wnd, sn)
 		}
+		kcp.advanceRcvBufToQueue()
 		return true
 	}
-	if _itimediff(sn, kcp.rcv_nxt) < 0 {
-		return true
-	}
+	behind := _itimediff(sn, kcp.rcv_nxt) < 0
 
 	repeat := false
-	if !kcp.rcv_buf.Has(sn) {
-		// replicate the content if it's new
-		dataCopy := defaultBufferPool.Get()[:len(newseg.data)]
-		copy(dataCopy, newseg.data)
-		newseg.data = dataCopy
+	if !behind {
+		if !kcp.rcv_buf.Has(sn) {
+			// replicate the content if it's new
+			dataCopy := defaultBufferPool.Get()[:len(newseg.data)]
+			copy(dataCopy, newseg.data)
+			newseg.data = dataCopy
 
-		// insert the new segment into rcv_buf
-		heap.Push(kcp.rcv_buf, newseg)
-		if _itimediff(sn, kcp.rcv_nxt) > 0 {
-			atomic.AddUint64(&DefaultSnmp.RcvReorderGap, 1)
-			kcp.scheduleResendRequest(kcp.rcv_nxt, _itimediff(sn, kcp.rcv_nxt), true)
-			if os.Getenv("DNSTT_KCP_RECV_GAP") != "" {
-				verbose := os.Getenv("DNSTT_KCP_RECV_GAP_VERBOSE") != ""
-				if verbose || !kcp.recvGapLogged {
-					if !verbose {
-						kcp.recvGapLogged = true
+			// insert the new segment into rcv_buf
+			heap.Push(kcp.rcv_buf, newseg)
+			if _itimediff(sn, kcp.rcv_nxt) > 0 {
+				atomic.AddUint64(&DefaultSnmp.RcvReorderGap, 1)
+				kcp.scheduleResendRequest(kcp.rcv_nxt, _itimediff(sn, kcp.rcv_nxt), true)
+				if os.Getenv("DNSTT_KCP_RECV_GAP") != "" {
+					verbose := os.Getenv("DNSTT_KCP_RECV_GAP_VERBOSE") != ""
+					if verbose || !kcp.recvGapLogged {
+						if !verbose {
+							kcp.recvGapLogged = true
+						}
+						miss := _itimediff(sn, kcp.rcv_nxt)
+						log.Printf("kcp: recv seq gap conv=%08x next_expected_sn=%d arrived_sn=%d missing_streak=%d payload=%d B rcv_buf_segs=%d — KCP sn [%d,%d) never arrived (inferred loss/reorder); smux/TCP blocked until sn %d; assume-delivered downstream may never resend",
+							kcp.conv&0xFFFFFFFF, kcp.rcv_nxt, sn, miss, len(dataCopy), kcp.rcv_buf.Len(),
+							kcp.rcv_nxt, sn, kcp.rcv_nxt)
 					}
-					miss := _itimediff(sn, kcp.rcv_nxt)
-					log.Printf("kcp: recv seq gap conv=%08x next_expected_sn=%d arrived_sn=%d missing_streak=%d payload=%d B rcv_buf_segs=%d — KCP sn [%d,%d) never arrived (inferred loss/reorder); smux/TCP blocked until sn %d; assume-delivered downstream may never resend",
-						kcp.conv&0xFFFFFFFF, kcp.rcv_nxt, sn, miss, len(dataCopy), kcp.rcv_buf.Len(),
-						kcp.rcv_nxt, sn, kcp.rcv_nxt)
 				}
 			}
+		} else {
+			repeat = true
 		}
-	} else {
-		repeat = true
 	}
 
-	// move available data from rcv_buf -> rcv_queue
+	kcp.advanceRcvBufToQueue()
+
+	if behind {
+		return true
+	}
+	return repeat
+}
+
+// advanceRcvBufToQueue moves contiguous segments from rcv_buf into rcv_queue.
+func (kcp *KCP) advanceRcvBufToQueue() {
 	for kcp.rcv_buf.Len() > 0 {
 		seg := heap.Pop(kcp.rcv_buf).(segment)
 		if seg.sn == kcp.rcv_nxt && kcp.rcv_queue.Len() < int(kcp.rcv_wnd) {
@@ -795,13 +817,10 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 			kcp.recvGapLogged = false
 			kcp.resetNreqRetryAfterProgress()
 		} else {
-			// push back segment
 			heap.Push(kcp.rcv_buf, seg)
 			break
 		}
 	}
-
-	return repeat
 }
 
 // Input a packet into kcp state machine.
@@ -858,7 +877,7 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 		}
 		// NREQ reuses header fields; do not treat `una` as KCP cumulative ACK.
 		if cmd != IKCP_CMD_NREQ {
-			if kcp.parse_una(una) > 0 {
+			if kcp.parse_una(expandSN16(kcp.snd_una, una)) > 0 {
 				flushSegments |= 1
 			}
 			kcp.shrink_buf()
@@ -866,12 +885,14 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 
 		switch cmd {
 		case IKCP_CMD_ACK:
+			sn = expandSN16(kcp.snd_una, sn)
 			kcp.debugLog(IKCP_LOG_IN_ACK, "conv", conv, "sn", sn, "una", una, "ts", ts, "rto", kcp.rx_rto)
 			kcp.parse_ack(sn)
 			flushSegments |= kcp.parse_fastack(sn, ts)
 			updateRTT |= 1
 			latest = ts
 		case IKCP_CMD_PUSH:
+			sn = expandSN16(kcp.rcv_nxt, sn)
 			repeat := true
 			if _itimediff(sn, kcp.rcv_nxt+kcp.rcv_wnd) < 0 {
 				if !kcp.suppressOutgoingACK {
@@ -908,6 +929,7 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 				cnt = maxNreqSegments
 			}
 			if kcp.onResendRequest != nil {
+				sn = expandSN16(kcp.snd_nxt, sn)
 				kcp.onResendRequest(sn, cnt)
 			}
 		default:

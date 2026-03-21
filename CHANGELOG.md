@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.8] - 2026-03-21
+
+### Fixed
+
+- **16-bit KCP `sn`/`una` on wire vs unbounded counters** — Headers only carry the low 16 bits of sequence numbers while `rcv_nxt` / `snd_nxt` grow as `uint32`. After enough segments, a legitimate next segment (e.g. wire `0` when `rcv_nxt==65536`) was misclassified as a duplicate and dropped, leaving a permanent hole and endless NREQ/polls.
+
+- **`parse_data` duplicate short-circuit skipped reorder drain** — A segment with `sn < rcv_nxt` returned before moving `rcv_buf` → `rcv_queue`, so a duplicate could delay processing already-buffered in-order data. The reorder pass now always runs (`advanceRcvBufToQueue`), shared with `Recv`.
+
 ## [1.5.7] - 2026-03-21
 
 ### Fixed
@@ -257,7 +265,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.7...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.8...HEAD
+[1.5.7]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.7...v1.5.8
 [1.5.7]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.6...v1.5.7
 [1.5.6]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.5...v1.5.6
 [1.5.5]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.4...v1.5.5
