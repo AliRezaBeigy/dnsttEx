@@ -173,10 +173,42 @@ type segment struct {
 	data     []byte
 }
 
+const (
+	// compact header has only 2 cmd bits; reserve WINS+frg markers for extensions
+	cmdExtBaseFrg = 60
+)
+
+func encodeCmdFrg(cmd uint8, frg uint8) uint8 {
+	switch cmd {
+	case IKCP_CMD_PUSH, IKCP_CMD_ACK, IKCP_CMD_WASK, IKCP_CMD_WINS:
+		return uint8((cmd-81)<<6) | (frg & 0x3F)
+	case IKCP_CMD_NREQ:
+		return uint8((IKCP_CMD_WINS-81)<<6) | cmdExtBaseFrg
+	case IKCP_CMD_NMIS:
+		return uint8((IKCP_CMD_WINS-81)<<6) | (cmdExtBaseFrg + 1)
+	default:
+		return uint8((IKCP_CMD_PUSH-81)<<6) | (frg & 0x3F)
+	}
+}
+
+func decodeCmdFrg(b byte) (cmd uint8, frg uint8) {
+	cmd = (b >> 6) + 81
+	frg = b & 0x3F
+	if cmd == IKCP_CMD_WINS && frg >= cmdExtBaseFrg {
+		switch frg {
+		case cmdExtBaseFrg:
+			return IKCP_CMD_NREQ, 0
+		case cmdExtBaseFrg + 1:
+			return IKCP_CMD_NMIS, 0
+		}
+	}
+	return cmd, frg
+}
+
 // encodeWireHeader writes the 12-byte KCP header; does not bump OutSegs (for resends).
 func (seg *segment) encodeWireHeader(ptr []byte) []byte {
 	binary.LittleEndian.PutUint16(ptr, uint16(seg.conv&0xFFFF))
-	ptr[2] = uint8((seg.cmd-81)<<6) | (seg.frg & 0x3F)
+	ptr[2] = encodeCmdFrg(seg.cmd, seg.frg)
 	ptr[3] = byte(min(uint32(seg.wnd), 255))
 	binary.LittleEndian.PutUint16(ptr[4:], uint16(seg.ts&0xFFFF))
 	binary.LittleEndian.PutUint16(ptr[6:], uint16(seg.sn&0xFFFF))
@@ -856,9 +888,7 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 		if uint32(conv16) != (kcp.conv & 0xFFFF) {
 			return -1
 		}
-		cmdFrg := data[2]
-		cmd := (cmdFrg >> 6) + 81
-		frg := cmdFrg & 0x3F
+		cmd, frg := decodeCmdFrg(data[2])
 		wnd := uint16(data[3])
 		ts := uint32(binary.LittleEndian.Uint16(data[4:6]))
 		sn := uint32(binary.LittleEndian.Uint16(data[6:8]))

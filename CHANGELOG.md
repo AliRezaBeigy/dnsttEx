@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.15] - 2026-03-21
+
+### Fixed
+
+- **`NREQ` / `NMIS` wire encoding (compact 12-byte header)** — The header only carries **two bits** of command (`cmd` in the high nibble of byte 2), so only four wire command values exist (`PUSH`/`ACK`/`WASK`/`WINS`). Emitting logical `IKCP_CMD_NREQ` (85) or `IKCP_CMD_NMIS` (86) via `(cmd−81)<<6` **collided** with `WINS` on the wire; peers decoded resend requests as window-tell frames, so the server never ran `handleDownstreamNREQ`, replay stayed idle, and the client kept retrying while stuck on `recv seq gap`. **`NREQ` and `NMIS` now encode as `WINS` with reserved `frg` markers** (`60` / `61`); `Input`/`encodeWireHeader` map those back to 85/86. **Client and server must both run this build** (or stay on a matching pair); mixed with a peer that lacks this mapping, extension frames are misinterpreted.
+
 ## [1.5.14] - 2026-03-21
 
 ### Added
@@ -309,7 +315,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.14...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.15...HEAD
+[1.5.15]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.14...v1.5.15
 [1.5.14]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.13...v1.5.14
 [1.5.13]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.12...v1.5.13
 [1.5.12]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.11...v1.5.12
