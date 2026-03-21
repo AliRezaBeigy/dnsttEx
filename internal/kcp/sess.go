@@ -889,6 +889,7 @@ func (s *UDPSession) update() {
 	case <-s.die:
 	default:
 		s.mu.Lock()
+		s.kcp.maybeRetryNreqOnStall()
 		interval := s.kcp.flush(IKCP_FLUSH_FULL)
 		waitsnd := s.kcp.WaitSnd()
 		if waitsnd < int(s.kcp.snd_wnd) {

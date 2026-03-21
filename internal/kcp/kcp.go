@@ -202,6 +202,14 @@ func (h *segmentHeap) Has(sn uint32) bool {
 	return exists
 }
 
+// peekMinSN returns the smallest buffered segment sequence number.
+func (h *segmentHeap) peekMinSN() (sn uint32, ok bool) {
+	if len(h.segments) == 0 {
+		return 0, false
+	}
+	return h.segments[0].sn, true
+}
+
 // KCP defines a single KCP connection's protocol state machine.
 // It is a pure ARQ (Automatic Repeat reQuest) implementation with no I/O.
 type KCP struct {
@@ -261,6 +269,11 @@ type KCP struct {
 
 	// clientSendNreq: schedule NREQ when a downstream PUSH arrives with sn > rcv_nxt.
 	clientSendNreq bool
+	// NREQ stall retry (client): while rcv_buf holds segments ahead of rcv_nxt, re-send NREQ on a timer.
+	lastNreqScheduleMs uint32
+	nreqRetryBaseMs    uint32
+	nreqRetryMaxMs     uint32
+	nreqRetryCurMs     uint32
 
 	// onResendRequest: server-side handler for peer NREQ (runs under UDPSession.mu).
 	onResendRequest func(firstMissingSN uint32, maxSegments uint32)
@@ -320,7 +333,39 @@ func NewKCP(conv uint32, output output_callback) *KCP {
 	kcp.rcv_queue = NewRingBuffer[segment](IKCP_WND_RCV * 2)
 	kcp.snd_queue = NewRingBuffer[segment](IKCP_WND_SND * 2)
 	kcp.rcv_buf = newSegmentHeap()
+	kcp.nreqRetryBaseMs, kcp.nreqRetryMaxMs = nreqRetryDurationsFromEnv()
+	kcp.nreqRetryCurMs = kcp.nreqRetryBaseMs
 	return kcp
+}
+
+func nreqRetryDurationsFromEnv() (baseMs, maxMs uint32) {
+	baseMs = 400
+	maxMs = 8000
+	if s := os.Getenv("DNSTT_KCP_NREQ_INTERVAL"); s != "" {
+		if d, err := time.ParseDuration(s); err == nil && d > 0 {
+			ms := uint32(d / time.Millisecond)
+			if ms < 50 {
+				ms = 50
+			}
+			if ms > 60000 {
+				ms = 60000
+			}
+			baseMs = ms
+		}
+	}
+	if s := os.Getenv("DNSTT_KCP_NREQ_INTERVAL_MAX"); s != "" {
+		if d, err := time.ParseDuration(s); err == nil && d > 0 {
+			ms := uint32(d / time.Millisecond)
+			if ms < baseMs {
+				ms = baseMs
+			}
+			if ms > 120000 {
+				ms = 120000
+			}
+			maxMs = ms
+		}
+	}
+	return baseMs, maxMs
 }
 
 // newSegment creates a KCP segment
@@ -407,6 +452,7 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 			kcp.rcv_queue.Push(seg)
 			kcp.rcv_nxt++
 			kcp.recvGapLogged = false
+			kcp.resetNreqRetryAfterProgress()
 		} else {
 			// push back segment
 			heap.Push(kcp.rcv_buf, seg)
@@ -637,7 +683,7 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 		heap.Push(kcp.rcv_buf, newseg)
 		if _itimediff(sn, kcp.rcv_nxt) > 0 {
 			atomic.AddUint64(&DefaultSnmp.RcvReorderGap, 1)
-			kcp.scheduleResendRequest(kcp.rcv_nxt, _itimediff(sn, kcp.rcv_nxt))
+			kcp.scheduleResendRequest(kcp.rcv_nxt, _itimediff(sn, kcp.rcv_nxt), true)
 			if os.Getenv("DNSTT_KCP_RECV_GAP") != "" {
 				verbose := os.Getenv("DNSTT_KCP_RECV_GAP_VERBOSE") != ""
 				if verbose || !kcp.recvGapLogged {
@@ -662,6 +708,7 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 			kcp.rcv_queue.Push(seg)
 			kcp.rcv_nxt++
 			kcp.recvGapLogged = false
+			kcp.resetNreqRetryAfterProgress()
 		} else {
 			// push back segment
 			heap.Push(kcp.rcv_buf, seg)
@@ -1171,7 +1218,9 @@ func (kcp *KCP) SetOutboundPushHook(h func(sn uint32, payload []byte)) {
 	kcp.onOutboundPush = h
 }
 
-func (kcp *KCP) scheduleResendRequest(first uint32, miss int32) {
+// scheduleResendRequest queues an NREQ for [first, first+count). resetBackoff: gap first seen from
+// parse_data (reset retry timer to base); false: timer-based retry (increase spacing).
+func (kcp *KCP) scheduleResendRequest(first uint32, miss int32, resetBackoff bool) {
 	if !kcp.clientSendNreq || miss <= 0 {
 		return
 	}
@@ -1184,10 +1233,72 @@ func (kcp *KCP) scheduleResendRequest(first uint32, miss int32) {
 			if n > kcp.nreqList[i].count {
 				kcp.nreqList[i].count = n
 			}
+			kcp.markNreqScheduled(resetBackoff)
 			return
 		}
 	}
 	kcp.nreqList = append(kcp.nreqList, nreqItem{first: first, count: n})
+	kcp.markNreqScheduled(resetBackoff)
+}
+
+func (kcp *KCP) markNreqScheduled(resetBackoff bool) {
+	kcp.lastNreqScheduleMs = currentMs()
+	if resetBackoff {
+		kcp.nreqRetryCurMs = kcp.nreqRetryBaseMs
+		return
+	}
+	next := kcp.nreqRetryCurMs * 2
+	if next < kcp.nreqRetryCurMs {
+		next = kcp.nreqRetryMaxMs
+	}
+	if next > kcp.nreqRetryMaxMs {
+		next = kcp.nreqRetryMaxMs
+	}
+	kcp.nreqRetryCurMs = next
+}
+
+// maybeRetryNreqOnStall re-sends NREQ while out-of-order data is stuck in rcv_buf (client).
+// Caller must hold UDPSession.mu.
+func (kcp *KCP) maybeRetryNreqOnStall() {
+	if !kcp.clientSendNreq || kcp.rcv_buf.Len() == 0 {
+		return
+	}
+	minSn, ok := kcp.rcv_buf.peekMinSN()
+	if !ok {
+		return
+	}
+	if _itimediff(minSn, kcp.rcv_nxt) <= 0 {
+		return
+	}
+	if len(kcp.nreqList) > 0 {
+		return
+	}
+	now := currentMs()
+	if kcp.lastNreqScheduleMs != 0 {
+		if _itimediff(now, kcp.lastNreqScheduleMs) < int32(kcp.nreqRetryCurMs) {
+			return
+		}
+	}
+	miss := _itimediff(minSn, kcp.rcv_nxt)
+	if miss <= 0 {
+		return
+	}
+	elapsed := int32(0)
+	if kcp.lastNreqScheduleMs != 0 {
+		elapsed = _itimediff(now, kcp.lastNreqScheduleMs)
+	}
+	kcp.scheduleResendRequest(kcp.rcv_nxt, miss, false)
+	if os.Getenv("DNSTT_DEBUG") != "" {
+		log.Printf("kcp: NREQ stall retry conv=%08x next_expected_sn=%d min_buf_sn=%d miss=%d after %dms (next gap %dms)",
+			kcp.conv&0xFFFFFFFF, kcp.rcv_nxt, minSn, miss, elapsed, kcp.nreqRetryCurMs)
+	}
+}
+
+func (kcp *KCP) resetNreqRetryAfterProgress() {
+	if !kcp.clientSendNreq {
+		return
+	}
+	kcp.nreqRetryCurMs = kcp.nreqRetryBaseMs
 }
 
 // (deprecated)

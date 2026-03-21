@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.5] - 2026-03-21
+
+### Added
+
+- **KCP recv gap diagnostics** — `internal/kcp` SNMP adds `RcvReorderGap` and `RcvBeyondWindow`. Set `DNSTT_KCP_RECV_GAP=1` to log when a downstream PUSH has `sn > rcv_nxt`; optional `DNSTT_KCP_RECV_GAP_VERBOSE=1` logs every such segment (default: once per stalled `rcv_nxt`).
+
+- **NREQ stall retries (client)** — While out-of-order segments remain in `rcv_buf`, the client re-sends `IKCP_CMD_NREQ` on a timer (default first spacing `400ms`, exponential backoff capped at `8s`), scheduled from `UDPSession.update()` so retries continue even when DNS polls carry no new KCP payload. Env: `DNSTT_KCP_NREQ_INTERVAL`, `DNSTT_KCP_NREQ_INTERVAL_MAX`. Backoff resets when `rcv_nxt` advances.
+
+### Changed
+
+- **NREQ gap log wording** — Sequence-gap lines now include `missing_streak` and the half-open `sn` range for easier reading.
+
 ## [1.5.4] - 2026-03-21
 
 ### Added
@@ -227,8 +239,9 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.4...HEAD
-[1.5.3]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.3...v1.5.4
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.5...HEAD
+[1.5.5]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.4...v1.5.5
+[1.5.4]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.3...v1.5.4
 [1.5.3]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.2...v1.5.3
 [1.5.2]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.0...v1.5.1

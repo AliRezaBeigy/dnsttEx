@@ -70,6 +70,8 @@ func dnsttLogRxData() bool { return os.Getenv("DNSTT_LOG_RX_DATA") != "" }
 
 // dnsttKcpClientNreq enables client IKCP_CMD_NREQ on downstream seq gaps (requires server replay).
 // On by default. Set DNSTT_KCP_NREQ=0 (or false/no) to disable if the server rejects cmd 85.
+// Retries while a hole persists: internal/kcp uses DNSTT_KCP_NREQ_INTERVAL (default 400ms) and
+// DNSTT_KCP_NREQ_INTERVAL_MAX (default 8s) for exponential backoff between stall retries.
 func dnsttKcpClientNreq() bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv("DNSTT_KCP_NREQ")))
 	if v == "" {
