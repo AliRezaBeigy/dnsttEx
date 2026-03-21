@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.6] - 2026-03-21
+
+- **Lossy-path redundancy for NREQ/replay** — Each flush emits `DNSTT_KCP_NREQ_COPIES` (default `2`) identical NREQ segments so one dropped upstream query is less likely to lose the whole resend request. While a reorder hole persists (`rcv_buf` ahead of `rcv_nxt`, including mid-stream gaps such as missing `sn` 6–9), stall retries are spaced by at most `DNSTT_KCP_NREQ_STALL_CAP` (default `150ms`; legacy env `DNSTT_KCP_NREQ_BOOTSTRAP_INTERVAL`). The server queues each replayed PUSH `DNSTT_KCP_REPLAY_SEND_COPIES` times (default `2`) per NREQ so downstream answers get duplicate chances through DNS.
+
+### Fixed
+
+- **NREQ idle-head (SOCKS / single lost downstream segment)** — With server `SetAssumeDeliveredAfterSend` and client `SetSuppressOutgoingACK`, a **sole** lost downstream PUSH leaves `rcv_buf` empty (no later segment to infer a gap), so NREQ never ran and SOCKS could hang on `ReadAck` until smux keepalive. The client now sends NREQ for the next segment window after `DNSTT_KCP_NREQ_IDLE_HEAD` (default `250ms`) with no `rcv_nxt` progress following an on-wire PUSH. Set `DNSTT_KCP_NREQ_IDLE_HEAD=0` to disable.
+
+### Changed
+
+- **Downstream replay eviction (server)** — The replay cache previously evicted the **oldest** stored `sn` first (FIFO). While the client was stuck on a **low** missing `sn`, the server kept sending **newer** PUSHes; FIFO then dropped the very payloads NREQ asked for, so replays were empty and gaps never closed. Eviction now drops the **highest** `sn` first (KCP-style compare via `_itimediff`), and default capacity is raised (`2048` entries / `2 MiB` bytes).
+
 ## [1.5.5] - 2026-03-21
 
 ### Added
@@ -239,7 +251,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.5...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.6...HEAD
+[1.5.6]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.5...v1.5.6
 [1.5.5]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.4...v1.5.5
 [1.5.4]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.3...v1.5.4
 [1.5.3]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.2...v1.5.3

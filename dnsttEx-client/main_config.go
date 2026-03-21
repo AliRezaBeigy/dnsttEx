@@ -70,8 +70,14 @@ func dnsttLogRxData() bool { return os.Getenv("DNSTT_LOG_RX_DATA") != "" }
 
 // dnsttKcpClientNreq enables client IKCP_CMD_NREQ on downstream seq gaps (requires server replay).
 // On by default. Set DNSTT_KCP_NREQ=0 (or false/no) to disable if the server rejects cmd 85.
-// Retries while a hole persists: internal/kcp uses DNSTT_KCP_NREQ_INTERVAL (default 400ms) and
-// DNSTT_KCP_NREQ_INTERVAL_MAX (default 8s) for exponential backoff between stall retries.
+// Retries while a hole persists: DNSTT_KCP_NREQ_INTERVAL (default 400ms) and
+// DNSTT_KCP_NREQ_INTERVAL_MAX (default 8s) for exponential backoff. While rcv_buf holds a gap
+// (any missing sn, including mid-stream), DNSTT_KCP_NREQ_STALL_CAP (default 150ms; alias
+// DNSTT_KCP_NREQ_BOOTSTRAP_INTERVAL) caps retry spacing vs backoff. DNSTT_KCP_NREQ_IDLE_HEAD
+// (default 250ms, 0=off) triggers NREQ when a PUSH was sent but rcv_nxt has not advanced and
+// the reorder buffer is empty (e.g. lone lost SOCKS dial ack). Each flush sends
+// DNSTT_KCP_NREQ_COPIES (default 2) identical NREQ frames. Server replay resends use
+// DNSTT_KCP_REPLAY_SEND_COPIES (default 2) per missing segment.
 func dnsttKcpClientNreq() bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv("DNSTT_KCP_NREQ")))
 	if v == "" {

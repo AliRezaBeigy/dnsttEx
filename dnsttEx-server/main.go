@@ -62,6 +62,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -385,7 +386,17 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string, 
 		conn.SetWindowSize(512, 512) // was QueueSize/2=64; larger window for high-latency DNS
 		// Custom mode: do not wait for client ACK for sent KCP PUSH segments.
 		// Once placed on wire, sender considers segment delivered (no retransmit).
-		conn.SetAssumeDeliveredAfterSend(true)
+		// Set DNSTT_KCP_ASSUME_DELIVERED=0 on server for classic KCP retransmit (more upstream ACK traffic).
+		assumeDel := true
+		if v := strings.TrimSpace(os.Getenv("DNSTT_KCP_ASSUME_DELIVERED")); v != "" {
+			lv := strings.ToLower(v)
+			if lv == "0" || lv == "false" || lv == "off" || lv == "no" {
+				assumeDel = false
+			}
+		}
+		if assumeDel {
+			conn.SetAssumeDeliveredAfterSend(true)
+		}
 		if rc := conn.SetMtu(mtu); !rc {
 			panic(rc)
 		}

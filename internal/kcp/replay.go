@@ -6,8 +6,8 @@ package kcp
 import "sync"
 
 const (
-	defaultReplayMaxEntries = 512
-	defaultReplayMaxBytes   = 512 * 1024
+	defaultReplayMaxEntries = 2048
+	defaultReplayMaxBytes   = 2048 * 1024
 )
 
 type downstreamReplay struct {
@@ -50,8 +50,16 @@ func (r *downstreamReplay) Add(sn uint32, payload []byte) {
 
 func (r *downstreamReplay) evictLocked() {
 	for (len(r.order) > r.maxEntries || r.curBytes > r.maxBytes) && len(r.order) > 0 {
-		oldSN := r.order[0]
-		r.order = r.order[1:]
+		// Evict highest sn first. FIFO eviction removed the oldest (lowest) sns first,
+		// which are exactly what a stalled client requests via NREQ (first missing sn).
+		maxIdx := 0
+		for i := 1; i < len(r.order); i++ {
+			if _itimediff(r.order[i], r.order[maxIdx]) > 0 {
+				maxIdx = i
+			}
+		}
+		oldSN := r.order[maxIdx]
+		r.order = append(r.order[:maxIdx], r.order[maxIdx+1:]...)
 		if old, ok := r.bySN[oldSN]; ok {
 			r.curBytes -= len(old)
 			delete(r.bySN, oldSN)

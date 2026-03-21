@@ -53,6 +53,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -303,6 +304,30 @@ func serverDownstreamReplayEnabled() bool {
 	return true
 }
 
+var (
+	replaySendCopiesOnce sync.Once
+	replaySendCopiesVal  int
+)
+
+// replaySendCopies is how many times each replayed PUSH is queued per NREQ (separate TX chances on lossy DNS).
+func replaySendCopies() int {
+	replaySendCopiesOnce.Do(func() {
+		replaySendCopiesVal = 2
+		if s := os.Getenv("DNSTT_KCP_REPLAY_SEND_COPIES"); s != "" {
+			if n, err := strconv.Atoi(s); err == nil {
+				replaySendCopiesVal = n
+			}
+		}
+		if replaySendCopiesVal < 1 {
+			replaySendCopiesVal = 1
+		}
+		if replaySendCopiesVal > 4 {
+			replaySendCopiesVal = 4
+		}
+	})
+	return replaySendCopiesVal
+}
+
 // SetClientResendRequests enables IKCP_CMD_NREQ when the client detects a downstream sequence gap.
 func (s *UDPSession) SetClientResendRequests(enable bool) {
 	s.mu.Lock()
@@ -314,6 +339,7 @@ func (s *UDPSession) handleDownstreamNREQ(firstMissingSN, maxSegments uint32) {
 	if s.downstreamReplay == nil {
 		return
 	}
+	copies := replaySendCopies()
 	for i := uint32(0); i < maxSegments; i++ {
 		sn := firstMissingSN + i
 		payload := s.downstreamReplay.Payload(sn)
@@ -321,7 +347,9 @@ func (s *UDPSession) handleDownstreamNREQ(firstMissingSN, maxSegments uint32) {
 			continue
 		}
 		plain := s.encodeResendPush(sn, payload)
-		s.enqueuePlainKCP(plain)
+		for c := 0; c < copies; c++ {
+			s.enqueuePlainKCP(plain)
+		}
 	}
 }
 
