@@ -78,3 +78,27 @@ func (r *downstreamReplay) payloadForNREQ(sn uint32) (payload []byte, ok bool) {
 	p, ok := r.bySN[sn]
 	return p, ok
 }
+
+// resolveWireSN maps a 16-bit-on-wire sequence number to the full uint32 key used in bySN.
+// When the client is stuck at a low rcv_nxt but the server has advanced snd_nxt far ahead,
+// expandSN16(snd_nxt, wire) picks the wrong lap (e.g. 65536 instead of 0); we scan laps in
+// order and return the first sn present in the replay map with sn < sndNxt (when sndNxt > 0).
+func (r *downstreamReplay) resolveWireSN(wire uint32, sndNxt uint32) (snFull uint32, ok bool) {
+	if r == nil {
+		return 0, false
+	}
+	w := wire & (kcpSNMod - 1)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	const maxLaps = 128
+	for lap := 0; lap < maxLaps; lap++ {
+		sn := w + uint32(lap)*kcpSNMod
+		if sndNxt != 0 && sn >= sndNxt {
+			break
+		}
+		if _, ok := r.bySN[sn]; ok {
+			return sn, true
+		}
+	}
+	return 0, false
+}

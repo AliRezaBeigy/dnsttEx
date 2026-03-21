@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.9] - 2026-03-21
+
+### Fixed
+
+- **NREQ replay lookup when server `snd_nxt` is far ahead of client `rcv_nxt`** — Resolving the wire `sn` with `expandSN16(snd_nxt, wire)` could pick the wrong 64K lap (e.g. **65536** instead of **0** when the replay map only holds **0..n**). The server now maps NREQ’s 16-bit `sn` by scanning laps **0, 65536, …** and taking the first key present in the downstream replay with `sn < snd_nxt` (or any lap when `snd_nxt==0`).
+
 ## [1.5.8] - 2026-03-21
 
 ### Fixed
@@ -265,8 +271,9 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.8...HEAD
-[1.5.7]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.7...v1.5.8
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.9...HEAD
+[1.5.9]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.8...v1.5.9
+[1.5.8]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.7...v1.5.8
 [1.5.7]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.6...v1.5.7
 [1.5.6]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.5...v1.5.6
 [1.5.5]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.4...v1.5.5

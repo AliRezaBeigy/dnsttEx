@@ -335,13 +335,17 @@ func (s *UDPSession) SetClientResendRequests(enable bool) {
 	s.kcp.SetClientResendRequests(enable)
 }
 
-func (s *UDPSession) handleDownstreamNREQ(firstMissingSN, maxSegments uint32) {
+func (s *UDPSession) handleDownstreamNREQ(wireFirstMissingSN, maxSegments uint32) {
 	if s.downstreamReplay == nil {
 		return
 	}
+	firstFull, ok := s.downstreamReplay.resolveWireSN(wireFirstMissingSN, s.kcp.snd_nxt)
+	if !ok {
+		firstFull = expandSN16(s.kcp.snd_nxt, wireFirstMissingSN)
+	}
 	copies := replaySendCopies()
 	for i := uint32(0); i < maxSegments; i++ {
-		sn := firstMissingSN + i
+		sn := firstFull + i
 		payload, found := s.downstreamReplay.payloadForNREQ(sn)
 		if !found {
 			continue

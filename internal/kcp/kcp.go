@@ -929,7 +929,8 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 				cnt = maxNreqSegments
 			}
 			if kcp.onResendRequest != nil {
-				sn = expandSN16(kcp.snd_nxt, sn)
+				// sn is only 16 bits on the wire; the server resolves the full sequence number
+				// against the replay map (see handleDownstreamNREQ / resolveWireSN).
 				kcp.onResendRequest(sn, cnt)
 			}
 		default:
@@ -1322,7 +1323,8 @@ func (kcp *KCP) SetClientResendRequests(enable bool) {
 	kcp.clientSendNreq = enable
 }
 
-// SetResendRequestHandler registers the server-side NREQ handler (first missing sn, max count from peer).
+// SetResendRequestHandler registers the server-side NREQ handler. firstMissingSN is the
+// 16-bit-on-wire value from the NREQ header; the listener resolves it to a full sn via replay.
 func (kcp *KCP) SetResendRequestHandler(h func(firstMissingSN uint32, maxSegments uint32)) {
 	kcp.onResendRequest = h
 }
