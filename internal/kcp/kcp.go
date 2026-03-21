@@ -346,8 +346,8 @@ type KCP struct {
 
 	// onResendRequest: server-side handler for peer NREQ (runs under UDPSession.mu).
 	onResendRequest func(firstMissingSN uint32, maxSegments uint32)
-	// onOutboundPush: server-side snapshot of each sent PUSH payload (plaintext body only).
-	onOutboundPush func(sn uint32, payload []byte)
+	// onOutboundPush: server-side snapshot of each sent PUSH payload + fragment index.
+	onOutboundPush func(sn uint32, frg uint8, payload []byte)
 
 	buffer []byte          // pre-allocated encoding buffer for flush()
 	output output_callback // callback to write data to the underlying transport
@@ -1280,7 +1280,7 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 				if kcp.onOutboundPush != nil {
 					pb := make([]byte, len(segment.data))
 					copy(pb, segment.data)
-					kcp.onOutboundPush(segment.sn, pb)
+					kcp.onOutboundPush(segment.sn, segment.frg, pb)
 				}
 
 				// After max retransmits without ACK, drop this segment only (do not close session).
@@ -1382,7 +1382,7 @@ func (kcp *KCP) SetResendRequestHandler(h func(firstMissingSN uint32, maxSegment
 }
 
 // SetOutboundPushHook registers a callback invoked for each outbound PUSH payload (plaintext segment body).
-func (kcp *KCP) SetOutboundPushHook(h func(sn uint32, payload []byte)) {
+func (kcp *KCP) SetOutboundPushHook(h func(sn uint32, frg uint8, payload []byte)) {
 	kcp.onOutboundPush = h
 }
 

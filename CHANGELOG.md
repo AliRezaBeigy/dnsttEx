@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.16] - 2026-03-21
+
+### Fixed
+
+- **NREQ replay preserves KCP PUSH `frg` (fragment index)** — Re-encoded replay PUSH segments always used **`frg=0`**. In KCP **message mode** (`stream==0`), a single logical message split across multiple MSS-sized PUSH segments relies on **`frg`** for reassembly; wrong `frg` after replay left the client unable to complete `Recv` even when every `sn` had been delivered, matching “recv seq gap” / stalled SOCKS symptoms on multi-segment downstream. **`downstreamReplay` now stores `(payload, frg)` per full `sn`**, and **`encodeResendPush` copies the stored `frg`**. **`SetOutboundPushHook`** is now **`func(sn uint32, frg uint8, payload []byte)`** so the server cache matches what was actually sent.
+
 ## [1.5.15] - 2026-03-21
 
 ### Fixed
@@ -315,7 +321,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.15...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.16...HEAD
+[1.5.16]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.15...v1.5.16
 [1.5.15]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.14...v1.5.15
 [1.5.14]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.13...v1.5.14
 [1.5.13]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.12...v1.5.13

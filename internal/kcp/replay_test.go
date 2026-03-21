@@ -4,9 +4,9 @@ import "testing"
 
 func TestResolveWireSN(t *testing.T) {
 	r := newDownstreamReplay()
-	r.Add(0, []byte{1})
-	r.Add(1, []byte{2})
-	r.Add(2, []byte{3})
+	r.Add(0, 0, []byte{1})
+	r.Add(1, 0, []byte{2})
+	r.Add(2, 0, []byte{3})
 
 	sn, ok := r.resolveWireSN(0, 10)
 	if !ok || sn != 0 {

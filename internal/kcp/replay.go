@@ -27,8 +27,13 @@ type downstreamReplay struct {
 	maxBytes   int
 	curBytes   int
 
-	bySN  map[uint32][]byte
+	bySN  map[uint32]replaySeg
 	order []uint32
+}
+
+type replaySeg struct {
+	payload []byte
+	frg     uint8
 }
 
 func newDownstreamReplay() *downstreamReplay {
@@ -36,7 +41,7 @@ func newDownstreamReplay() *downstreamReplay {
 	return &downstreamReplay{
 		maxEntries: maxEntries,
 		maxBytes:   maxBytes,
-		bySN:       make(map[uint32][]byte),
+		bySN:       make(map[uint32]replaySeg),
 	}
 }
 
@@ -72,7 +77,7 @@ func replayLimits() (maxEntries int, maxBytes int) {
 	return replayMaxEntriesValue, replayMaxBytesValue
 }
 
-func (r *downstreamReplay) Add(sn uint32, payload []byte) {
+func (r *downstreamReplay) Add(sn uint32, frg uint8, payload []byte) {
 	if r == nil {
 		return
 	}
@@ -80,12 +85,15 @@ func (r *downstreamReplay) Add(sn uint32, payload []byte) {
 	defer r.mu.Unlock()
 
 	if old, ok := r.bySN[sn]; ok {
-		r.curBytes -= len(old)
+		r.curBytes -= len(old.payload)
 	} else {
 		r.order = append(r.order, sn)
 	}
 	cp := append([]byte(nil), payload...)
-	r.bySN[sn] = cp
+	r.bySN[sn] = replaySeg{
+		payload: cp,
+		frg:     frg,
+	}
 	r.curBytes += len(cp)
 
 	r.evictLocked()
@@ -104,7 +112,7 @@ func (r *downstreamReplay) evictLocked() {
 		oldSN := r.order[maxIdx]
 		r.order = append(r.order[:maxIdx], r.order[maxIdx+1:]...)
 		if old, ok := r.bySN[oldSN]; ok {
-			r.curBytes -= len(old)
+			r.curBytes -= len(old.payload)
 			delete(r.bySN, oldSN)
 		}
 	}
@@ -112,14 +120,17 @@ func (r *downstreamReplay) evictLocked() {
 
 // payloadForNREQ returns stored bytes for sn. ok is false if sn was never recorded.
 // payload may have length 0 (valid KCP PUSH); callers must not treat empty as "missing".
-func (r *downstreamReplay) payloadForNREQ(sn uint32) (payload []byte, ok bool) {
+func (r *downstreamReplay) payloadForNREQ(sn uint32) (payload []byte, frg uint8, ok bool) {
 	if r == nil {
-		return nil, false
+		return nil, 0, false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	p, ok := r.bySN[sn]
-	return p, ok
+	seg, ok := r.bySN[sn]
+	if !ok {
+		return nil, 0, false
+	}
+	return seg.payload, seg.frg, true
 }
 
 // resolveWireSN maps a 16-bit-on-wire sequence number to the full uint32 key used in bySN.

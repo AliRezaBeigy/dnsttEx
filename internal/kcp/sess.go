@@ -267,8 +267,8 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 
 	if sess.l != nil && serverDownstreamReplayEnabled() {
 		sess.downstreamReplay = newDownstreamReplay()
-		sess.kcp.SetOutboundPushHook(func(sn uint32, data []byte) {
-			sess.downstreamReplay.Add(sn, data)
+		sess.kcp.SetOutboundPushHook(func(sn uint32, frg uint8, data []byte) {
+			sess.downstreamReplay.Add(sn, frg, data)
 		})
 		sess.kcp.SetResendRequestHandler(func(firstMissingSN, maxSegments uint32) {
 			sess.handleDownstreamNREQ(firstMissingSN, maxSegments)
@@ -358,7 +358,7 @@ func (s *UDPSession) handleDownstreamNREQ(wireFirstMissingSN, maxSegments uint32
 	// The client is blocked specifically on the first missing sequence.
 	// If that head segment is unavailable on the server, replaying later
 	// segments only creates duplicate out-of-order traffic and cannot unblock.
-	if _, found := s.downstreamReplay.payloadForNREQ(firstFull); !found {
+	if _, _, found := s.downstreamReplay.payloadForNREQ(firstFull); !found {
 		if replayMissNotifyEnabled() {
 			s.enqueueReplayMissNotify(wireFirstMissingSN)
 		}
@@ -367,11 +367,11 @@ func (s *UDPSession) handleDownstreamNREQ(wireFirstMissingSN, maxSegments uint32
 	copies := replaySendCopies()
 	for i := uint32(0); i < maxSegments; i++ {
 		sn := firstFull + i
-		payload, found := s.downstreamReplay.payloadForNREQ(sn)
+		payload, frg, found := s.downstreamReplay.payloadForNREQ(sn)
 		if !found {
 			continue
 		}
-		plain := s.encodeResendPush(sn, payload)
+		plain := s.encodeResendPush(sn, frg, payload)
 		for c := 0; c < copies; c++ {
 			s.enqueuePlainKCP(plain)
 		}
@@ -398,12 +398,12 @@ func (s *UDPSession) enqueueReplayMissNotify(wireSN uint32) {
 	}
 }
 
-func (s *UDPSession) encodeResendPush(sn uint32, payload []byte) []byte {
+func (s *UDPSession) encodeResendPush(sn uint32, frg uint8, payload []byte) []byte {
 	var seg segment
 	seg.conv = s.kcp.conv
 	seg.cmd = IKCP_CMD_PUSH
 	seg.sn = sn
-	seg.frg = 0
+	seg.frg = frg
 	seg.wnd = uint16(min(int(s.kcp.wnd_unused()), 255))
 	seg.ts = currentMs()
 	seg.una = s.kcp.rcv_nxt
