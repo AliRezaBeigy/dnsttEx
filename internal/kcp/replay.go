@@ -30,7 +30,7 @@ func newDownstreamReplay() *downstreamReplay {
 }
 
 func (r *downstreamReplay) Add(sn uint32, payload []byte) {
-	if r == nil || len(payload) == 0 {
+	if r == nil {
 		return
 	}
 	r.mu.Lock()
@@ -67,12 +67,14 @@ func (r *downstreamReplay) evictLocked() {
 	}
 }
 
-// Payload returns a stored PUSH payload for sn, or nil.
-func (r *downstreamReplay) Payload(sn uint32) []byte {
+// payloadForNREQ returns stored bytes for sn. ok is false if sn was never recorded.
+// payload may have length 0 (valid KCP PUSH); callers must not treat empty as "missing".
+func (r *downstreamReplay) payloadForNREQ(sn uint32) (payload []byte, ok bool) {
 	if r == nil {
-		return nil
+		return nil, false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.bySN[sn]
+	p, ok := r.bySN[sn]
+	return p, ok
 }

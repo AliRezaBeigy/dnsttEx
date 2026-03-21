@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.7] - 2026-03-21
+
+### Fixed
+
+- **Replay of zero-length downstream PUSH (server)** — Outbound replay hooks and NREQ skipped `len==0` PUSH bodies, so a valid empty KCP PUSH at `sn==0` was never cached and could not be resent; NREQ still replayed `sn` 1+, producing endless duplicate small downstream while the client stayed at `rcv_nxt==0`. Empty PUSHes are now recorded and replayed; NREQ uses map presence, not payload length, to decide resend.
+
 ## [1.5.6] - 2026-03-21
 
 - **Lossy-path redundancy for NREQ/replay** — Each flush emits `DNSTT_KCP_NREQ_COPIES` (default `2`) identical NREQ segments so one dropped upstream query is less likely to lose the whole resend request. While a reorder hole persists (`rcv_buf` ahead of `rcv_nxt`, including mid-stream gaps such as missing `sn` 6–9), stall retries are spaced by at most `DNSTT_KCP_NREQ_STALL_CAP` (default `150ms`; legacy env `DNSTT_KCP_NREQ_BOOTSTRAP_INTERVAL`). The server queues each replayed PUSH `DNSTT_KCP_REPLAY_SEND_COPIES` times (default `2`) per NREQ so downstream answers get duplicate chances through DNS.
@@ -251,7 +257,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.6...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.7...HEAD
+[1.5.7]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.6...v1.5.7
 [1.5.6]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.5...v1.5.6
 [1.5.5]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.4...v1.5.5
 [1.5.4]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.3...v1.5.4

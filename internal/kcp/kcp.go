@@ -1202,7 +1202,7 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 
 				kcp.debugLog(IKCP_LOG_OUT_PUSH, "conv", segment.conv, "sn", segment.sn, "frg", segment.frg, "una", segment.una, "ts", segment.ts, "xmit", segment.xmit, "datalen", len(segment.data))
 
-				if kcp.onOutboundPush != nil && len(segment.data) > 0 {
+				if kcp.onOutboundPush != nil {
 					pb := make([]byte, len(segment.data))
 					copy(pb, segment.data)
 					kcp.onOutboundPush(segment.sn, pb)

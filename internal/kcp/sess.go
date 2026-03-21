@@ -342,8 +342,8 @@ func (s *UDPSession) handleDownstreamNREQ(firstMissingSN, maxSegments uint32) {
 	copies := replaySendCopies()
 	for i := uint32(0); i < maxSegments; i++ {
 		sn := firstMissingSN + i
-		payload := s.downstreamReplay.Payload(sn)
-		if len(payload) == 0 {
+		payload, found := s.downstreamReplay.payloadForNREQ(sn)
+		if !found {
 			continue
 		}
 		plain := s.encodeResendPush(sn, payload)
