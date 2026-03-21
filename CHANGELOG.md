@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.4] - 2026-03-21
+
+### Added
+
+- **KCP downstream resend (NREQ)** — New control `IKCP_CMD_NREQ` (85): on a downstream sequence gap the client can send one compact request (`first_sn`, count) instead of per-segment ACKs. The server keeps a bounded replay cache of recent outbound PUSH payloads and re-encodes missing segments on request. **Client:** NREQ enabled by default; set `DNSTT_KCP_NREQ=0` if the server does not accept cmd 85. **Server:** replay enabled by default; set `DNSTT_KCP_REPLAY=0` to disable.
+
 ## [1.5.3] - 2026-03-20
 
 ### Added
@@ -221,7 +227,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.3...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.4...HEAD
+[1.5.3]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.3...v1.5.4
 [1.5.3]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.2...v1.5.3
 [1.5.2]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.0...v1.5.1

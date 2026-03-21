@@ -25,6 +25,7 @@ package kcp
 import (
 	"container/heap"
 	"encoding/binary"
+	"log"
 	"os"
 	"strconv"
 	"sync/atomic"
@@ -44,6 +45,11 @@ const (
 	IKCP_CMD_ACK  = 82 // cmd: acknowledge
 	IKCP_CMD_WASK = 83 // cmd: window probe request (ask)
 	IKCP_CMD_WINS = 84 // cmd: window size response (tell)
+	// IKCP_CMD_NREQ: client asks server to resend downstream PUSH payloads starting at sn (header sn),
+	// up to una (header una) segments. No payload. dnstt extension; peers must both support it.
+	IKCP_CMD_NREQ = 85
+	// maxNreqSegments caps how many sequence numbers one NREQ may cover.
+	maxNreqSegments = 128
 
 	// Probe flags (bitfield), set in kcp.probe to schedule probe commands
 	IKCP_ASK_SEND = 1 // schedule sending IKCP_CMD_WASK
@@ -138,8 +144,8 @@ type segment struct {
 	data     []byte
 }
 
-// encode a segment header (compact 12-byte dnstt layout).
-func (seg *segment) encode(ptr []byte) []byte {
+// encodeWireHeader writes the 12-byte KCP header; does not bump OutSegs (for resends).
+func (seg *segment) encodeWireHeader(ptr []byte) []byte {
 	binary.LittleEndian.PutUint16(ptr, uint16(seg.conv&0xFFFF))
 	ptr[2] = uint8((seg.cmd-81)<<6) | (seg.frg & 0x3F)
 	ptr[3] = byte(min(uint32(seg.wnd), 255))
@@ -147,8 +153,13 @@ func (seg *segment) encode(ptr []byte) []byte {
 	binary.LittleEndian.PutUint16(ptr[6:], uint16(seg.sn&0xFFFF))
 	binary.LittleEndian.PutUint16(ptr[8:], uint16(seg.una&0xFFFF))
 	binary.LittleEndian.PutUint16(ptr[10:], uint16(len(seg.data)))
-	atomic.AddUint64(&DefaultSnmp.OutSegs, 1)
 	return ptr[IKCP_OVERHEAD:]
+}
+
+// encode a segment header (compact 12-byte dnstt layout).
+func (seg *segment) encode(ptr []byte) []byte {
+	atomic.AddUint64(&DefaultSnmp.OutSegs, 1)
+	return seg.encodeWireHeader(ptr)
 }
 
 // segmentHeap is a min-heap of segments, used for receiving segments in order
@@ -236,6 +247,8 @@ type KCP struct {
 
 	// Logging
 	logmask KCPLogType
+	// recvGapLogged: with DNSTT_KCP_RECV_GAP, log at most once per stalled rcv_nxt (same hole).
+	recvGapLogged bool
 
 	// Data queues and buffers
 	snd_queue *RingBuffer[segment] // send queue: segments waiting to enter the send window
@@ -243,7 +256,16 @@ type KCP struct {
 	snd_buf   *RingBuffer[segment] // send buffer: segments in-flight (sent but unacknowledged)
 	rcv_buf   *segmentHeap         // receive buffer: out-of-order segments awaiting reordering
 
-	acklist []ackItem // pending ACKs to be flushed
+	acklist  []ackItem  // pending ACKs to be flushed
+	nreqList []nreqItem // pending NREQ control segments (flushed with ACK phase)
+
+	// clientSendNreq: schedule NREQ when a downstream PUSH arrives with sn > rcv_nxt.
+	clientSendNreq bool
+
+	// onResendRequest: server-side handler for peer NREQ (runs under UDPSession.mu).
+	onResendRequest func(firstMissingSN uint32, maxSegments uint32)
+	// onOutboundPush: server-side snapshot of each sent PUSH payload (plaintext body only).
+	onOutboundPush func(sn uint32, payload []byte)
 
 	buffer []byte          // pre-allocated encoding buffer for flush()
 	output output_callback // callback to write data to the underlying transport
@@ -254,6 +276,11 @@ type KCP struct {
 type ackItem struct {
 	sn uint32
 	ts uint32
+}
+
+type nreqItem struct {
+	first uint32
+	count uint16
 }
 
 // NewKCP create a new kcp state machine
@@ -379,6 +406,7 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 		if seg.sn == kcp.rcv_nxt && kcp.rcv_queue.Len() < int(kcp.rcv_wnd) {
 			kcp.rcv_queue.Push(seg)
 			kcp.rcv_nxt++
+			kcp.recvGapLogged = false
 		} else {
 			// push back segment
 			heap.Push(kcp.rcv_buf, seg)
@@ -586,8 +614,15 @@ func (kcp *KCP) ack_push(sn, ts uint32) {
 // returns true if data has repeated
 func (kcp *KCP) parse_data(newseg segment) bool {
 	sn := newseg.sn
-	if _itimediff(sn, kcp.rcv_nxt+kcp.rcv_wnd) >= 0 ||
-		_itimediff(sn, kcp.rcv_nxt) < 0 {
+	if _itimediff(sn, kcp.rcv_nxt+kcp.rcv_wnd) >= 0 {
+		atomic.AddUint64(&DefaultSnmp.RcvBeyondWindow, 1)
+		if os.Getenv("DNSTT_KCP_RECV_GAP") != "" {
+			log.Printf("kcp: recv beyond window conv=%08x rcv_nxt=%d rcv_wnd=%d got_sn=%d — segment dropped (too far ahead)",
+				kcp.conv&0xFFFFFFFF, kcp.rcv_nxt, kcp.rcv_wnd, sn)
+		}
+		return true
+	}
+	if _itimediff(sn, kcp.rcv_nxt) < 0 {
 		return true
 	}
 
@@ -600,6 +635,22 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 
 		// insert the new segment into rcv_buf
 		heap.Push(kcp.rcv_buf, newseg)
+		if _itimediff(sn, kcp.rcv_nxt) > 0 {
+			atomic.AddUint64(&DefaultSnmp.RcvReorderGap, 1)
+			kcp.scheduleResendRequest(kcp.rcv_nxt, _itimediff(sn, kcp.rcv_nxt))
+			if os.Getenv("DNSTT_KCP_RECV_GAP") != "" {
+				verbose := os.Getenv("DNSTT_KCP_RECV_GAP_VERBOSE") != ""
+				if verbose || !kcp.recvGapLogged {
+					if !verbose {
+						kcp.recvGapLogged = true
+					}
+					miss := _itimediff(sn, kcp.rcv_nxt)
+					log.Printf("kcp: recv seq gap conv=%08x next_expected_sn=%d arrived_sn=%d missing_streak=%d payload=%d B rcv_buf_segs=%d — KCP sn [%d,%d) never arrived (inferred loss/reorder); smux/TCP blocked until sn %d; assume-delivered downstream may never resend",
+						kcp.conv&0xFFFFFFFF, kcp.rcv_nxt, sn, miss, len(dataCopy), kcp.rcv_buf.Len(),
+						kcp.rcv_nxt, sn, kcp.rcv_nxt)
+				}
+			}
+		}
 	} else {
 		repeat = true
 	}
@@ -610,6 +661,7 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 		if seg.sn == kcp.rcv_nxt && kcp.rcv_queue.Len() < int(kcp.rcv_wnd) {
 			kcp.rcv_queue.Push(seg)
 			kcp.rcv_nxt++
+			kcp.recvGapLogged = false
 		} else {
 			// push back segment
 			heap.Push(kcp.rcv_buf, seg)
@@ -664,7 +716,7 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 		}
 
 		if cmd != IKCP_CMD_PUSH && cmd != IKCP_CMD_ACK &&
-			cmd != IKCP_CMD_WASK && cmd != IKCP_CMD_WINS {
+			cmd != IKCP_CMD_WASK && cmd != IKCP_CMD_WINS && cmd != IKCP_CMD_NREQ {
 			return -3
 		}
 
@@ -672,10 +724,13 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 		if pktType == IKCP_PACKET_REGULAR {
 			kcp.rmt_wnd = uint32(wnd)
 		}
-		if kcp.parse_una(una) > 0 {
-			flushSegments |= 1
+		// NREQ reuses header fields; do not treat `una` as KCP cumulative ACK.
+		if cmd != IKCP_CMD_NREQ {
+			if kcp.parse_una(una) > 0 {
+				flushSegments |= 1
+			}
+			kcp.shrink_buf()
 		}
-		kcp.shrink_buf()
 
 		switch cmd {
 		case IKCP_CMD_ACK:
@@ -709,6 +764,20 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 			kcp.debugLog(IKCP_LOG_IN_WASK, "conv", conv, "wnd", wnd, "ts", ts)
 		case IKCP_CMD_WINS:
 			kcp.debugLog(IKCP_LOG_IN_WINS, "conv", conv, "wnd", wnd, "ts", ts)
+		case IKCP_CMD_NREQ:
+			if length != 0 {
+				return -2
+			}
+			cnt := una
+			if cnt == 0 {
+				cnt = 32
+			}
+			if cnt > maxNreqSegments {
+				cnt = maxNreqSegments
+			}
+			if kcp.onResendRequest != nil {
+				kcp.onResendRequest(sn, cnt)
+			}
 		default:
 			return -3
 		}
@@ -771,6 +840,8 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 		// so acks have to be sent out immediately when there are too many.
 		kcp.flush(IKCP_FLUSH_ACKONLY)
 	} else if ackNoDelay && len(kcp.acklist) > 0 { // testing(xtaci): ack immediately if acNoDelay is set
+		kcp.flush(IKCP_FLUSH_ACKONLY)
+	} else if len(kcp.nreqList) > 0 {
 		kcp.flush(IKCP_FLUSH_ACKONLY)
 	}
 	return 0
@@ -840,6 +911,20 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 			}
 		}
 		kcp.acklist = kcp.acklist[0:0]
+
+		for _, nr := range kcp.nreqList {
+			nseg := segment{
+				conv: kcp.conv,
+				cmd:  IKCP_CMD_NREQ,
+				sn:   nr.first,
+				ts:   0,
+				una:  uint32(nr.count),
+				wnd:  kcp.wnd_unused(),
+			}
+			makeSpace(IKCP_OVERHEAD)
+			ptr = nseg.encode(ptr)
+		}
+		kcp.nreqList = kcp.nreqList[:0]
 	}
 
 	// --- Phase 2: Window probing (when remote window is zero) ---
@@ -978,6 +1063,12 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 
 				kcp.debugLog(IKCP_LOG_OUT_PUSH, "conv", segment.conv, "sn", segment.sn, "frg", segment.frg, "una", segment.una, "ts", segment.ts, "xmit", segment.xmit, "datalen", len(segment.data))
 
+				if kcp.onOutboundPush != nil && len(segment.data) > 0 {
+					pb := make([]byte, len(segment.data))
+					copy(pb, segment.data)
+					kcp.onOutboundPush(segment.sn, pb)
+				}
+
 				// After max retransmits without ACK, drop this segment only (do not close session).
 				// Keeps session alive for high-latency/lossy networks and middleware with many clients.
 				if segment.xmit >= kcp.dead_link {
@@ -1063,6 +1154,40 @@ func (kcp *KCP) SetAssumeDeliveredAfterSend(enable bool) {
 // When enabled, this endpoint will not send KCP ACK packets.
 func (kcp *KCP) SetSuppressOutgoingACK(enable bool) {
 	kcp.suppressOutgoingACK = enable
+}
+
+// SetClientResendRequests enables sending IKCP_CMD_NREQ when a downstream seq gap is detected.
+func (kcp *KCP) SetClientResendRequests(enable bool) {
+	kcp.clientSendNreq = enable
+}
+
+// SetResendRequestHandler registers the server-side NREQ handler (first missing sn, max count from peer).
+func (kcp *KCP) SetResendRequestHandler(h func(firstMissingSN uint32, maxSegments uint32)) {
+	kcp.onResendRequest = h
+}
+
+// SetOutboundPushHook registers a callback invoked for each outbound PUSH payload (plaintext segment body).
+func (kcp *KCP) SetOutboundPushHook(h func(sn uint32, payload []byte)) {
+	kcp.onOutboundPush = h
+}
+
+func (kcp *KCP) scheduleResendRequest(first uint32, miss int32) {
+	if !kcp.clientSendNreq || miss <= 0 {
+		return
+	}
+	n := uint16(miss)
+	if n > maxNreqSegments {
+		n = maxNreqSegments
+	}
+	for i := range kcp.nreqList {
+		if kcp.nreqList[i].first == first {
+			if n > kcp.nreqList[i].count {
+				kcp.nreqList[i].count = n
+			}
+			return
+		}
+	}
+	kcp.nreqList = append(kcp.nreqList, nreqItem{first: first, count: n})
 }
 
 // (deprecated)

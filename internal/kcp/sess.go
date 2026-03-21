@@ -52,6 +52,7 @@ import (
 	"hash/crc32"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -173,6 +174,9 @@ type (
 		// OOB data bypasses the KCP reliable data path and is delivered unreliably.
 		// The callback is invoked synchronously from the KCP input processing path.
 		callbackForOOB atomic.Value
+
+		// downstreamReplay (server sessions only): recent PUSH payloads for NREQ resend.
+		downstreamReplay *downstreamReplay
 	}
 
 	setReadBuffer interface {
@@ -278,7 +282,78 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 		atomic.CompareAndSwapUint64(&DefaultSnmp.MaxConn, maxconn, currestab)
 	}
 
+	if sess.l != nil && serverDownstreamReplayEnabled() {
+		sess.downstreamReplay = newDownstreamReplay()
+		sess.kcp.SetOutboundPushHook(func(sn uint32, data []byte) {
+			sess.downstreamReplay.Add(sn, data)
+		})
+		sess.kcp.SetResendRequestHandler(func(firstMissingSN, maxSegments uint32) {
+			sess.handleDownstreamNREQ(firstMissingSN, maxSegments)
+		})
+	}
+
 	return sess
+}
+
+func serverDownstreamReplayEnabled() bool {
+	v := os.Getenv("DNSTT_KCP_REPLAY")
+	if v == "0" || v == "false" {
+		return false
+	}
+	return true
+}
+
+// SetClientResendRequests enables IKCP_CMD_NREQ when the client detects a downstream sequence gap.
+func (s *UDPSession) SetClientResendRequests(enable bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.kcp.SetClientResendRequests(enable)
+}
+
+func (s *UDPSession) handleDownstreamNREQ(firstMissingSN, maxSegments uint32) {
+	if s.downstreamReplay == nil {
+		return
+	}
+	for i := uint32(0); i < maxSegments; i++ {
+		sn := firstMissingSN + i
+		payload := s.downstreamReplay.Payload(sn)
+		if len(payload) == 0 {
+			continue
+		}
+		plain := s.encodeResendPush(sn, payload)
+		s.enqueuePlainKCP(plain)
+	}
+}
+
+func (s *UDPSession) encodeResendPush(sn uint32, payload []byte) []byte {
+	var seg segment
+	seg.conv = s.kcp.conv
+	seg.cmd = IKCP_CMD_PUSH
+	seg.sn = sn
+	seg.frg = 0
+	seg.wnd = uint16(min(int(s.kcp.wnd_unused()), 255))
+	seg.ts = currentMs()
+	seg.una = s.kcp.rcv_nxt
+	seg.data = payload
+	out := make([]byte, IKCP_OVERHEAD+len(payload))
+	tail := seg.encode(out)
+	copy(tail, payload)
+	return out
+}
+
+// enqueuePlainKCP queues a plaintext KCP frame for encryption and TX (same path as kcp output callback).
+// Caller must hold s.mu when required for consistent kcp state used in encoding.
+func (s *UDPSession) enqueuePlainKCP(plain []byte) {
+	if len(plain) < IKCP_OVERHEAD {
+		return
+	}
+	bts := defaultBufferPool.Get()[:len(plain)+s.headerSize]
+	copy(bts[s.headerSize:], plain)
+	select {
+	case s.chPostProcessing <- sendRequest{bts, false}:
+	case <-s.die:
+		defaultBufferPool.Put(bts)
+	}
 }
 
 // Read implements net.Conn
@@ -1032,7 +1107,7 @@ func (s *UDPSession) packetInput(data []byte) {
 //   - 0xf3 (typeOOB): out-of-band packet (unreliable, bypasses KCP)
 //   - other values: raw KCP packet (no FEC)
 //
-// Note: KCP cmd values [81-84] with frg [0-255] do not collide with
+// Note: KCP cmd values [81-85] with frg [0-255] do not collide with
 // FEC type markers 0x00f1/0x00f2/0x00f3 in little-endian.
 func (s *UDPSession) kcpInput(data []byte) {
 	atomic.AddUint64(&DefaultSnmp.InPkts, 1)

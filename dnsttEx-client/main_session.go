@@ -156,6 +156,9 @@ func (sm *sessionManager) createSessionUnlocked() (*kcp.UDPSession, io.ReadWrite
 	conn.SetWindowSize(512, 512) // was QueueSize/2=64; larger window for high-latency DNS
 	// Custom mode: suppress client ACK packets for received downstream KCP PUSH.
 	conn.SetSuppressOutgoingACK(true)
+	if dnsttKcpClientNreq() {
+		conn.SetClientResendRequests(true)
+	}
 	if !conn.SetMtu(sm.mtu) {
 		conn.Close()
 		sm.clearHandshakeConnIf(conn)
@@ -196,8 +199,8 @@ func (sm *sessionManager) createSessionUnlocked() (*kcp.UDPSession, io.ReadWrite
 	// Start a smux session on the Noise channel.
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.Version = 2
-	smuxConfig.KeepAliveInterval = 10 * time.Second
-	smuxConfig.KeepAliveTimeout = 30 * time.Second
+	smuxConfig.KeepAliveInterval = 30 * time.Second
+	smuxConfig.KeepAliveTimeout = 120 * time.Second
 	if s := os.Getenv("DNSTT_SMUX_KEEPALIVE_INTERVAL"); s != "" {
 		if d, err := time.ParseDuration(s); err == nil && d >= time.Second {
 			smuxConfig.KeepAliveInterval = d

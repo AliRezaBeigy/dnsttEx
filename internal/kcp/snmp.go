@@ -49,6 +49,11 @@ type Snmp struct {
 	EarlyRetransSegs    uint64 // accumulated early retransmitted segments
 	LostSegs            uint64 // number of segs inferred as lost
 	RepeatSegs          uint64 // number of segs duplicated
+	// RcvReorderGap counts PUSH segments accepted out of order (sn > rcv_nxt): a lower
+	// sequence number never arrived — typical with DNS loss while peer does not retransmit.
+	RcvReorderGap uint64
+	// RcvBeyondWindow counts PUSH segments dropped as sn >= rcv_nxt+rcv_wnd.
+	RcvBeyondWindow uint64
 	FECFullShardSet     uint64 // number of FEC segments that are full
 	FECRecovered        uint64 // correct packets recovered from FEC
 	FECErrs             uint64 // incorrect packets recovered from FEC
@@ -88,6 +93,8 @@ func (s *Snmp) Header() []string {
 		"EarlyRetransSegs",
 		"LostSegs",
 		"RepeatSegs",
+		"RcvReorderGap",
+		"RcvBeyondWindow",
 		"FECFullShards",
 		"FECParityShards",
 		"FECErrs",
@@ -125,6 +132,8 @@ func (s *Snmp) ToSlice() []string {
 		strconv.FormatUint(snmp.EarlyRetransSegs, 10),
 		strconv.FormatUint(snmp.LostSegs, 10),
 		strconv.FormatUint(snmp.RepeatSegs, 10),
+		strconv.FormatUint(snmp.RcvReorderGap, 10),
+		strconv.FormatUint(snmp.RcvBeyondWindow, 10),
 		strconv.FormatUint(snmp.FECFullShardSet, 10),
 		strconv.FormatUint(snmp.FECParityShards, 10),
 		strconv.FormatUint(snmp.FECErrs, 10),
@@ -161,6 +170,8 @@ func (s *Snmp) Copy() *Snmp {
 	d.EarlyRetransSegs = atomic.LoadUint64(&s.EarlyRetransSegs)
 	d.LostSegs = atomic.LoadUint64(&s.LostSegs)
 	d.RepeatSegs = atomic.LoadUint64(&s.RepeatSegs)
+	d.RcvReorderGap = atomic.LoadUint64(&s.RcvReorderGap)
+	d.RcvBeyondWindow = atomic.LoadUint64(&s.RcvBeyondWindow)
 	d.FECFullShardSet = atomic.LoadUint64(&s.FECFullShardSet)
 	d.FECParityShards = atomic.LoadUint64(&s.FECParityShards)
 	d.FECErrs = atomic.LoadUint64(&s.FECErrs)
@@ -196,6 +207,8 @@ func (s *Snmp) Reset() {
 	atomic.StoreUint64(&s.EarlyRetransSegs, 0)
 	atomic.StoreUint64(&s.LostSegs, 0)
 	atomic.StoreUint64(&s.RepeatSegs, 0)
+	atomic.StoreUint64(&s.RcvReorderGap, 0)
+	atomic.StoreUint64(&s.RcvBeyondWindow, 0)
 	atomic.StoreUint64(&s.FECFullShardSet, 0)
 	atomic.StoreUint64(&s.FECParityShards, 0)
 	atomic.StoreUint64(&s.FECErrs, 0)

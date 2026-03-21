@@ -68,6 +68,16 @@ func dnsttDebug() bool { return os.Getenv("DNSTT_DEBUG") != "" }
 // Set DNSTT_LOG_RX_DATA=1. Lines: DNSTT_TX_DATA → (tunnel upstream), DNSTT_RX_* ← (downstream).
 func dnsttLogRxData() bool { return os.Getenv("DNSTT_LOG_RX_DATA") != "" }
 
+// dnsttKcpClientNreq enables client IKCP_CMD_NREQ on downstream seq gaps (requires server replay).
+// On by default. Set DNSTT_KCP_NREQ=0 (or false/no) to disable if the server rejects cmd 85.
+func dnsttKcpClientNreq() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("DNSTT_KCP_NREQ")))
+	if v == "" {
+		return true
+	}
+	return v != "0" && v != "false" && v != "no" && v != "off"
+}
+
 // dnsttHandshakeDiag enables extra logs explaining handshake stalls: KCP Read/Write under Noise,
 // and throttled lines for idle DNS polls (which DNSTT_LOG_RX_DATA omits). Set DNSTT_HANDSHAKE_DIAG=1.
 func dnsttHandshakeDiag() bool { return os.Getenv("DNSTT_HANDSHAKE_DIAG") != "" }
