@@ -264,6 +264,16 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 		panic("Overhead too large")
 	}
 
+	if sess.l != nil && serverDownstreamReplayEnabled() {
+		sess.downstreamReplay = newDownstreamReplay()
+		sess.kcp.SetOutboundPushHook(func(sn uint32, data []byte) {
+			sess.downstreamReplay.Add(sn, data)
+		})
+		sess.kcp.SetResendRequestHandler(func(firstMissingSN, maxSegments uint32) {
+			sess.handleDownstreamNREQ(firstMissingSN, maxSegments)
+		})
+	}
+
 	// create post-processing goroutine
 	go sess.postProcess()
 
@@ -281,16 +291,6 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 	maxconn := atomic.LoadUint64(&DefaultSnmp.MaxConn)
 	if currestab > maxconn {
 		atomic.CompareAndSwapUint64(&DefaultSnmp.MaxConn, maxconn, currestab)
-	}
-
-	if sess.l != nil && serverDownstreamReplayEnabled() {
-		sess.downstreamReplay = newDownstreamReplay()
-		sess.kcp.SetOutboundPushHook(func(sn uint32, data []byte) {
-			sess.downstreamReplay.Add(sn, data)
-		})
-		sess.kcp.SetResendRequestHandler(func(firstMissingSN, maxSegments uint32) {
-			sess.handleDownstreamNREQ(firstMissingSN, maxSegments)
-		})
 	}
 
 	return sess

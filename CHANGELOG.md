@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.13] - 2026-03-21
+
+### Fixed
+
+- **Server downstream replay hooks before first flush** — `newUDPSession` started the per-session updater (`SystemTimedSched.Put(sess.update, …)`) **before** installing `SetOutboundPushHook` / `SetResendRequestHandler`. Early downstream PUSH segments (`sn` 0, 1, 2, …) could therefore leave the server **without** being stored in `downstreamReplay`, so client NREQ could not replay a lost first segment and logs showed `next_expected_sn=0` or `2` while later `sn` kept arriving. Replay setup now runs **before** `postProcess` and the updater.
+
 ## [1.5.12] - 2026-03-21
 
 ### Fixed
@@ -289,7 +295,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.12...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.13...HEAD
+[1.5.13]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.12...v1.5.13
 [1.5.12]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.11...v1.5.12
 [1.5.11]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.10...v1.5.11
 [1.5.10]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.9...v1.5.10
