@@ -14,7 +14,7 @@ import (
 )
 
 func isExplicitEmptyMarker(payload []byte) bool {
-	return len(payload) == 1 && payload[0] == 0x00
+	return len(payload) == 1 && payload[0] == dns.DownstreamFlagData
 }
 
 // dnsResponsePayload extracts downstream payload. Prefers TXT Answer (works with
@@ -59,19 +59,17 @@ func dnsResponsePayload(resp *dns.Message, domain dns.Name) []byte {
 // were 0 bytes remaining to read from r. It returns io.ErrUnexpectedEOF when
 // EOF occurs in the middle of an encoded packet.
 func nextPacket(r *bytes.Reader) ([]byte, error) {
-	for {
-		var n uint16
-		err := binary.Read(r, binary.BigEndian, &n)
-		if err != nil {
-			return nil, err
-		}
-		p := make([]byte, n)
-		_, err = io.ReadFull(r, p)
-		if err == io.EOF {
-			err = io.ErrUnexpectedEOF
-		}
-		return p, err
+	var n uint16
+	err := binary.Read(r, binary.BigEndian, &n)
+	if err != nil {
+		return nil, err
 	}
+	p := make([]byte, n)
+	_, err = io.ReadFull(r, p)
+	if err == io.EOF {
+		err = io.ErrUnexpectedEOF
+	}
+	return p, err
 }
 
 // recvLoop repeatedly calls transport.ReadFrom to receive a DNS message,
@@ -180,18 +178,37 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 		if len(payload) == 0 {
 			continue
 		}
-		// Wire contract: TXT payload exactly {0x00} is an explicit empty marker.
-		// It is not a length-prefixed tunnel packet and should not be queued.
-		if isExplicitEmptyMarker(payload) {
-			if dnsttLogRxData() {
-				log.Printf("DNSTT_RX_POLL_EMPTY ← from %s | explicit empty marker (0x00)", addr)
-			}
-			continue
-		}
 		if bytes.Equal(payload, ProbeResponsePONG) {
 			if dnsttLogRxData() {
 				log.Printf("DNSTT_RX_POLL_EMPTY ← from %s | PONG only (health / idle)", addr)
 			}
+			continue
+		}
+		flag, frameData, hint, err := dns.ParseDownstreamFrame(payload)
+		if err != nil {
+			if dnsttDebug() {
+				log.Printf("DNSTT_DEBUG: invalid downstream frame from %s: %v", addr, err)
+			}
+			continue
+		}
+		switch flag {
+		case dns.DownstreamFlagData:
+			payload = frameData
+			if len(payload) == 0 {
+				if dnsttLogRxData() {
+					log.Printf("DNSTT_RX_POLL_EMPTY ← from %s | explicit empty marker (flag 0x00)", addr)
+				}
+				continue
+			}
+		case dns.DownstreamFlagHint:
+			c.maybeDispatchServerHint(hint)
+			if dnsttLogRxData() {
+				log.Printf("DNSTT_RX_POLL_EMPTY ← from %s | server hint first_missing=%d highest_sent=%d count=%d ttl_ms=%d",
+					addr, hint.FirstMissingSN, hint.HighestSentSN, hint.SuggestedCount, hint.HintTTLms)
+			}
+			continue
+		default:
+			// ParseDownstreamFrame already filters unknown flags, keep as guard.
 			continue
 		}
 

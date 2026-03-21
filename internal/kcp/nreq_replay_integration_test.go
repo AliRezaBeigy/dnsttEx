@@ -222,6 +222,29 @@ func TestHandleDownstreamNREQResolveWireLapToFullSN(t *testing.T) {
 	}
 }
 
+func TestApplyServerMissingHintSchedulesTargetedNREQ(t *testing.T) {
+	k := NewKCP(0x9999, func([]byte, int) {})
+	k.SetClientResendRequests(true)
+	k.rcv_nxt = 50
+
+	k.ApplyServerMissingHint(40, 60, 8)
+	if len(k.nreqList) != 1 {
+		t.Fatalf("nreqList len=%d want=1", len(k.nreqList))
+	}
+	if k.nreqList[0].first != 50 {
+		t.Fatalf("nreq first=%d want=50 (rcv_nxt)", k.nreqList[0].first)
+	}
+	if k.nreqList[0].count != 8 {
+		t.Fatalf("nreq count=%d want=8", k.nreqList[0].count)
+	}
+
+	k.nreqList = k.nreqList[:0]
+	k.ApplyServerMissingHint(70, 49, 10) // server not ahead
+	if len(k.nreqList) != 0 {
+		t.Fatalf("unexpected nreq scheduled when highest_sent < rcv_nxt")
+	}
+}
+
 func TestKCPIntegrationNREQReplayAndReplayMiss(t *testing.T) {
 	cases := []struct {
 		name            string

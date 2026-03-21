@@ -347,6 +347,14 @@ func (s *UDPSession) SetClientResendRequests(enable bool) {
 	s.kcp.SetClientResendRequests(enable)
 }
 
+// ApplyServerMissingHint schedules targeted NREQ retries from server-side
+// downstream progress metadata carried over the DNS response framing.
+func (s *UDPSession) ApplyServerMissingHint(firstMissingFull, highestSentFull uint32, suggestedCount uint16) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.kcp.ApplyServerMissingHint(firstMissingFull, highestSentFull, suggestedCount)
+}
+
 func (s *UDPSession) handleDownstreamNREQ(wireFirstMissingSN, maxSegments uint32) {
 	if s.downstreamReplay == nil {
 		return

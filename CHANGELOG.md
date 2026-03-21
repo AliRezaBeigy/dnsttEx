@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.18] - 2026-03-21
+
+### Changed
+
+- **Downstream TXT framing now uses a mandatory first-byte flag** — Tunnel responses are now framed as `0x00` + payload bytes (including empty payload as one-byte frame `0x00`) or `0x01` + hint metadata. This replaces the prior special-case `{0x00}` empty marker and gives the client an explicit typed control channel from server to client inside TXT payload bytes.
+
+### Added
+
+- **Server missing-hint frame (`0x01`) and client fast NREQ scheduling** — Server can emit a structured hint frame (`first_missing_sn_full`, `highest_sent_sn_full`, `suggested_count`, `hint_ttl_ms`) when no downstream payload is sent. The client decodes this hint, estimates likely-missed downstream range, debounces repeated hints by TTL, and immediately schedules targeted NREQ via KCP instead of waiting for inferred reorder gaps.
+
 ## [1.5.17] - 2026-03-21
 
 ### Fixed
@@ -327,7 +337,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.17...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.18...HEAD
+[1.5.18]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.17...v1.5.18
 [1.5.17]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.16...v1.5.17
 [1.5.16]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.15...v1.5.16
 [1.5.15]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.14...v1.5.15

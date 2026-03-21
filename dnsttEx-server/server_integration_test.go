@@ -756,21 +756,28 @@ func TestSendLoopTryLockContentionStillSendsData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecodeRDataTXT: %v", err)
 	}
-	if len(decoded) == 1 && decoded[0] == 0x00 {
-		t.Fatal("got explicit empty marker, expected queued data packet")
+	flag, frameData, _, err := dns.ParseDownstreamFrame(decoded)
+	if err != nil {
+		t.Fatalf("ParseDownstreamFrame: %v", err)
 	}
-	if len(decoded) < 2 {
-		t.Fatalf("decoded payload too short: %d", len(decoded))
+	if flag != dns.DownstreamFlagData {
+		t.Fatalf("downstream flag=%#x want data", flag)
 	}
-	gotLen := int(binary.BigEndian.Uint16(decoded[:2]))
+	if len(frameData) == 0 {
+		t.Fatal("got explicit empty data frame, expected queued data packet")
+	}
+	if len(frameData) < 2 {
+		t.Fatalf("decoded payload too short: %d", len(frameData))
+	}
+	gotLen := int(binary.BigEndian.Uint16(frameData[:2]))
 	if gotLen != len(wantPacket) {
 		t.Fatalf("length prefix = %d, want %d", gotLen, len(wantPacket))
 	}
-	if len(decoded) < 2+gotLen {
-		t.Fatalf("decoded payload truncated: have %d want %d", len(decoded), 2+gotLen)
+	if len(frameData) < 2+gotLen {
+		t.Fatalf("decoded payload truncated: have %d want %d", len(frameData), 2+gotLen)
 	}
-	if !bytes.Equal(decoded[2:2+gotLen], wantPacket) {
-		t.Fatalf("packet = %x, want %x", decoded[2:2+gotLen], wantPacket)
+	if !bytes.Equal(frameData[2:2+gotLen], wantPacket) {
+		t.Fatalf("packet = %x, want %x", frameData[2:2+gotLen], wantPacket)
 	}
 
 	select {

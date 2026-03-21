@@ -114,7 +114,18 @@ var (
 // ClientID so memory is bounded under high client churn.
 type clientState struct {
 	mu sync.Mutex // serializes data collection in sendLoop (TryLock)
+
+	// hint state for downstream 0x01 frames.
+	hintHighestSentSN uint32
+	hintHasHighestSN  bool
+	hintLastSentAt    time.Time
 }
+
+const (
+	downstreamHintSuggestedCount = 32
+	downstreamHintTTLms          = 300
+	minHintResendInterval        = 200 * time.Millisecond
+)
 
 var (
 	// maxUDPPayload is the maximum DNS response size we send.
@@ -894,6 +905,68 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 // response, it sends on the network immediately. Those that represent a
 // response capable of carrying data, it packs full of as many packets as will
 // fit while keeping the total size under maxEncodedPayload, then sends it.
+func parseKCPPushWireSN16(packet []byte) (uint32, bool) {
+	if len(packet) < kcp.IKCP_OVERHEAD {
+		return 0, false
+	}
+	cmd := uint8(packet[2]>>6) + 81
+	if cmd != kcp.IKCP_CMD_PUSH {
+		return 0, false
+	}
+	return uint32(binary.LittleEndian.Uint16(packet[6:8])), true
+}
+
+func expandWireSNFromHighest(highestFull uint32, wireSN uint32) uint32 {
+	const snMod = uint32(65536)
+	base := highestFull &^ (snMod - 1)
+	candidate := base | (wireSN & (snMod - 1))
+	// Prefer near/high-side candidate so wraps continue monotonically.
+	if candidate+snMod/2 < highestFull {
+		candidate += snMod
+	}
+	return candidate
+}
+
+func updateHintHighestFromPacket(cs *clientState, packet []byte) {
+	wireSN, ok := parseKCPPushWireSN16(packet)
+	if !ok {
+		return
+	}
+	if !cs.hintHasHighestSN {
+		cs.hintHighestSentSN = wireSN
+		cs.hintHasHighestSN = true
+		return
+	}
+	full := expandWireSNFromHighest(cs.hintHighestSentSN, wireSN)
+	if int32(full-cs.hintHighestSentSN) > 0 {
+		cs.hintHighestSentSN = full
+	}
+}
+
+func buildDownstreamHintFrame(cs *clientState) ([]byte, bool) {
+	if !cs.hintHasHighestSN {
+		return nil, false
+	}
+	if !cs.hintLastSentAt.IsZero() && time.Since(cs.hintLastSentAt) < minHintResendInterval {
+		return nil, false
+	}
+	highest := cs.hintHighestSentSN
+	first := highest
+	if highest >= downstreamHintSuggestedCount-1 {
+		first = highest - (downstreamHintSuggestedCount - 1)
+	} else {
+		first = 0
+	}
+	h := dns.DownstreamHint{
+		FirstMissingSN: first,
+		HighestSentSN:  highest,
+		SuggestedCount: downstreamHintSuggestedCount,
+		HintTTLms:      downstreamHintTTLms,
+	}
+	cs.hintLastSentAt = time.Now()
+	return dns.EncodeDownstreamHintFrame(h), true
+}
+
 func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-chan *record, maxEncodedPayload int, clientCache *ttlcache.Cache[turbotunnel.ClientID, *clientState]) error {
 	var nextRec *record
 	for {
@@ -985,19 +1058,28 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 					if limit > maxEncodedPayload {
 						limit = maxEncodedPayload
 					}
+					if limit > 0 {
+						limit-- // reserve one byte for downstream data flag (0x00)
+					}
 					if p, ok := dequeueOneDownstreamNonBlocking(ttConn, rec.ClientID); ok {
 						packetSize := 2 + len(p)
 						if packetSize <= limit {
 							binary.Write(&payload, binary.BigEndian, uint16(len(p)))
 							payload.Write(p)
+							updateHintHighestFromPacket(cs, p)
 						} else {
 							stashDownstreamWithBackpressure(ttConn, rec.ClientID, p)
 						}
 					}
 					payloadBytes := payload.Bytes()
 					if len(payloadBytes) == 0 {
-						// Wire contract: {0x00} means explicit empty marker.
-						payloadBytes = []byte{0}
+						if hintPayload, ok := buildDownstreamHintFrame(cs); ok && len(hintPayload) <= maxPayloadForReq {
+							payloadBytes = hintPayload
+						} else {
+							payloadBytes = dns.EncodeDownstreamDataFrame(nil)
+						}
+					} else {
+						payloadBytes = dns.EncodeDownstreamDataFrame(payloadBytes)
 					}
 					rec.Resp.Answer[0].Data = dns.EncodeRDataTXT(payloadBytes)
 				} else {
@@ -1005,6 +1087,9 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 					limit := maxPayloadForReq
 					if limit > maxEncodedPayload {
 						limit = maxEncodedPayload
+					}
+					if limit > 0 {
+						limit-- // reserve one byte for downstream data flag (0x00)
 					}
 					timer := time.NewTimer(maxResponseDelay)
 					for {
@@ -1063,14 +1148,20 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 						}
 						binary.Write(&payload, binary.BigEndian, uint16(len(p)))
 						payload.Write(p)
+						updateHintHighestFromPacket(cs, p)
 					}
 					timer.Stop()
 					cs.mu.Unlock()
 
 					payloadBytes := payload.Bytes()
 					if len(payloadBytes) == 0 {
-						// Wire contract: {0x00} means explicit empty marker.
-						payloadBytes = []byte{0}
+						if hintPayload, ok := buildDownstreamHintFrame(cs); ok && len(hintPayload) <= maxPayloadForReq {
+							payloadBytes = hintPayload
+						} else {
+							payloadBytes = dns.EncodeDownstreamDataFrame(nil)
+						}
+					} else {
+						payloadBytes = dns.EncodeDownstreamDataFrame(payloadBytes)
 					}
 					rec.Resp.Answer[0].Data = dns.EncodeRDataTXT(payloadBytes)
 				}

@@ -85,10 +85,51 @@ type DNSPacketConn struct {
 	statsResponsesRecv      atomic.Uint64 // responses that contained tunnel payload
 	statsTunnelBytesRecv    atomic.Uint64
 	statsResponsesRecvTotal atomic.Uint64 // any DNS response received (to see empty vs none)
+	// server hint callback + dedupe state for downstream hint frames (flag 0x01).
+	hintMu            sync.Mutex
+	serverHintHandler func(dns.DownstreamHint)
+	lastHint          dns.DownstreamHint
+	lastHintAt        time.Time
+	lastHintValid     bool
 	// QueuePacketConn is the direct receiver of ReadFrom and WriteTo calls.
 	// recvLoop and sendLoop take the messages out of the receive and send
 	// queues and actually put them on the network.
 	*turbotunnel.QueuePacketConn
+}
+
+// SetServerHintHandler installs/removes a callback for server downstream hint frames.
+// The callback should be fast and non-blocking.
+func (c *DNSPacketConn) SetServerHintHandler(h func(dns.DownstreamHint)) {
+	c.hintMu.Lock()
+	defer c.hintMu.Unlock()
+	c.serverHintHandler = h
+}
+
+func (c *DNSPacketConn) maybeDispatchServerHint(h dns.DownstreamHint) {
+	ttl := time.Duration(h.HintTTLms) * time.Millisecond
+	if ttl <= 0 {
+		ttl = 250 * time.Millisecond
+	}
+	now := time.Now()
+
+	c.hintMu.Lock()
+	if c.lastHintValid &&
+		c.lastHint.FirstMissingSN == h.FirstMissingSN &&
+		c.lastHint.HighestSentSN == h.HighestSentSN &&
+		c.lastHint.SuggestedCount == h.SuggestedCount &&
+		now.Sub(c.lastHintAt) < ttl {
+		c.hintMu.Unlock()
+		return
+	}
+	c.lastHint = h
+	c.lastHintAt = now
+	c.lastHintValid = true
+	handler := c.serverHintHandler
+	c.hintMu.Unlock()
+
+	if handler != nil {
+		handler(h)
+	}
 }
 
 // KCPMTUHint returns the largest single tunnel packet that can fit in one DNS

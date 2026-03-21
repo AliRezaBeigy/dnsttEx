@@ -43,10 +43,14 @@ type sessionManager struct {
 	conv          uint32
 }
 
+type serverHintSetter interface {
+	SetServerHintHandler(func(dns.DownstreamHint))
+}
+
 // newSessionManager creates a new session manager. If usePlain, pubkey is ignored
 // and the tunnel uses no Noise (server negotiates plaintext via preamble).
 func newSessionManager(pubkey []byte, domain dns.Name, remoteAddr net.Addr, pconn net.PacketConn, mtu int, usePlain bool) *sessionManager {
-	return &sessionManager{
+	sm := &sessionManager{
 		pubkey:     pubkey,
 		usePlain:   usePlain,
 		domain:     domain,
@@ -54,6 +58,25 @@ func newSessionManager(pubkey []byte, domain dns.Name, remoteAddr net.Addr, pcon
 		pconn:      pconn,
 		mtu:        mtu,
 	}
+	if hs, ok := pconn.(serverHintSetter); ok {
+		hs.SetServerHintHandler(func(h dns.DownstreamHint) {
+			sm.applyServerHint(h)
+		})
+	}
+	return sm
+}
+
+func (sm *sessionManager) applyServerHint(h dns.DownstreamHint) {
+	sm.mu.RLock()
+	conn := sm.conn
+	if conn == nil {
+		conn = sm.handshakeConn
+	}
+	sm.mu.RUnlock()
+	if conn == nil {
+		return
+	}
+	conn.ApplyServerMissingHint(h.FirstMissingSN, h.HighestSentSN, h.SuggestedCount)
 }
 
 // closeSessionLocked closes the current session if it exists.

@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"io"
 	"net"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"dnsttEx/dns"
 	"dnsttEx/turbotunnel"
@@ -313,5 +315,43 @@ func TestIsExplicitEmptyMarker(t *testing.T) {
 		if got := isExplicitEmptyMarker(tc.payload); got != tc.want {
 			t.Errorf("%s: isExplicitEmptyMarker(%x) = %v, want %v", tc.name, tc.payload, got, tc.want)
 		}
+	}
+}
+
+func TestMaybeDispatchServerHintDebounce(t *testing.T) {
+	pconn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket: %v", err)
+	}
+	defer pconn.Close()
+	domain, err := dns.ParseName("hint-debounce.test.")
+	if err != nil {
+		t.Fatalf("ParseName: %v", err)
+	}
+	conn := NewDNSPacketConn(pconn, pconn.LocalAddr(), domain, 0, 0)
+	defer conn.Close()
+
+	var calls atomic.Int32
+	conn.SetServerHintHandler(func(h dns.DownstreamHint) {
+		_ = h
+		calls.Add(1)
+	})
+
+	h := dns.DownstreamHint{
+		FirstMissingSN: 100,
+		HighestSentSN:  130,
+		SuggestedCount: 16,
+		HintTTLms:      200,
+	}
+	conn.maybeDispatchServerHint(h)
+	conn.maybeDispatchServerHint(h)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("debounced calls=%d want=1", got)
+	}
+
+	time.Sleep(250 * time.Millisecond)
+	conn.maybeDispatchServerHint(h)
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("post-ttl calls=%d want=2", got)
 	}
 }

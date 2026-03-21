@@ -1378,6 +1378,34 @@ func (kcp *KCP) SetClientResendRequests(enable bool) {
 	kcp.clientSendNreq = enable
 }
 
+// ApplyServerMissingHint uses server-provided downstream progress metadata to
+// schedule a targeted NREQ range from the client side.
+func (kcp *KCP) ApplyServerMissingHint(firstMissingFull, highestSentFull uint32, suggestedCount uint16) {
+	if !kcp.clientSendNreq {
+		return
+	}
+	// Nothing to request if server is not known ahead of our current receive edge.
+	if _itimediff(highestSentFull, kcp.rcv_nxt) < 0 {
+		return
+	}
+
+	start := kcp.rcv_nxt
+	if _itimediff(firstMissingFull, start) >= 0 && _itimediff(highestSentFull, firstMissingFull) >= 0 {
+		start = firstMissingFull
+	}
+	miss := _itimediff(highestSentFull, start) + 1
+	if miss <= 0 {
+		return
+	}
+	if suggestedCount > 0 && int32(suggestedCount) < miss {
+		miss = int32(suggestedCount)
+	}
+	if miss > maxNreqSegments {
+		miss = maxNreqSegments
+	}
+	kcp.scheduleResendRequest(start, miss, true)
+}
+
 // SetResendRequestHandler registers the server-side NREQ handler. firstMissingSN is the
 // 16-bit-on-wire value from the NREQ header; the listener resolves it to a full sn via replay.
 func (kcp *KCP) SetResendRequestHandler(h func(firstMissingSN uint32, maxSegments uint32)) {
