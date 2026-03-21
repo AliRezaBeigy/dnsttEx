@@ -76,8 +76,8 @@ func dnsttLogRxData() bool { return os.Getenv("DNSTT_LOG_RX_DATA") != "" }
 // DNSTT_KCP_NREQ_BOOTSTRAP_INTERVAL) caps retry spacing vs backoff. DNSTT_KCP_NREQ_IDLE_HEAD
 // (default 250ms, 0=off) triggers NREQ when a PUSH was sent but rcv_nxt has not advanced and
 // the reorder buffer is empty (e.g. lone lost SOCKS dial ack). Each flush sends
-// DNSTT_KCP_NREQ_COPIES (default 2) identical NREQ frames. Server replay resends use
-// DNSTT_KCP_REPLAY_SEND_COPIES (default 2) per missing segment.
+// DNSTT_KCP_NREQ_COPIES (default 3) identical NREQ frames. Server replay resends use
+// DNSTT_KCP_REPLAY_SEND_COPIES (default 3) per missing segment.
 func dnsttKcpClientNreq() bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv("DNSTT_KCP_NREQ")))
 	if v == "" {

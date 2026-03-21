@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.20] - 2026-03-21
+
+### Changed
+
+- **Server smux keepalive aligned with the client** — `acceptStreams` used **15s / 30s** (interval / timeout) while the client used **30s / 120s**. On multi-second DNS+KCP paths the server could declare the smux session dead while NREQ/replay was still recovering downstream gaps, producing hung SOCKS/HTTP or empty replies. Defaults are now **30s / 120s**, with **`DNSTT_SMUX_KEEPALIVE_INTERVAL`** and **`DNSTT_SMUX_KEEPALIVE_TIMEOUT`** on the server (same semantics as the client).
+
+- **Lossy-path defaults for NREQ/replay copies** — Default **`DNSTT_KCP_NREQ_COPIES`** is **3** (was `2`); default **`DNSTT_KCP_REPLAY_SEND_COPIES`** is **3** (was `2`). Override with env if you need less redundant DNS traffic.
+
+### Fixed
+
+- **NREQ flushed between clocked `Update` ticks** — If `ikcp_update` saw **`slap < 0`**, it skipped `flush` while **`nreqList` was non-empty**; `maybeRetryNreqOnStall` then returned immediately at its `nreqList` guard, so resend requests could stall until the next interval. **`Update` now runs `flush(IKCP_FLUSH_ACKONLY)` when `slap < 0` and `len(nreqList) > 0`**, so pending NREQ reaches the server promptly.
+
+- **Idle-tail NREQ when `lastRcvNxtAdvanceMs == 0`** — The idle probe treated **`lastRcvNxtAdvanceMs == 0` as “never advanced”**, but that value is also valid when **`currentMs()` is still `0`** at the first in-order delivery (sub‑millisecond after process start). **`rcv_nxt` has already moved** in that case, so idle recovery must still run. The guard is now **`lastRcvNxtAdvanceMs == 0 && rcv_nxt == 0`** (true cold start only).
+
 ## [1.5.19] - 2026-03-21
 
 ### Changed
@@ -347,7 +361,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.19...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.20...HEAD
+[1.5.20]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.19...v1.5.20
 [1.5.19]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.18...v1.5.19
 [1.5.18]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.17...v1.5.18
 [1.5.17]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.16...v1.5.17

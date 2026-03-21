@@ -332,11 +332,23 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string, socksT
 	}
 
 	// Put an smux session on top of the Noise channel or raw KCP (plaintext).
+	// Defaults match dnsttEx-client: long timeouts so lossy / multi-second DNS+KCP
+	// paths do not tear down smux while NREQ/replay is still recovering gaps.
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.Version = 2
-	smuxConfig.KeepAliveInterval = 15 * time.Second // send PING every 15s
-	smuxConfig.KeepAliveTimeout = 30 * time.Second  // declare dead after 30s (was idleTimeout=2min)
-	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024    // default is 65536
+	smuxConfig.KeepAliveInterval = 30 * time.Second
+	smuxConfig.KeepAliveTimeout = 120 * time.Second
+	if s := os.Getenv("DNSTT_SMUX_KEEPALIVE_INTERVAL"); s != "" {
+		if d, err := time.ParseDuration(s); err == nil && d >= time.Second {
+			smuxConfig.KeepAliveInterval = d
+		}
+	}
+	if s := os.Getenv("DNSTT_SMUX_KEEPALIVE_TIMEOUT"); s != "" {
+		if d, err := time.ParseDuration(s); err == nil && d >= time.Second {
+			smuxConfig.KeepAliveTimeout = d
+		}
+	}
+	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024 // default is 65536
 	sess, err := smux.Server(rw, smuxConfig)
 	if err != nil {
 		return err

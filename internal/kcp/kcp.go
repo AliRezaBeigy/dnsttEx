@@ -445,7 +445,7 @@ func nreqRetryDurationsFromEnv() (baseMs, maxMs uint32) {
 }
 
 func nreqWireCopiesFromEnv() int {
-	n := 2
+	n := 3
 	if s := os.Getenv("DNSTT_KCP_NREQ_COPIES"); s != "" {
 		if v, err := strconv.Atoi(s); err == nil {
 			n = v
@@ -1513,7 +1513,9 @@ func (kcp *KCP) maybeRetryNreqOnStall() {
 	if kcp.PeekSize() >= 0 {
 		return
 	}
-	if kcp.lastRcvNxtAdvanceMs == 0 {
+	// lastRcvNxtAdvanceMs can be 0 when it equals currentMs() during the first
+	// millisecond after process start; that must not block idle recovery forever.
+	if kcp.lastRcvNxtAdvanceMs == 0 && kcp.rcv_nxt == 0 {
 		return
 	}
 	if _itimediff(now, kcp.lastRcvNxtAdvanceMs) < int32(kcp.nreqIdleHeadAfterMs) {
@@ -1574,6 +1576,13 @@ func (kcp *KCP) Update() {
 	if slap >= 10000 || slap < -10000 {
 		kcp.ts_flush = current
 		slap = 0
+	}
+
+	// Pending NREQ must leave the client even when the clocked full flush is not
+	// due yet (slap < 0). Otherwise nreqList stays non-empty, maybeRetryNreqOnStall
+	// bails out immediately, and recovery can stall indefinitely on lossy DNS.
+	if slap < 0 && len(kcp.nreqList) > 0 {
+		kcp.flush(IKCP_FLUSH_ACKONLY)
 	}
 
 	if slap >= 0 {

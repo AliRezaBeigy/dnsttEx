@@ -419,7 +419,7 @@ func TestKCPIntegrationNREQReplayAndReplayMiss(t *testing.T) {
 			}
 
 			if nreqSeen == 0 {
-				t.Fatal("expected at least one NREQ after dropped head segment")
+				t.Fatal("expected at least one NREQ after simulated wire loss")
 			}
 			if tc.expectRecovered {
 				if !recovered {
