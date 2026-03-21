@@ -1384,6 +1384,10 @@ func (kcp *KCP) ApplyServerMissingHint(firstMissingFull, highestSentFull uint32,
 	if !kcp.clientSendNreq {
 		return
 	}
+	if suggestedCount == 0 {
+		// Informational hint with no actionable estimate.
+		return
+	}
 	// Nothing to request if server is not known ahead of our current receive edge.
 	if _itimediff(highestSentFull, kcp.rcv_nxt) < 0 {
 		return

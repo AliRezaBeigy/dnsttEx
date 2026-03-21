@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.19] - 2026-03-21
+
+### Changed
+
+- **No-data DNS responses prefer `0x01` hint over `0x00` empty data** — When `sendLoop` has no downstream tunnel bytes to pack, the server now emits a **`0x01` missing-hint frame** whenever it fits in the per-request TXT payload budget (instead of defaulting to `0x00` with no body, which looked like an “explicit empty marker” in client logs). If the hint cannot fit (extremely tight response size), the server still falls back to `0x00` empty.
+
+### Fixed
+
+- **Informational hint when SN estimate is unknown** — Before any downstream PUSH has been observed for hint bookkeeping, the server still sends a valid **`0x01` frame with `suggested_count=0`** (TTL debounce applies). **`ApplyServerMissingHint` treats `suggested_count=0` as non-actionable** (no NREQ), avoiding bogus resend storms while preserving typed “no useful data” signaling on the wire.
+
 ## [1.5.18] - 2026-03-21
 
 ### Changed
@@ -337,7 +347,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.18...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.19...HEAD
+[1.5.19]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.18...v1.5.19
 [1.5.18]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.17...v1.5.18
 [1.5.17]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.16...v1.5.17
 [1.5.16]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.15...v1.5.16

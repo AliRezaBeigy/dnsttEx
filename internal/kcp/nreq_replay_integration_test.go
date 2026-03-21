@@ -239,6 +239,12 @@ func TestApplyServerMissingHintSchedulesTargetedNREQ(t *testing.T) {
 	}
 
 	k.nreqList = k.nreqList[:0]
+	k.ApplyServerMissingHint(50, 60, 0) // informational-only hint
+	if len(k.nreqList) != 0 {
+		t.Fatalf("unexpected nreq scheduled for suggested_count=0")
+	}
+
+	k.nreqList = k.nreqList[:0]
 	k.ApplyServerMissingHint(70, 49, 10) // server not ahead
 	if len(k.nreqList) != 0 {
 		t.Fatalf("unexpected nreq scheduled when highest_sent < rcv_nxt")

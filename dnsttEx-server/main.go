@@ -124,7 +124,6 @@ type clientState struct {
 const (
 	downstreamHintSuggestedCount = 32
 	downstreamHintTTLms          = 300
-	minHintResendInterval        = 200 * time.Millisecond
 )
 
 var (
@@ -944,24 +943,30 @@ func updateHintHighestFromPacket(cs *clientState, packet []byte) {
 }
 
 func buildDownstreamHintFrame(cs *clientState) ([]byte, bool) {
-	if !cs.hintHasHighestSN {
-		return nil, false
-	}
-	if !cs.hintLastSentAt.IsZero() && time.Since(cs.hintLastSentAt) < minHintResendInterval {
-		return nil, false
-	}
-	highest := cs.hintHighestSentSN
-	first := highest
-	if highest >= downstreamHintSuggestedCount-1 {
-		first = highest - (downstreamHintSuggestedCount - 1)
+	var h dns.DownstreamHint
+	if cs.hintHasHighestSN {
+		highest := cs.hintHighestSentSN
+		first := highest
+		if highest >= downstreamHintSuggestedCount-1 {
+			first = highest - (downstreamHintSuggestedCount - 1)
+		} else {
+			first = 0
+		}
+		h = dns.DownstreamHint{
+			FirstMissingSN: first,
+			HighestSentSN:  highest,
+			SuggestedCount: downstreamHintSuggestedCount,
+			HintTTLms:      downstreamHintTTLms,
+		}
 	} else {
-		first = 0
-	}
-	h := dns.DownstreamHint{
-		FirstMissingSN: first,
-		HighestSentSN:  highest,
-		SuggestedCount: downstreamHintSuggestedCount,
-		HintTTLms:      downstreamHintTTLms,
+		// Mandatory hint mode: when we have no reliable estimate yet, still emit
+		// a 0x01 frame with suggested_count=0 (client treats as informational only).
+		h = dns.DownstreamHint{
+			FirstMissingSN: 0,
+			HighestSentSN:  0,
+			SuggestedCount: 0,
+			HintTTLms:      downstreamHintTTLms,
+		}
 	}
 	cs.hintLastSentAt = time.Now()
 	return dns.EncodeDownstreamHintFrame(h), true
