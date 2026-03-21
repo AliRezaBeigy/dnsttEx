@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.11] - 2026-03-21
+
+### Fixed
+
+- **Replay capture anchor per output buffer** — Plaintext capture used `expandSN16` with anchor **0** at the start of **every** post-process buffer. For any lap after **65536** downstream segments, the same 16-bit wire value (e.g. `2`) maps to a **different** full `sn`; anchor **0** then filed payloads under the wrong `bySN` key, so NREQ could not find the real missing segment and the client saw endless duplicate PUSHes while stuck on an earlier `rcv_nxt`. Each enqueue now passes **`replayAnchor = snd_nxt − pushCount`** at post-process time (and `enqueuePlainKCP` uses the same rule with the live `snd_nxt`), matching `onOutboundPush` keys through long-lived sessions.
+
 ## [1.5.10] - 2026-03-21
 
 ### Fixed
@@ -277,7 +283,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.10...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.11...HEAD
+[1.5.11]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.10...v1.5.11
 [1.5.10]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.9...v1.5.10
 [1.5.9]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.8...v1.5.9
 [1.5.8]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.7...v1.5.8

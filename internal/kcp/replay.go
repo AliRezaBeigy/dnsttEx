@@ -82,21 +82,34 @@ func (r *downstreamReplay) payloadForNREQ(sn uint32) (payload []byte, ok bool) {
 	return p, ok
 }
 
-// resolveWireSN maps a 16-bit-on-wire sequence number to the full uint32 key used in bySN.
-// When the client is stuck at a low rcv_nxt but the server has advanced snd_nxt far ahead,
-// expandSN16(snd_nxt, wire) picks the wrong lap (e.g. 65536 instead of 0); we scan laps in
-// order and return the first sn present in the replay map with sn < sndNxt (when sndNxt > 0).
-// captureOutboundKCPPushes walks one or more concatenated dnstt-compact KCP frames (as written
-// by kcp.flush into the output buffer) and records each IKCP_CMD_PUSH payload by sequence number.
-//
-// This duplicates the onOutboundPush hook so the replay map always matches what is about to be
-// encrypted and sent, even if hook ordering or future refactors diverge. Sequence numbers use
-// expandSN16 chained on expected next sn so multi-segment batches stay in the correct uint32 epoch.
-func captureOutboundKCPPushes(r *downstreamReplay, data []byte) {
+// countKCPPushesInPlain returns how many IKCP_CMD_PUSH frames are concatenated in data.
+func countKCPPushesInPlain(data []byte) uint32 {
+	var n uint32
+	for len(data) >= IKCP_OVERHEAD {
+		cmdFrg := data[2]
+		cmd := (cmdFrg >> 6) + 81
+		length := uint32(binary.LittleEndian.Uint16(data[10:12]))
+		frameLen := int(IKCP_OVERHEAD + length)
+		if len(data) < frameLen {
+			break
+		}
+		if cmd == IKCP_CMD_PUSH {
+			n++
+		}
+		data = data[frameLen:]
+	}
+	return n
+}
+
+// captureOutboundKCPPushesAnchored walks concatenated dnstt-compact KCP frames and records each
+// IKCP_CMD_PUSH. firstFullSN must be the true uint32 sn of the first PUSH in data (typically
+// snd_nxt - pushCount at enqueue time) so 16-bit wire values expand correctly across UDP-sized
+// output buffers (resetting anchor to 0 per buffer mis-keys mid-stream segments and breaks NREQ).
+func captureOutboundKCPPushesAnchored(r *downstreamReplay, firstFullSN uint32, data []byte) {
 	if r == nil || len(data) < IKCP_OVERHEAD {
 		return
 	}
-	nextSnAnchor := uint32(0)
+	nextSnAnchor := firstFullSN
 	for len(data) >= IKCP_OVERHEAD {
 		cmdFrg := data[2]
 		cmd := (cmdFrg >> 6) + 81
@@ -115,6 +128,11 @@ func captureOutboundKCPPushes(r *downstreamReplay, data []byte) {
 		data = data[frameLen:]
 	}
 }
+
+// resolveWireSN maps a 16-bit-on-wire sequence number to the full uint32 key used in bySN.
+// When the client is stuck at a low rcv_nxt but the server has advanced snd_nxt far ahead,
+// expandSN16(snd_nxt, wire) picks the wrong lap (e.g. 65536 instead of 0); we scan laps in
+// order and return the first sn present in the replay map with sn < sndNxt (when sndNxt > 0).
 
 func (r *downstreamReplay) resolveWireSN(wire uint32, sndNxt uint32) (snFull uint32, ok bool) {
 	if r == nil {
