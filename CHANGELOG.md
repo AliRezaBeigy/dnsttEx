@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.17] - 2026-03-21
+
+### Fixed
+
+- **Client NREQ for trailing downstream loss (“idle tail”)** — When the **last** one or more downstream PUSH segments are lost and **no later segment arrives**, `rcv_buf` stays empty and there is no `sn > rcv_nxt` gap to schedule NREQ, so the client could hang forever waiting for a final fragment. **`maybeRetryNreqOnStall` now emits bounded speculative NREQ** when `PeekSize() < 0`, `rcv_buf` is empty, and **`rcv_nxt` has not advanced for `DNSTT_KCP_NREQ_IDLE_HEAD`** (default **250ms**; `0` disables). At most **3** such probes per stalled **`rcv_nxt`**; counters reset when `rcv_nxt` advances. The previous idle path required **`lastSndPushOutMs > lastRcvNxtAdvanceMs`**, which only helped when the **client** had recently sent PUSH (e.g. SOCKS dial), not pure server→client tail loss.
+
 ## [1.5.16] - 2026-03-21
 
 ### Fixed
@@ -321,7 +327,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.16...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.17...HEAD
+[1.5.17]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.16...v1.5.17
 [1.5.16]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.15...v1.5.16
 [1.5.15]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.14...v1.5.15
 [1.5.14]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.13...v1.5.14

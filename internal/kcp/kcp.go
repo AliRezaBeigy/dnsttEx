@@ -340,9 +340,11 @@ type KCP struct {
 	nreqRetryCurMs      uint32
 	nreqWireCopies      int    // duplicate NREQ frames per flush (lossy upstream DNS)
 	nreqStallCapMs      uint32 // cap spacing for NREQ stall retries while rcv_buf has a hole (0=use backoff only)
-	nreqIdleHeadAfterMs uint32 // after on-wire PUSH, NREQ if rcv_nxt still stale (0=disable); see maybeRetryNreqOnStall
+	nreqIdleHeadAfterMs uint32 // if rcv_nxt stays stale with empty rcv_buf, emit speculative NREQ (0=disable)
 	lastRcvNxtAdvanceMs uint32 // last time in-order receive advanced rcv_nxt
 	lastSndPushOutMs    uint32 // last time flush encoded a PUSH onto the wire
+	idleNreqProbeRcvNxt uint32 // rcv_nxt that current idle-probe counter is tied to (0xFFFFFFFF = unset)
+	idleNreqProbeCount  uint8  // speculative idle NREQ retries sent for idleNreqProbeRcvNxt
 
 	// onResendRequest: server-side handler for peer NREQ (runs under UDPSession.mu).
 	onResendRequest func(firstMissingSN uint32, maxSegments uint32)
@@ -407,6 +409,7 @@ func NewKCP(conv uint32, output output_callback) *KCP {
 	kcp.nreqWireCopies = nreqWireCopiesFromEnv()
 	kcp.nreqStallCapMs = nreqStallCapMsFromEnv()
 	kcp.nreqIdleHeadAfterMs = nreqIdleHeadAfterMsFromEnv()
+	kcp.idleNreqProbeRcvNxt = 0xFFFFFFFF
 	kcp.lastReplayMissFullSn = 0xFFFFFFFF
 	return kcp
 }
@@ -1426,8 +1429,8 @@ func (kcp *KCP) markNreqScheduled(resetBackoff bool) {
 }
 
 // maybeRetryNreqOnStall re-sends NREQ while out-of-order data is stuck in rcv_buf (client),
-// or while waiting for the next in-order segment after we sent PUSH (idle head: lost segment with
-// empty rcv_buf, e.g. SOCKS WriteAck under assume-delivered + suppress ACK path).
+// and also does bounded speculative "idle tail" probes when rcv_nxt is stale with empty rcv_buf
+// (e.g., last downstream packet(s) lost so no later segment arrives to expose a gap).
 // Caller must hold UDPSession.mu.
 func (kcp *KCP) maybeRetryNreqOnStall() {
 	if !kcp.clientSendNreq {
@@ -1471,20 +1474,24 @@ func (kcp *KCP) maybeRetryNreqOnStall() {
 		return
 	}
 
-	// Idle head: no out-of-order buffer, but we sent PUSH after last rcv_nxt advance and have nothing to read.
+	// Idle tail/head probe: no out-of-order buffer and no complete message to read.
 	if kcp.nreqIdleHeadAfterMs == 0 {
 		return
 	}
 	if kcp.PeekSize() >= 0 {
 		return
 	}
-	if kcp.lastSndPushOutMs == 0 || kcp.lastRcvNxtAdvanceMs == 0 {
+	if kcp.lastRcvNxtAdvanceMs == 0 {
 		return
 	}
-	if _itimediff(kcp.lastSndPushOutMs, kcp.lastRcvNxtAdvanceMs) <= 0 {
+	if _itimediff(now, kcp.lastRcvNxtAdvanceMs) < int32(kcp.nreqIdleHeadAfterMs) {
 		return
 	}
-	if _itimediff(now, kcp.lastSndPushOutMs) < int32(kcp.nreqIdleHeadAfterMs) {
+	if kcp.idleNreqProbeRcvNxt != kcp.rcv_nxt {
+		kcp.idleNreqProbeRcvNxt = kcp.rcv_nxt
+		kcp.idleNreqProbeCount = 0
+	}
+	if kcp.idleNreqProbeCount >= 3 {
 		return
 	}
 	if kcp.lastNreqScheduleMs != 0 {
@@ -1497,14 +1504,17 @@ func (kcp *KCP) maybeRetryNreqOnStall() {
 		miss = maxNreqSegments
 	}
 	kcp.scheduleResendRequest(kcp.rcv_nxt, miss, false)
+	kcp.idleNreqProbeCount++
 	if os.Getenv("DNSTT_DEBUG") != "" {
-		log.Printf("kcp: NREQ idle-head retry conv=%08x rcv_nxt=%d (sent PUSH, no rcv_nxt progress for %dms after send)",
-			kcp.conv&0xFFFFFFFF, kcp.rcv_nxt, _itimediff(now, kcp.lastSndPushOutMs))
+		log.Printf("kcp: NREQ idle probe conv=%08x rcv_nxt=%d no-progress=%dms probe=%d/3",
+			kcp.conv&0xFFFFFFFF, kcp.rcv_nxt, _itimediff(now, kcp.lastRcvNxtAdvanceMs), kcp.idleNreqProbeCount)
 	}
 }
 
 func (kcp *KCP) resetNreqRetryAfterProgress() {
 	kcp.lastRcvNxtAdvanceMs = currentMs()
+	kcp.idleNreqProbeRcvNxt = 0xFFFFFFFF
+	kcp.idleNreqProbeCount = 0
 	kcp.lastReplayMissFullSn = 0xFFFFFFFF
 	kcp.lastReplayMissLogMs = 0
 	if !kcp.clientSendNreq {

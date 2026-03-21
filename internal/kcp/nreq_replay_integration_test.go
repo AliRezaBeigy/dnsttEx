@@ -224,18 +224,27 @@ func TestHandleDownstreamNREQResolveWireLapToFullSN(t *testing.T) {
 
 func TestKCPIntegrationNREQReplayAndReplayMiss(t *testing.T) {
 	cases := []struct {
-		name           string
-		dropHeadReplay bool
+		name            string
+		dropOnWire      string // "head" or "tail"
+		dropHeadReplay  bool
 		expectRecovered bool
 		expectReplaySN uint32
 	}{
 		{
 			name:            "replay_head_present_recovers_stream",
+			dropOnWire:      "head",
+			dropHeadReplay:  false,
+			expectRecovered: true,
+		},
+		{
+			name:            "replay_tail_loss_recovers_with_idle_probe",
+			dropOnWire:      "tail",
 			dropHeadReplay:  false,
 			expectRecovered: true,
 		},
 		{
 			name:            "replay_head_missing_sends_nmis",
+			dropOnWire:      "head",
 			dropHeadReplay:  true,
 			expectRecovered: false,
 			expectReplaySN:  0,
@@ -247,7 +256,7 @@ func TestKCPIntegrationNREQReplayAndReplayMiss(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			serverReplay := newDownstreamReplay()
 			var (
-				droppedHead    bool
+				droppedWire    bool
 				firstPushSN    uint32
 				haveFirstPush  bool
 				nreqSeen       int
@@ -272,10 +281,20 @@ func TestKCPIntegrationNREQReplayAndReplayMiss(t *testing.T) {
 
 			server = NewKCP(conv, func(buf []byte, size int) {
 				for _, seg := range splitWireSegments(t, append([]byte(nil), buf[:size]...)) {
-					// Reproduce the bug pattern: lose first downstream PUSH once.
-					if seg.cmd == IKCP_CMD_PUSH && haveFirstPush && seg.sn16 == firstPushSN && !droppedHead {
-						droppedHead = true
-						continue
+					if seg.cmd == IKCP_CMD_PUSH && haveFirstPush && !droppedWire {
+						headSN := firstPushSN
+						tailSN := (firstPushSN + 1) & (kcpSNMod - 1)
+						shouldDrop := false
+						switch tc.dropOnWire {
+						case "head":
+							shouldDrop = seg.sn16 == headSN
+						case "tail":
+							shouldDrop = seg.sn16 == tailSN
+						}
+						if shouldDrop {
+							droppedWire = true
+							continue
+						}
 					}
 					if ret := client.Input(seg.raw, IKCP_PACKET_REGULAR, true); ret != 0 {
 						t.Fatalf("client input from server output failed: ret=%d", ret)
@@ -346,6 +365,9 @@ func TestKCPIntegrationNREQReplayAndReplayMiss(t *testing.T) {
 				t.Fatalf("server send failed: ret=%d", ret)
 			}
 			server.flush(IKCP_FLUSH_FULL)
+			if !droppedWire {
+				t.Fatalf("test setup failed: no downstream PUSH dropped for mode %q", tc.dropOnWire)
+			}
 
 			deadline := time.Now().Add(4 * time.Second)
 			recovered := false
@@ -362,6 +384,7 @@ func TestKCPIntegrationNREQReplayAndReplayMiss(t *testing.T) {
 					break
 				}
 				server.Update()
+				client.maybeRetryNreqOnStall()
 				client.Update()
 				time.Sleep(5 * time.Millisecond)
 			}
