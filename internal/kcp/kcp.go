@@ -296,15 +296,15 @@ type KCP struct {
 	// clientSendNreq: schedule NREQ when a downstream PUSH arrives with sn > rcv_nxt.
 	clientSendNreq bool
 	// NREQ stall retry (client): while rcv_buf holds segments ahead of rcv_nxt, re-send NREQ on a timer.
-	lastNreqScheduleMs uint32
-	nreqRetryBaseMs    uint32
-	nreqRetryMaxMs     uint32
-	nreqRetryCurMs     uint32
-	nreqWireCopies        int    // duplicate NREQ frames per flush (lossy upstream DNS)
-	nreqStallCapMs        uint32 // cap spacing for NREQ stall retries while rcv_buf has a hole (0=use backoff only)
-	nreqIdleHeadAfterMs   uint32 // after on-wire PUSH, NREQ if rcv_nxt still stale (0=disable); see maybeRetryNreqOnStall
-	lastRcvNxtAdvanceMs   uint32 // last time in-order receive advanced rcv_nxt
-	lastSndPushOutMs      uint32 // last time flush encoded a PUSH onto the wire
+	lastNreqScheduleMs  uint32
+	nreqRetryBaseMs     uint32
+	nreqRetryMaxMs      uint32
+	nreqRetryCurMs      uint32
+	nreqWireCopies      int    // duplicate NREQ frames per flush (lossy upstream DNS)
+	nreqStallCapMs      uint32 // cap spacing for NREQ stall retries while rcv_buf has a hole (0=use backoff only)
+	nreqIdleHeadAfterMs uint32 // after on-wire PUSH, NREQ if rcv_nxt still stale (0=disable); see maybeRetryNreqOnStall
+	lastRcvNxtAdvanceMs uint32 // last time in-order receive advanced rcv_nxt
+	lastSndPushOutMs    uint32 // last time flush encoded a PUSH onto the wire
 
 	// onResendRequest: server-side handler for peer NREQ (runs under UDPSession.mu).
 	onResendRequest func(firstMissingSN uint32, maxSegments uint32)

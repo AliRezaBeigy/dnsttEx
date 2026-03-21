@@ -113,11 +113,6 @@ func (timeoutError) Temporary() bool { return true }
 type sendRequest struct {
 	buffer []byte
 	oob    bool
-	// replayPushN / replayAnchor: for downstream replay capture (plaintext KCP → bySN).
-	// At enqueue time, replayAnchor = snd_nxt - replayPushN (full sn of first PUSH in this blob).
-	// Zero replayPushN skips capture (OOB, unknown layout, or no PUSH frames).
-	replayPushN  uint16
-	replayAnchor uint32
 }
 
 // OOB callback function
@@ -242,36 +237,18 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 			// copy the data to a new buffer, and reserve header space
 			copy(bts[sess.headerSize:], buf)
 
-			np := countKCPPushesInPlain(buf[:size])
-			var rAnchor uint32
-			var rpn uint16
-			if np > 0 {
-				rAnchor = sess.kcp.snd_nxt - np
-				if np > 65535 {
-					rpn = 65535
-				} else {
-					rpn = uint16(np)
-				}
-			}
-			req := sendRequest{
-				buffer:       bts,
-				oob:          false,
-				replayPushN:  rpn,
-				replayAnchor: rAnchor,
-			}
-
 			// Delivery to post-processing queue.
 			// In normal reliable mode we keep non-blocking behavior and let KCP retransmit on drop.
 			// In assume-delivered mode, dropping here is fatal (no retransmit), so apply backpressure.
 			if sess.kcp.assumeDeliveredAfterSend {
 				select {
-				case sess.chPostProcessing <- req:
+				case sess.chPostProcessing <- sendRequest{bts, false}:
 				case <-sess.die:
 					return
 				}
 			} else {
 				select {
-				case sess.chPostProcessing <- req:
+				case sess.chPostProcessing <- sendRequest{bts, false}:
 				case <-sess.die:
 					return
 				default:
@@ -404,25 +381,8 @@ func (s *UDPSession) enqueuePlainKCP(plain []byte) {
 	}
 	bts := defaultBufferPool.Get()[:len(plain)+s.headerSize]
 	copy(bts[s.headerSize:], plain)
-	np := countKCPPushesInPlain(plain)
-	var rAnchor uint32
-	var rpn uint16
-	if np > 0 {
-		rAnchor = s.kcp.snd_nxt - np
-		if np > 65535 {
-			rpn = 65535
-		} else {
-			rpn = uint16(np)
-		}
-	}
-	req := sendRequest{
-		buffer:       bts,
-		oob:          false,
-		replayPushN:  rpn,
-		replayAnchor: rAnchor,
-	}
 	select {
-	case s.chPostProcessing <- req:
+	case s.chPostProcessing <- sendRequest{bts, false}:
 	case <-s.die:
 		defaultBufferPool.Put(bts)
 	}
@@ -828,35 +788,6 @@ func (s *UDPSession) Control(f func(conn net.PacketConn) error) error {
 	return f(s.conn)
 }
 
-// captureReplayFromOutboundBuf records every PUSH in the plaintext KCP blob before encryption.
-// replayAnchor is the full sequence number of the first PUSH (snd_nxt - pushCount at enqueue time).
-// No-op when replay is disabled, OOB, FEC is enabled, or replayPushN==0.
-func (s *UDPSession) captureReplayFromOutboundBuf(buf []byte, replayPushN uint16, replayAnchor uint32) {
-	if s.downstreamReplay == nil || replayPushN == 0 || len(buf) < IKCP_OVERHEAD {
-		return
-	}
-	var kcpPlain []byte
-	switch block := s.block.(type) {
-	case nil:
-		kcpPlain = buf
-	case *aeadCrypt:
-		ns := block.NonceSize()
-		if len(buf) <= ns {
-			return
-		}
-		kcpPlain = buf[ns:]
-	default:
-		if len(buf) <= cryptHeaderSize {
-			return
-		}
-		kcpPlain = buf[cryptHeaderSize:]
-	}
-	if len(kcpPlain) < IKCP_OVERHEAD {
-		return
-	}
-	captureOutboundKCPPushesAnchored(s.downstreamReplay, replayAnchor, kcpPlain)
-}
-
 // postProcess is the goroutine that handles the outgoing packet pipeline.
 // It runs the following stages sequentially for each packet:
 //  1. FEC encoding   — generate parity shards (Reed-Solomon)
@@ -875,12 +806,6 @@ func (s *UDPSession) postProcess() {
 		case req := <-s.chPostProcessing: // dequeue from post processing
 			buf := req.buffer
 			oob := req.oob
-
-			// Mirror outbound PUSH into downstream replay from the same bytes we encrypt, so NREQ
-			// can always resend what actually left the server (belt-and-suspenders with onOutboundPush).
-			if s.fecEncoder == nil && !oob && req.replayPushN > 0 {
-				s.captureReplayFromOutboundBuf(buf, req.replayPushN, req.replayAnchor)
-			}
 
 			var ecc [][]byte
 
@@ -1110,7 +1035,7 @@ func (s *UDPSession) SendOOB(data []byte) error {
 	// Enqueue the packet for post-processing.
 	// Performs OOB framing, encryption, and transmission, bypassing FEC and KCP.
 	select {
-	case s.chPostProcessing <- sendRequest{buffer: buf, oob: true}:
+	case s.chPostProcessing <- sendRequest{buf, true}:
 		return nil
 	case <-s.die:
 		// Session is closing.

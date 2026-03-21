@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.12] - 2026-03-21
+
+### Fixed
+
+- **Post-process plaintext replay capture removed** — Re-parsing encrypted-path buffers with **`snd_nxt − pushCount`** as anchor was unreliable when a single KCP output buffer mixed **ACK / NREQ** before **PUSH**, or when **MTU splitting** separated frames. Mis-keyed capture could **overwrite** correct `bySN` entries from **`onOutboundPush`**, leaving NREQ unable to replay the real hole (client stuck on `rcv_nxt`, duplicate later PUSHes). Downstream replay is again populated **only** from `onOutboundPush` (authoritative `segment.sn` per PUSH). **`resolveWireSN`** / NREQ lap resolution are unchanged.
+
 ## [1.5.11] - 2026-03-21
 
 ### Fixed
@@ -283,7 +289,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.11...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.12...HEAD
+[1.5.12]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.11...v1.5.12
 [1.5.11]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.10...v1.5.11
 [1.5.10]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.9...v1.5.10
 [1.5.9]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.8...v1.5.9

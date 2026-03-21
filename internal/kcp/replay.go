@@ -3,10 +3,7 @@
 
 package kcp
 
-import (
-	"encoding/binary"
-	"sync"
-)
+import "sync"
 
 const (
 	defaultReplayMaxEntries = 2048
@@ -80,53 +77,6 @@ func (r *downstreamReplay) payloadForNREQ(sn uint32) (payload []byte, ok bool) {
 	defer r.mu.Unlock()
 	p, ok := r.bySN[sn]
 	return p, ok
-}
-
-// countKCPPushesInPlain returns how many IKCP_CMD_PUSH frames are concatenated in data.
-func countKCPPushesInPlain(data []byte) uint32 {
-	var n uint32
-	for len(data) >= IKCP_OVERHEAD {
-		cmdFrg := data[2]
-		cmd := (cmdFrg >> 6) + 81
-		length := uint32(binary.LittleEndian.Uint16(data[10:12]))
-		frameLen := int(IKCP_OVERHEAD + length)
-		if len(data) < frameLen {
-			break
-		}
-		if cmd == IKCP_CMD_PUSH {
-			n++
-		}
-		data = data[frameLen:]
-	}
-	return n
-}
-
-// captureOutboundKCPPushesAnchored walks concatenated dnstt-compact KCP frames and records each
-// IKCP_CMD_PUSH. firstFullSN must be the true uint32 sn of the first PUSH in data (typically
-// snd_nxt - pushCount at enqueue time) so 16-bit wire values expand correctly across UDP-sized
-// output buffers (resetting anchor to 0 per buffer mis-keys mid-stream segments and breaks NREQ).
-func captureOutboundKCPPushesAnchored(r *downstreamReplay, firstFullSN uint32, data []byte) {
-	if r == nil || len(data) < IKCP_OVERHEAD {
-		return
-	}
-	nextSnAnchor := firstFullSN
-	for len(data) >= IKCP_OVERHEAD {
-		cmdFrg := data[2]
-		cmd := (cmdFrg >> 6) + 81
-		length := uint32(binary.LittleEndian.Uint16(data[10:12]))
-		frameLen := int(IKCP_OVERHEAD + length)
-		if len(data) < frameLen {
-			break
-		}
-		if cmd == IKCP_CMD_PUSH {
-			sn16 := uint32(binary.LittleEndian.Uint16(data[6:8]))
-			sn := expandSN16(nextSnAnchor, sn16)
-			payload := data[IKCP_OVERHEAD:frameLen]
-			r.Add(sn, payload)
-			nextSnAnchor = sn + 1
-		}
-		data = data[frameLen:]
-	}
 }
 
 // resolveWireSN maps a 16-bit-on-wire sequence number to the full uint32 key used in bySN.
