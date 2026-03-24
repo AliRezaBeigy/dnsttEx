@@ -324,7 +324,7 @@ var (
 // replaySendCopies is how many times each replayed PUSH is queued per NREQ (separate TX chances on lossy DNS).
 func replaySendCopies() int {
 	replaySendCopiesOnce.Do(func() {
-		replaySendCopiesVal = 3
+		replaySendCopiesVal = 1
 		if s := os.Getenv("DNSTT_KCP_REPLAY_SEND_COPIES"); s != "" {
 			if n, err := strconv.Atoi(s); err == nil {
 				replaySendCopiesVal = n

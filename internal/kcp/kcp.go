@@ -415,8 +415,8 @@ func NewKCP(conv uint32, output output_callback) *KCP {
 }
 
 func nreqRetryDurationsFromEnv() (baseMs, maxMs uint32) {
-	baseMs = 400
-	maxMs = 8000
+	baseMs = 800
+	maxMs = 12000
 	if s := os.Getenv("DNSTT_KCP_NREQ_INTERVAL"); s != "" {
 		if d, err := time.ParseDuration(s); err == nil && d > 0 {
 			ms := uint32(d / time.Millisecond)
@@ -445,7 +445,7 @@ func nreqRetryDurationsFromEnv() (baseMs, maxMs uint32) {
 }
 
 func nreqWireCopiesFromEnv() int {
-	n := 3
+	n := 1
 	if s := os.Getenv("DNSTT_KCP_NREQ_COPIES"); s != "" {
 		if v, err := strconv.Atoi(s); err == nil {
 			n = v
@@ -461,7 +461,7 @@ func nreqWireCopiesFromEnv() int {
 }
 
 // nreqStallCapMsFromEnv caps NREQ stall-retry spacing whenever rcv_buf holds segments ahead of rcv_nxt
-// (any reorder hole, not only sn 0). 0 disables the cap (pure exponential backoff). Default 150ms.
+// (any reorder hole, not only sn 0). 0 disables the cap (pure exponential backoff). Default 0.
 // DNSTT_KCP_NREQ_STALL_CAP overrides DNSTT_KCP_NREQ_BOOTSTRAP_INTERVAL (same semantics, legacy name).
 func nreqStallCapMsFromEnv() uint32 {
 	if s := strings.TrimSpace(os.Getenv("DNSTT_KCP_NREQ_STALL_CAP")); s != "" {
@@ -474,7 +474,7 @@ func nreqStallCapMsFromEnv() uint32 {
 			return ms
 		}
 	}
-	return 150
+	return 0
 }
 
 func parseNreqStallCapMs(s string) (ms uint32, ok bool) {
@@ -497,11 +497,11 @@ func parseNreqStallCapMs(s string) (ms uint32, ok bool) {
 
 // nreqIdleHeadAfterMsFromEnv: after sending PUSH, if rcv_nxt has not advanced for this long, emit NREQ
 // for the next segment range (covers assume-delivered + lost first downstream byte, e.g. SOCKS dial ack).
-// 0 disables. Default 250ms.
+// 0 disables. Default 600ms.
 func nreqIdleHeadAfterMsFromEnv() uint32 {
 	s := strings.TrimSpace(os.Getenv("DNSTT_KCP_NREQ_IDLE_HEAD"))
 	if s == "" {
-		return 250
+		return 600
 	}
 	ls := strings.ToLower(s)
 	if ls == "0" || ls == "false" || ls == "off" {
@@ -1525,7 +1525,7 @@ func (kcp *KCP) maybeRetryNreqOnStall() {
 		kcp.idleNreqProbeRcvNxt = kcp.rcv_nxt
 		kcp.idleNreqProbeCount = 0
 	}
-	if kcp.idleNreqProbeCount >= 3 {
+	if kcp.idleNreqProbeCount >= 2 {
 		return
 	}
 	if kcp.lastNreqScheduleMs != 0 {
@@ -1540,7 +1540,7 @@ func (kcp *KCP) maybeRetryNreqOnStall() {
 	kcp.scheduleResendRequest(kcp.rcv_nxt, miss, false)
 	kcp.idleNreqProbeCount++
 	if os.Getenv("DNSTT_DEBUG") != "" {
-		log.Printf("kcp: NREQ idle probe conv=%08x rcv_nxt=%d no-progress=%dms probe=%d/3",
+		log.Printf("kcp: NREQ idle probe conv=%08x rcv_nxt=%d no-progress=%dms probe=%d/2",
 			kcp.conv&0xFFFFFFFF, kcp.rcv_nxt, _itimediff(now, kcp.lastRcvNxtAdvanceMs), kcp.idleNreqProbeCount)
 	}
 }

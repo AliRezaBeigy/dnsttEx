@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Calmer default NREQ and replay redundancy** — Defaults are tuned for less duplicate DNS traffic while keeping env overrides. **`DNSTT_KCP_NREQ_COPIES`** default is **1** (was **3**). **`DNSTT_KCP_REPLAY_SEND_COPIES`** default is **1** (was **3**). Client NREQ retry spacing: **`DNSTT_KCP_NREQ_INTERVAL`** default **800ms** (was **400ms**), **`DNSTT_KCP_NREQ_INTERVAL_MAX`** default **12s** (was **8s**). **`DNSTT_KCP_NREQ_STALL_CAP`** default is **0** (off; was **150ms**), so stall retries follow exponential backoff only. **`DNSTT_KCP_NREQ_IDLE_HEAD`** default **600ms** (was **250ms**); idle speculative NREQ is capped at **2** probes per stalled **`rcv_nxt`** (was **3**). On very lossy paths, raise copies or set a stall cap via env as before.
+
 ## [1.5.20] - 2026-03-21
 
 ### Changed
