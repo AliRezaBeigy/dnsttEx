@@ -79,6 +79,18 @@ func (sm *sessionManager) applyServerHint(h dns.DownstreamHint) {
 	conn.ApplyServerMissingHint(h.FirstMissingSN, h.HighestSentSN, h.SuggestedCount)
 }
 
+// closeSessionAsyncForReplayMiss tears down the session after server NMIS when
+// DNSTT_KCP_REPLAY_MISS_RESET is enabled. Runs on its own goroutine (KCP input
+// must not block on session teardown).
+func (sm *sessionManager) closeSessionAsyncForReplayMiss(conn *kcp.UDPSession, miss uint32) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if sm.conn != conn && sm.handshakeConn != conn {
+		return
+	}
+	sm.closeSessionLocked(fmt.Sprintf("server replay miss (NMIS), missing_sn=%08x", miss))
+}
+
 // closeSessionLocked closes the current session if it exists.
 // reason is logged so the user knows why the connection dropped.
 // Caller must hold sm.mu write lock.
@@ -181,6 +193,15 @@ func (sm *sessionManager) createSessionUnlocked() (*kcp.UDPSession, io.ReadWrite
 	conn.SetSuppressOutgoingACK(true)
 	if dnsttKcpClientNreq() {
 		conn.SetClientResendRequests(true)
+		conv := conn.GetConv()
+		kcpConn := conn
+		conn.SetReplayMissHandler(func(miss uint32) {
+			log.Printf("tunnel: NMIS conv=%08x missing_sn=%d — server cannot resend this segment; backing off NREQ", conv, miss)
+			if !dnsttKcpReplayMissReset() {
+				return
+			}
+			go sm.closeSessionAsyncForReplayMiss(kcpConn, miss)
+		})
 	}
 	if !conn.SetMtu(sm.mtu) {
 		conn.Close()

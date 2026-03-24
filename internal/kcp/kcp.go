@@ -59,9 +59,9 @@ const (
 	IKCP_ASK_SEND = 1 // schedule sending IKCP_CMD_WASK
 	IKCP_ASK_TELL = 2 // schedule sending IKCP_CMD_WINS
 
-	// Default window and MTU sizes
-	IKCP_WND_SND = 32   // default send window size (packets)
-	IKCP_WND_RCV = 32   // default receive window size (packets)
+	// Default window and MTU sizes (raised from 32 for bursty DNS / beyond-window headroom)
+	IKCP_WND_SND = 64 // default send window size (packets)
+	IKCP_WND_RCV = 64 // default receive window size (packets)
 	IKCP_MTU_DEF = 1400 // default MTU (bytes, not including UDP/IP header)
 
 	// Compact wire format for DNS-sized paths (dnstt):
@@ -321,6 +321,12 @@ type KCP struct {
 	// Throttle client log for IKCP_CMD_NMIS (server replay miss) per missing sn.
 	lastReplayMissFullSn uint32 // 0xFFFFFFFF = unset
 	lastReplayMissLogMs  uint32
+	// After NMIS for the current receive head, suppress NREQ covering that SN briefly
+	// so the client does not hammer the server when replay cannot supply the segment.
+	nmisSuppressRcvNxt  uint32
+	nmisSuppressUntilMs uint32
+	// onReplayMiss: optional client callback when server signals NMIS (replay miss).
+	onReplayMiss func(missingSNFull uint32)
 
 	// Data queues and buffers
 	snd_queue *RingBuffer[segment] // send queue: segments waiting to enter the send window
@@ -341,10 +347,13 @@ type KCP struct {
 	nreqWireCopies      int    // duplicate NREQ frames per flush (lossy upstream DNS)
 	nreqStallCapMs      uint32 // cap spacing for NREQ stall retries while rcv_buf has a hole (0=use backoff only)
 	nreqIdleHeadAfterMs uint32 // if rcv_nxt stays stale with empty rcv_buf, emit speculative NREQ (0=disable)
-	lastRcvNxtAdvanceMs uint32 // last time in-order receive advanced rcv_nxt
+	lastRcvNxtAdvanceMs uint32 // last time in-order receive advanced rcv_nxt (0 = not yet advanced in-order)
+	kcpBornMs           uint32 // currentMs() at NewKCP; idle-head uses this when lastRcvNxtAdvanceMs is still 0
 	lastSndPushOutMs    uint32 // last time flush encoded a PUSH onto the wire
 	idleNreqProbeRcvNxt uint32 // rcv_nxt that current idle-probe counter is tied to (0xFFFFFFFF = unset)
 	idleNreqProbeCount  uint8  // speculative idle NREQ retries sent for idleNreqProbeRcvNxt
+	// beyondWndNreqForRcvNxt: after a beyond-window drop, we schedule one NREQ for this rcv_nxt (0xFFFFFFFF = unset).
+	beyondWndNreqForRcvNxt uint32
 
 	// onResendRequest: server-side handler for peer NREQ (runs under UDPSession.mu).
 	onResendRequest func(firstMissingSN uint32, maxSegments uint32)
@@ -410,8 +419,31 @@ func NewKCP(conv uint32, output output_callback) *KCP {
 	kcp.nreqStallCapMs = nreqStallCapMsFromEnv()
 	kcp.nreqIdleHeadAfterMs = nreqIdleHeadAfterMsFromEnv()
 	kcp.idleNreqProbeRcvNxt = 0xFFFFFFFF
+	kcp.beyondWndNreqForRcvNxt = 0xFFFFFFFF
 	kcp.lastReplayMissFullSn = 0xFFFFFFFF
+	kcp.kcpBornMs = currentMs()
 	return kcp
+}
+
+// nmisNreqCooldownMs is how long to suppress NREQ after NMIS for the stalled rcv_nxt.
+// DNSTT_KCP_NMIS_NREQ_COOLDOWN (duration, default 5s). Clamped 500ms–120s.
+func nmisNreqCooldownMs() uint32 {
+	s := strings.TrimSpace(os.Getenv("DNSTT_KCP_NMIS_NREQ_COOLDOWN"))
+	if s == "" {
+		return 5000
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d <= 0 {
+		return 5000
+	}
+	ms := uint32(d / time.Millisecond)
+	if ms < 500 {
+		ms = 500
+	}
+	if ms > 120000 {
+		ms = 120000
+	}
+	return ms
 }
 
 func nreqRetryDurationsFromEnv() (baseMs, maxMs uint32) {
@@ -805,6 +837,21 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 			log.Printf("kcp: recv beyond window conv=%08x rcv_nxt=%d rcv_wnd=%d got_sn=%d — segment dropped (too far ahead)",
 				kcp.conv&0xFFFFFFFF, kcp.rcv_nxt, kcp.rcv_wnd, sn)
 		}
+		// One NREQ per stuck rcv_nxt: segment is unusable until the head is replayed; gap-based
+		// NREQ never ran because sn never entered rcv_buf.
+		if kcp.clientSendNreq && kcp.beyondWndNreqForRcvNxt != kcp.rcv_nxt {
+			miss := int32(kcp.rcv_wnd)
+			if miss > maxNreqSegments {
+				miss = maxNreqSegments
+			}
+			if kcp.scheduleResendRequest(kcp.rcv_nxt, miss, true) {
+				kcp.beyondWndNreqForRcvNxt = kcp.rcv_nxt
+				if os.Getenv("DNSTT_DEBUG") != "" {
+					log.Printf("kcp: beyond-window scheduled NREQ conv=%08x rcv_nxt=%d rcv_wnd=%d dropped_sn=%d miss=%d",
+						kcp.conv&0xFFFFFFFF, kcp.rcv_nxt, kcp.rcv_wnd, sn, miss)
+				}
+			}
+		}
 		kcp.advanceRcvBufToQueue()
 		return true
 	}
@@ -822,7 +869,7 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 			heap.Push(kcp.rcv_buf, newseg)
 			if _itimediff(sn, kcp.rcv_nxt) > 0 {
 				atomic.AddUint64(&DefaultSnmp.RcvReorderGap, 1)
-				kcp.scheduleResendRequest(kcp.rcv_nxt, _itimediff(sn, kcp.rcv_nxt), true)
+				_ = kcp.scheduleResendRequest(kcp.rcv_nxt, _itimediff(sn, kcp.rcv_nxt), true)
 				if os.Getenv("DNSTT_KCP_RECV_GAP") != "" {
 					verbose := os.Getenv("DNSTT_KCP_RECV_GAP_VERBOSE") != ""
 					if verbose || !kcp.recvGapLogged {
@@ -987,6 +1034,13 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 					kcp.conv&0xFFFFFFFF, fullSn)
 				kcp.lastReplayMissFullSn = fullSn
 				kcp.lastReplayMissLogMs = now
+				if kcp.onReplayMiss != nil {
+					kcp.onReplayMiss(fullSn)
+				}
+				if kcp.clientSendNreq && fullSn == kcp.rcv_nxt {
+					kcp.nmisSuppressRcvNxt = kcp.rcv_nxt
+					kcp.nmisSuppressUntilMs = now + nmisNreqCooldownMs()
+				}
 			}
 		default:
 			return -3
@@ -1378,6 +1432,34 @@ func (kcp *KCP) SetClientResendRequests(enable bool) {
 	kcp.clientSendNreq = enable
 }
 
+// SetReplayMissHandler registers a client-side callback invoked when the server
+// sends IKCP_CMD_NMIS (requested segment not in downstream replay). The argument
+// is the full 32-bit missing sequence number. Optional; nil removes the handler.
+// Invoked at most once per 3s per distinct fullSn (same throttle as the log line).
+func (kcp *KCP) SetReplayMissHandler(h func(missingSNFull uint32)) {
+	kcp.onReplayMiss = h
+}
+
+// nreqSuppressedAfterNMIS returns true if NREQ for [first, first+count) should
+// be skipped while the NMIS cool-down applies to the current receive head.
+func (kcp *KCP) nreqSuppressedAfterNMIS(first uint32, count uint16) bool {
+	if count == 0 || kcp.nmisSuppressUntilMs == 0 {
+		return false
+	}
+	now := currentMs()
+	if _itimediff(now, kcp.nmisSuppressUntilMs) >= 0 {
+		// Cool-down ended; clear so later NREQ is not blocked by stale head/range.
+		kcp.nmisSuppressUntilMs = 0
+		return false
+	}
+	if kcp.rcv_nxt != kcp.nmisSuppressRcvNxt {
+		return false
+	}
+	h := uint64(kcp.nmisSuppressRcvNxt)
+	segEnd := uint64(first) + uint64(count)
+	return h >= uint64(first) && h < segEnd
+}
+
 // ApplyServerMissingHint uses server-provided downstream progress metadata to
 // schedule a targeted NREQ range from the client side.
 func (kcp *KCP) ApplyServerMissingHint(firstMissingFull, highestSentFull uint32, suggestedCount uint16) {
@@ -1393,10 +1475,10 @@ func (kcp *KCP) ApplyServerMissingHint(firstMissingFull, highestSentFull uint32,
 		return
 	}
 
+	// Always request from the client's receive head. Server first_missing can be
+	// stale or wrong relative to rcv_nxt; raising start above rcv_nxt would skip
+	// the segment the client is actually blocked on.
 	start := kcp.rcv_nxt
-	if _itimediff(firstMissingFull, start) >= 0 && _itimediff(highestSentFull, firstMissingFull) >= 0 {
-		start = firstMissingFull
-	}
 	miss := _itimediff(highestSentFull, start) + 1
 	if miss <= 0 {
 		return
@@ -1407,7 +1489,7 @@ func (kcp *KCP) ApplyServerMissingHint(firstMissingFull, highestSentFull uint32,
 	if miss > maxNreqSegments {
 		miss = maxNreqSegments
 	}
-	kcp.scheduleResendRequest(start, miss, true)
+	_ = kcp.scheduleResendRequest(start, miss, true)
 }
 
 // SetResendRequestHandler registers the server-side NREQ handler. firstMissingSN is the
@@ -1423,25 +1505,50 @@ func (kcp *KCP) SetOutboundPushHook(h func(sn uint32, frg uint8, payload []byte)
 
 // scheduleResendRequest queues an NREQ for [first, first+count). resetBackoff: gap first seen from
 // parse_data (reset retry timer to base); false: timer-based retry (increase spacing).
-func (kcp *KCP) scheduleResendRequest(first uint32, miss int32, resetBackoff bool) {
+// Returns whether a range was queued (false if disabled, suppressed after NMIS, or empty).
+func (kcp *KCP) scheduleResendRequest(first uint32, miss int32, resetBackoff bool) bool {
 	if !kcp.clientSendNreq || miss <= 0 {
-		return
+		return false
 	}
 	n := uint16(miss)
 	if n > maxNreqSegments {
 		n = maxNreqSegments
 	}
-	for i := range kcp.nreqList {
-		if kcp.nreqList[i].first == first {
-			if n > kcp.nreqList[i].count {
-				kcp.nreqList[i].count = n
+	newStart := uint64(first)
+	newEnd := newStart + uint64(n) // exclusive
+	for i := 0; i < len(kcp.nreqList); {
+		itemStart := uint64(kcp.nreqList[i].first)
+		itemEnd := itemStart + uint64(kcp.nreqList[i].count) // exclusive
+		// Merge overlapping or adjacent ranges so one SN is requested once.
+		if newStart <= itemEnd && itemStart <= newEnd {
+			if itemStart < newStart {
+				newStart = itemStart
 			}
-			kcp.markNreqScheduled(resetBackoff)
-			return
+			if itemEnd > newEnd {
+				newEnd = itemEnd
+			}
+			if newEnd-newStart > uint64(maxNreqSegments) {
+				newEnd = newStart + uint64(maxNreqSegments)
+			}
+			kcp.nreqList = append(kcp.nreqList[:i], kcp.nreqList[i+1:]...)
+			continue
 		}
+		i++
 	}
-	kcp.nreqList = append(kcp.nreqList, nreqItem{first: first, count: n})
+	finalFirst := uint32(newStart)
+	finalCount := uint16(newEnd - newStart)
+	if finalCount == 0 {
+		return false
+	}
+	if kcp.nreqSuppressedAfterNMIS(finalFirst, finalCount) {
+		return false
+	}
+	kcp.nreqList = append(kcp.nreqList, nreqItem{
+		first: finalFirst,
+		count: finalCount,
+	})
 	kcp.markNreqScheduled(resetBackoff)
+	return true
 }
 
 func (kcp *KCP) markNreqScheduled(resetBackoff bool) {
@@ -1498,7 +1605,7 @@ func (kcp *KCP) maybeRetryNreqOnStall() {
 		if kcp.lastNreqScheduleMs != 0 {
 			elapsed = _itimediff(now, kcp.lastNreqScheduleMs)
 		}
-		kcp.scheduleResendRequest(kcp.rcv_nxt, miss, false)
+		_ = kcp.scheduleResendRequest(kcp.rcv_nxt, miss, false)
 		if os.Getenv("DNSTT_DEBUG") != "" {
 			log.Printf("kcp: NREQ stall retry conv=%08x next_expected_sn=%d min_buf_sn=%d miss=%d after %dms (next gap %dms)",
 				kcp.conv&0xFFFFFFFF, kcp.rcv_nxt, minSn, miss, elapsed, kcp.nreqRetryCurMs)
@@ -1513,12 +1620,14 @@ func (kcp *KCP) maybeRetryNreqOnStall() {
 	if kcp.PeekSize() >= 0 {
 		return
 	}
-	// lastRcvNxtAdvanceMs can be 0 when it equals currentMs() during the first
-	// millisecond after process start; that must not block idle recovery forever.
-	if kcp.lastRcvNxtAdvanceMs == 0 && kcp.rcv_nxt == 0 {
-		return
+	// If we have never advanced rcv_nxt in-order, lastRcvNxtAdvanceMs stays 0. Use
+	// kcpBornMs so a lone lost first downstream segment still triggers idle-head NREQ
+	// after DNSTT_KCP_NREQ_IDLE_HEAD (same as "no progress since birth").
+	baseline := kcp.lastRcvNxtAdvanceMs
+	if baseline == 0 {
+		baseline = kcp.kcpBornMs
 	}
-	if _itimediff(now, kcp.lastRcvNxtAdvanceMs) < int32(kcp.nreqIdleHeadAfterMs) {
+	if _itimediff(now, baseline) < int32(kcp.nreqIdleHeadAfterMs) {
 		return
 	}
 	if kcp.idleNreqProbeRcvNxt != kcp.rcv_nxt {
@@ -1537,11 +1646,11 @@ func (kcp *KCP) maybeRetryNreqOnStall() {
 	if miss > maxNreqSegments {
 		miss = maxNreqSegments
 	}
-	kcp.scheduleResendRequest(kcp.rcv_nxt, miss, false)
+	_ = kcp.scheduleResendRequest(kcp.rcv_nxt, miss, false)
 	kcp.idleNreqProbeCount++
 	if os.Getenv("DNSTT_DEBUG") != "" {
 		log.Printf("kcp: NREQ idle probe conv=%08x rcv_nxt=%d no-progress=%dms probe=%d/2",
-			kcp.conv&0xFFFFFFFF, kcp.rcv_nxt, _itimediff(now, kcp.lastRcvNxtAdvanceMs), kcp.idleNreqProbeCount)
+			kcp.conv&0xFFFFFFFF, kcp.rcv_nxt, _itimediff(now, baseline), kcp.idleNreqProbeCount)
 	}
 }
 
@@ -1549,8 +1658,10 @@ func (kcp *KCP) resetNreqRetryAfterProgress() {
 	kcp.lastRcvNxtAdvanceMs = currentMs()
 	kcp.idleNreqProbeRcvNxt = 0xFFFFFFFF
 	kcp.idleNreqProbeCount = 0
+	kcp.beyondWndNreqForRcvNxt = 0xFFFFFFFF
 	kcp.lastReplayMissFullSn = 0xFFFFFFFF
 	kcp.lastReplayMissLogMs = 0
+	kcp.nmisSuppressUntilMs = 0
 	if !kcp.clientSendNreq {
 		return
 	}

@@ -249,6 +249,36 @@ func TestApplyServerMissingHintSchedulesTargetedNREQ(t *testing.T) {
 	if len(k.nreqList) != 0 {
 		t.Fatalf("unexpected nreq scheduled when highest_sent < rcv_nxt")
 	}
+
+	// first_missing ahead of rcv_nxt must not lift NREQ start (would skip the real head).
+	k.nreqList = k.nreqList[:0]
+	k.rcv_nxt = 50
+	k.ApplyServerMissingHint(55, 60, 20)
+	if len(k.nreqList) != 1 {
+		t.Fatalf("nreqList len=%d want=1", len(k.nreqList))
+	}
+	if k.nreqList[0].first != 50 {
+		t.Fatalf("nreq first=%d want=50 (rcv_nxt, not firstMissing)", k.nreqList[0].first)
+	}
+	if k.nreqList[0].count != 11 {
+		t.Fatalf("nreq count=%d want=11 (50..60 inclusive)", k.nreqList[0].count)
+	}
+}
+
+func TestScheduleResendRequestMergesOverlappingRanges(t *testing.T) {
+	k := NewKCP(0x1111, func([]byte, int) {})
+	k.SetClientResendRequests(true)
+	k.scheduleResendRequest(100, 8, true) // [100,108)
+	k.scheduleResendRequest(104, 8, true) // [104,112) overlaps
+	if len(k.nreqList) != 1 {
+		t.Fatalf("nreqList len=%d want=1", len(k.nreqList))
+	}
+	if k.nreqList[0].first != 100 {
+		t.Fatalf("nreq first=%d want=100", k.nreqList[0].first)
+	}
+	if k.nreqList[0].count != 12 {
+		t.Fatalf("nreq count=%d want=12", k.nreqList[0].count)
+	}
 }
 
 func TestKCPIntegrationNREQReplayAndReplayMiss(t *testing.T) {
@@ -257,7 +287,7 @@ func TestKCPIntegrationNREQReplayAndReplayMiss(t *testing.T) {
 		dropOnWire      string // "head" or "tail"
 		dropHeadReplay  bool
 		expectRecovered bool
-		expectReplaySN uint32
+		expectReplaySN  uint32
 	}{
 		{
 			name:            "replay_head_present_recovers_stream",
@@ -285,11 +315,11 @@ func TestKCPIntegrationNREQReplayAndReplayMiss(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			serverReplay := newDownstreamReplay()
 			var (
-				droppedWire    bool
-				firstPushSN    uint32
-				haveFirstPush  bool
-				nreqSeen       int
-				nmisSent       int
+				droppedWire   bool
+				firstPushSN   uint32
+				haveFirstPush bool
+				nreqSeen      int
+				nmisSent      int
 			)
 
 			const conv = 0x4455
@@ -442,4 +472,3 @@ func TestKCPIntegrationNREQReplayAndReplayMiss(t *testing.T) {
 		})
 	}
 }
-

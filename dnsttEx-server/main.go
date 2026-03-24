@@ -79,6 +79,7 @@ const (
 	upstreamEDNSOptionCode   = 0xFF00
 	downstreamEDNSOptionCode = 0xFF01
 	probeModeSizedFrame      = 0xFD
+	probeModeHintPoll        = 0xFE
 	// Health-check probe: client sends payload with mode byte 0xFF (PING), server responds with "PONG".
 	probeModePING = 0xFF
 )
@@ -626,6 +627,7 @@ type record struct {
 	MaxResponseSize int  // max UDP response size for this request (min of requester EDNS and server -mtu)
 	PongResponse    bool // true: health-check PING; send payload "PONG" or PongPayloadSize bytes
 	PongPayloadSize int  // when > 0, response payload is this many bytes (for MTU discovery); else literal "PONG"
+	HintRequest     bool // true: explicit client probe requesting downstream hint metadata
 }
 
 // dequeueOneDownstreamNonBlocking attempts a zero-wait read from per-client
@@ -855,6 +857,8 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 				frameFirst := frame[0]
 				if frameFirst == 0 {
 					// Poll: no packets
+				} else if frameFirst == probeModeHintPoll {
+					// Explicit hint request: no upstream packets.
 				} else if frameFirst >= 1 && frameFirst < 224 {
 					// Single packet of length frameFirst
 					if len(frame) >= 1+int(frameFirst) {
@@ -901,8 +905,12 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 		}
 		// If a response is called for, pass it to sendLoop via the channel.
 		if resp != nil {
+			hintReq := false
+			if n == len(clientID) && len(body) >= 1 && body[0] == probeModeSizedFrame && len(body) >= 4 && body[3] == probeModeHintPoll {
+				hintReq = true
+			}
 			select {
-			case ch <- &record{Resp: resp, Addr: addr, ClientID: clientID, MaxResponseSize: maxRespSize}:
+			case ch <- &record{Resp: resp, Addr: addr, ClientID: clientID, MaxResponseSize: maxRespSize, HintRequest: hintReq}:
 			default:
 				// sendLoop is busy; drop this response opportunity.
 				// The client will retry after its poll timer fires.
@@ -1098,6 +1106,11 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 					} else {
 						payloadBytes = dns.EncodeDownstreamDataFrame(payloadBytes)
 					}
+					if rec.HintRequest && len(payloadBytes) == 1 && payloadBytes[0] == dns.DownstreamFlagData {
+						if hintPayload, ok := buildDownstreamHintFrame(cs); ok && len(hintPayload) <= maxPayloadForReq {
+							payloadBytes = hintPayload
+						}
+					}
 					rec.Resp.Answer[0].Data = dns.EncodeRDataTXT(payloadBytes)
 				} else {
 					var payload bytes.Buffer
@@ -1179,6 +1192,11 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 						}
 					} else {
 						payloadBytes = dns.EncodeDownstreamDataFrame(payloadBytes)
+					}
+					if rec.HintRequest && len(payloadBytes) == 1 && payloadBytes[0] == dns.DownstreamFlagData {
+						if hintPayload, ok := buildDownstreamHintFrame(cs); ok && len(hintPayload) <= maxPayloadForReq {
+							payloadBytes = hintPayload
+						}
 					}
 					rec.Resp.Answer[0].Data = dns.EncodeRDataTXT(payloadBytes)
 				}

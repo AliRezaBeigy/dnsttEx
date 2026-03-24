@@ -74,15 +74,28 @@ func dnsttLogRxData() bool { return os.Getenv("DNSTT_LOG_RX_DATA") != "" }
 // DNSTT_KCP_NREQ_INTERVAL_MAX (default 12s) for exponential backoff. While rcv_buf holds a gap,
 // DNSTT_KCP_NREQ_STALL_CAP (default 0 = off; alias DNSTT_KCP_NREQ_BOOTSTRAP_INTERVAL) caps retry
 // spacing vs backoff when set. DNSTT_KCP_NREQ_IDLE_HEAD (default 600ms, 0=off) triggers NREQ when
-// rcv_nxt has not advanced and the reorder buffer is empty (e.g. lone lost tail segment). Each
+// the reorder buffer is empty, PeekSize() has no complete message, and receive progress has been
+// idle for that long (baseline: last in-order rcv_nxt advance, or session birth until first advance
+// — covers lone lost first or tail segment). Each
 // flush sends DNSTT_KCP_NREQ_COPIES (default 1) identical NREQ frames. Server replay resends use
 // DNSTT_KCP_REPLAY_SEND_COPIES (default 1) per missing segment.
+//
+// When the server sends IKCP_CMD_NMIS (segment not in replay), the client invokes a replay-miss
+// handler and suppresses NREQ for that receive head for DNSTT_KCP_NMIS_NREQ_COOLDOWN (default 5s).
+// Set DNSTT_KCP_REPLAY_MISS_RESET=1 to tear down and recreate the tunnel session on NMIS.
 func dnsttKcpClientNreq() bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv("DNSTT_KCP_NREQ")))
 	if v == "" {
 		return true
 	}
 	return v != "0" && v != "false" && v != "no" && v != "off"
+}
+
+// dnsttKcpReplayMissReset when true: on server NMIS (replay miss), close the tunnel session so
+// the client can reconnect. Off by default (NMIS only logs and backs off NREQ).
+func dnsttKcpReplayMissReset() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("DNSTT_KCP_REPLAY_MISS_RESET")))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
 }
 
 // dnsttHandshakeDiag enables extra logs explaining handshake stalls: KCP Read/Write under Noise,

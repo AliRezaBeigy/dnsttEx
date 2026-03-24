@@ -161,6 +161,31 @@ func TestPollPayloadNoise(t *testing.T) {
 	}
 }
 
+func TestHintPollPayloadMode(t *testing.T) {
+	pconn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket: %v", err)
+	}
+	defer pconn.Close()
+	domain, err := dns.ParseName("hint-poll.test.")
+	if err != nil {
+		t.Fatalf("ParseName: %v", err)
+	}
+	conn := NewDNSPacketConn(pconn, pconn.LocalAddr(), domain, 0, 0)
+	defer conn.Close()
+
+	p := conn.buildUpstreamPayloadWithMode(nil, 512, probeModeHintPoll)
+	if len(p) < 12+probeNoiseLen {
+		t.Fatalf("hint-poll payload too short: %d", len(p))
+	}
+	if p[8] != probeModeSizedFrame {
+		t.Fatalf("frame marker=0x%02x want 0x%02x", p[8], probeModeSizedFrame)
+	}
+	if p[11] != probeModeHintPoll {
+		t.Fatalf("probe marker=0x%02x want 0x%02x", p[11], probeModeHintPoll)
+	}
+}
+
 // TestEffectiveSendCapacityRespectsMTU verifies that when maxRequestSize is set (QNAME limit),
 // effectiveSendCapacity caps payload so the question QNAME does not exceed it.
 func TestEffectiveSendCapacityRespectsMTU(t *testing.T) {

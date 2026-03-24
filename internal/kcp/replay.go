@@ -1,5 +1,7 @@
 // Downstream replay buffer for server-side KCP: stores recent PUSH payloads by
 // sequence number so explicit resend requests (NREQ) can re-encode segments.
+// Entries are dropped when older than DNSTT_KCP_REPLAY_MAX_AGE (default 30s),
+// and also when DNSTT_KCP_REPLAY_MAX_ENTRIES / DNSTT_KCP_REPLAY_MAX_BYTES are exceeded.
 
 package kcp
 
@@ -7,17 +9,20 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"time"
 )
 
 const (
-	defaultReplayMaxEntries = 8192
-	defaultReplayMaxBytes   = 8 * 1024 * 1024
+	defaultReplayMaxEntries = 81920
+	defaultReplayMaxBytes   = 80 * 1024 * 1024
+	defaultReplayMaxAge     = 30 * time.Second
 )
 
 var (
 	replayLimitsOnce      sync.Once
 	replayMaxEntriesValue int
 	replayMaxBytesValue   int
+	replayMaxAgeValue     time.Duration
 )
 
 type downstreamReplay struct {
@@ -25,6 +30,7 @@ type downstreamReplay struct {
 
 	maxEntries int
 	maxBytes   int
+	maxAge     time.Duration
 	curBytes   int
 
 	bySN  map[uint32]replaySeg
@@ -34,32 +40,51 @@ type downstreamReplay struct {
 type replaySeg struct {
 	payload []byte
 	frg     uint8
+	addedAt time.Time
 }
 
 func newDownstreamReplay() *downstreamReplay {
-	maxEntries, maxBytes := replayLimits()
+	maxEntries, maxBytes, maxAge := replayLimits()
 	return &downstreamReplay{
 		maxEntries: maxEntries,
 		maxBytes:   maxBytes,
+		maxAge:     maxAge,
 		bySN:       make(map[uint32]replaySeg),
 	}
 }
 
-func replayLimits() (maxEntries int, maxBytes int) {
+func replayLimits() (maxEntries int, maxBytes int, maxAge time.Duration) {
 	replayLimitsOnce.Do(func() {
 		replayMaxEntriesValue = defaultReplayMaxEntries
 		replayMaxBytesValue = defaultReplayMaxBytes
+		replayMaxAgeValue = defaultReplayMaxAge
+
+		if s := os.Getenv("DNSTT_KCP_REPLAY_MAX_AGE"); s != "" {
+			if d, err := time.ParseDuration(s); err == nil {
+				if d <= 0 {
+					replayMaxAgeValue = 0
+				} else {
+					replayMaxAgeValue = d
+					if replayMaxAgeValue < time.Second {
+						replayMaxAgeValue = time.Second
+					}
+					if replayMaxAgeValue > 24*time.Hour {
+						replayMaxAgeValue = 24 * time.Hour
+					}
+				}
+			}
+		}
 
 		if s := os.Getenv("DNSTT_KCP_REPLAY_MAX_ENTRIES"); s != "" {
 			if n, err := strconv.Atoi(s); err == nil {
 				replayMaxEntriesValue = n
 			}
 		}
-		if replayMaxEntriesValue < 256 {
-			replayMaxEntriesValue = 256
+		if replayMaxEntriesValue < 2560 {
+			replayMaxEntriesValue = 2560
 		}
-		if replayMaxEntriesValue > 262144 {
-			replayMaxEntriesValue = 262144
+		if replayMaxEntriesValue > 2621440 {
+			replayMaxEntriesValue = 2621440
 		}
 
 		if s := os.Getenv("DNSTT_KCP_REPLAY_MAX_BYTES"); s != "" {
@@ -67,14 +92,14 @@ func replayLimits() (maxEntries int, maxBytes int) {
 				replayMaxBytesValue = n
 			}
 		}
-		if replayMaxBytesValue < 256*1024 {
-			replayMaxBytesValue = 256 * 1024
+		if replayMaxBytesValue < 2560*1024 {
+			replayMaxBytesValue = 2560 * 1024
 		}
-		if replayMaxBytesValue > 512*1024*1024 {
-			replayMaxBytesValue = 512 * 1024 * 1024
+		if replayMaxBytesValue > 5120*1024*1024 {
+			replayMaxBytesValue = 5120 * 1024 * 1024
 		}
 	})
-	return replayMaxEntriesValue, replayMaxBytesValue
+	return replayMaxEntriesValue, replayMaxBytesValue, replayMaxAgeValue
 }
 
 func (r *downstreamReplay) Add(sn uint32, frg uint8, payload []byte) {
@@ -89,17 +114,42 @@ func (r *downstreamReplay) Add(sn uint32, frg uint8, payload []byte) {
 	} else {
 		r.order = append(r.order, sn)
 	}
+	now := time.Now()
 	cp := append([]byte(nil), payload...)
 	r.bySN[sn] = replaySeg{
 		payload: cp,
 		frg:     frg,
+		addedAt: now,
 	}
 	r.curBytes += len(cp)
 
-	r.evictLocked()
+	r.evictLocked(now)
 }
 
-func (r *downstreamReplay) evictLocked() {
+// evictStaleLocked removes segments older than maxAge (wall clock). Skips if maxAge <= 0.
+func (r *downstreamReplay) evictStaleLocked(now time.Time) {
+	if r.maxAge <= 0 {
+		return
+	}
+	cutoff := now.Add(-r.maxAge)
+	newOrder := r.order[:0]
+	for _, sn := range r.order {
+		seg, ok := r.bySN[sn]
+		if !ok {
+			continue
+		}
+		if seg.addedAt.Before(cutoff) {
+			r.curBytes -= len(seg.payload)
+			delete(r.bySN, sn)
+		} else {
+			newOrder = append(newOrder, sn)
+		}
+	}
+	r.order = newOrder
+}
+
+func (r *downstreamReplay) evictLocked(now time.Time) {
+	r.evictStaleLocked(now)
 	for (len(r.order) > r.maxEntries || r.curBytes > r.maxBytes) && len(r.order) > 0 {
 		// Evict highest sn first. FIFO eviction removed the oldest (lowest) sns first,
 		// which are exactly what a stalled client requests via NREQ (first missing sn).
@@ -126,6 +176,7 @@ func (r *downstreamReplay) payloadForNREQ(sn uint32) (payload []byte, frg uint8,
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.evictStaleLocked(time.Now())
 	seg, ok := r.bySN[sn]
 	if !ok {
 		return nil, 0, false
@@ -145,6 +196,7 @@ func (r *downstreamReplay) resolveWireSN(wire uint32, sndNxt uint32) (snFull uin
 	w := wire & (kcpSNMod - 1)
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.evictStaleLocked(time.Now())
 	const maxLaps = 128
 	for lap := 0; lap < maxLaps; lap++ {
 		sn := w + uint32(lap)*kcpSNMod

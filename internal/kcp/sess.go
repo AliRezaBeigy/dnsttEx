@@ -347,6 +347,14 @@ func (s *UDPSession) SetClientResendRequests(enable bool) {
 	s.kcp.SetClientResendRequests(enable)
 }
 
+// SetReplayMissHandler registers a callback when the peer sends IKCP_CMD_NMIS
+// (server: requested downstream segment not in replay). See KCP.SetReplayMissHandler.
+func (s *UDPSession) SetReplayMissHandler(h func(missingSNFull uint32)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.kcp.SetReplayMissHandler(h)
+}
+
 // ApplyServerMissingHint schedules targeted NREQ retries from server-side
 // downstream progress metadata carried over the DNS response framing.
 func (s *UDPSession) ApplyServerMissingHint(firstMissingFull, highestSentFull uint32, suggestedCount uint16) {
@@ -373,12 +381,17 @@ func (s *UDPSession) handleDownstreamNREQ(wireFirstMissingSN, maxSegments uint32
 		return
 	}
 	copies := replaySendCopies()
+	seen := make(map[uint32]struct{}, maxSegments)
 	for i := uint32(0); i < maxSegments; i++ {
 		sn := firstFull + i
+		if _, ok := seen[sn]; ok {
+			continue
+		}
 		payload, frg, found := s.downstreamReplay.payloadForNREQ(sn)
 		if !found {
 			continue
 		}
+		seen[sn] = struct{}{}
 		plain := s.encodeResendPush(sn, frg, payload)
 		for c := 0; c < copies; c++ {
 			s.enqueuePlainKCP(plain)

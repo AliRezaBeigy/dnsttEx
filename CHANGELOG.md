@@ -7,9 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.21] - 2026-03-24
+
+### Added
+
+- **Periodic explicit hint polls (client → server)** — When the upstream batch is empty, the client can send a dedicated **hint-request** probe (mode byte **`0xFE`** after the sized-frame prefix) on a timer (**`DNSTT_HINT_POLL_MS`**, default **500ms**; clamped **100–5000ms**). The server flags these as **`HintRequest`** and, if it would otherwise return only the **`0x00` downstream data marker**, replaces it with a **`0x01` missing-hint frame** when that fits the per-request TXT budget.
+
+- **NMIS handling on the client** — **`UDPSession.SetReplayMissHandler`** / **`KCP.SetReplayMissHandler`** run when the server sends **`IKCP_CMD_NMIS`**. For a miss on the current receive head, NREQ is suppressed for **`DNSTT_KCP_NMIS_NREQ_COOLDOWN`** (default **5s**; clamped **500ms–120s**). Set **`DNSTT_KCP_REPLAY_MISS_RESET=1`** to close the tunnel session after NMIS so the client reconnects.
+
 ### Changed
 
 - **Calmer default NREQ and replay redundancy** — Defaults are tuned for less duplicate DNS traffic while keeping env overrides. **`DNSTT_KCP_NREQ_COPIES`** default is **1** (was **3**). **`DNSTT_KCP_REPLAY_SEND_COPIES`** default is **1** (was **3**). Client NREQ retry spacing: **`DNSTT_KCP_NREQ_INTERVAL`** default **800ms** (was **400ms**), **`DNSTT_KCP_NREQ_INTERVAL_MAX`** default **12s** (was **8s**). **`DNSTT_KCP_NREQ_STALL_CAP`** default is **0** (off; was **150ms**), so stall retries follow exponential backoff only. **`DNSTT_KCP_NREQ_IDLE_HEAD`** default **600ms** (was **250ms**); idle speculative NREQ is capped at **2** probes per stalled **`rcv_nxt`** (was **3**). On very lossy paths, raise copies or set a stall cap via env as before.
+
+- **Server downstream replay: time retention and larger defaults** — The replay map evicts segments by **wall-clock age** first (**`DNSTT_KCP_REPLAY_MAX_AGE`**, default **30s**; **`0`** disables). Default capacity is **81920** entries and **80 MiB** total payload (was **8192** / **8 MiB**). Env clamps are **2560–2621440** entries and **2.5 MiB–5 GiB** (was **256–262144** and **256 KiB–512 MiB**). See **`docs/kcp-nreq-replay-and-recovery.md`**.
+
+- **Default KCP send/receive windows** — **`IKCP_WND_SND`** and **`IKCP_WND_RCV`** are **64** packets (was **32**) for more reorder/burst headroom on DNS-sized paths.
+
+### Fixed
+
+- **Server missing-hint → NREQ always from `rcv_nxt`** — **`ApplyServerMissingHint`** no longer moves the NREQ start up to the server’s **`first_missing`** when that lies ahead of **`rcv_nxt`**; a stale hint could skip the segment the client is actually blocked on. The range still uses server **`highest_sent`** (and caps) from the current head.
+
+- **NREQ list coalescing** — **`scheduleResendRequest`** merges overlapping or adjacent ranges and skips scheduling while NMIS cool-down applies to the stalled head; it returns whether a range was queued.
+
+- **Beyond-receive-window segment drops** — A downstream PUSH **too far ahead** of **`rcv_nxt`** is dropped as before, but the client now schedules **one** bounded NREQ for that stuck head (gap-based NREQ never ran because the segment never entered **`rcv_buf`**). The guard resets when **`rcv_nxt`** advances.
+
+- **Idle-head NREQ before first in-order `rcv_nxt` advance** — Idle recovery uses a baseline of **session birth** when **`lastRcvNxtAdvanceMs`** is still **0**, so a **lone lost first** segment can trigger **`DNSTT_KCP_NREQ_IDLE_HEAD`** after the configured delay (client env docs updated).
+
+- **Server NREQ replay: duplicate `sn` in one request** — **`handleDownstreamNREQ`** de-duplicates by **`sn`** when replaying a range so the same segment is not **`enqueuePlainKCP`**’d multiple times.
 
 ## [1.5.20] - 2026-03-21
 
@@ -365,7 +389,8 @@ First release of the dnsttEx fork. Changes since upstream (after ae95dda):
 - smux keepalive behavior
 - Poller backoff behavior
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.20...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.21...HEAD
+[1.5.20]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.20...v1.5.21
 [1.5.20]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.19...v1.5.20
 [1.5.19]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.18...v1.5.19
 [1.5.18]: https://github.com/AliRezaBeigy/dnsttEx/compare/v1.5.17...v1.5.18

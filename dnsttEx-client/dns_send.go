@@ -20,6 +20,7 @@ import (
 // Probe mode bytes (first byte of payload after clientID).
 const (
 	probeModePoll       = 0    // frame marker: normal idle poll
+	probeModeHintPoll   = 0xFE // frame marker: explicit server-hint request (no upstream data)
 	probeModeSizedFrame = 0xFD // v2 framing: [0xFD][hint_hi][hint_lo][frame...]
 	probeModePING       = 0xFF // health-check PING; server must respond with PONG
 )
@@ -127,6 +128,12 @@ func (c *DNSPacketConn) effectiveSendCapacity() int {
 
 // buildUpstreamPayload builds raw payload with compact framing. See dns.go comment.
 func (c *DNSPacketConn) buildUpstreamPayload(packets [][]byte, maxRespHint int) []byte {
+	return c.buildUpstreamPayloadWithMode(packets, maxRespHint, probeModePoll)
+}
+
+// buildUpstreamPayloadWithMode is like buildUpstreamPayload, but lets callers
+// select the no-data probe frame marker (poll vs explicit hint poll).
+func (c *DNSPacketConn) buildUpstreamPayloadWithMode(packets [][]byte, maxRespHint int, emptyMode byte) []byte {
 	var buf bytes.Buffer
 	buf.Write(c.clientID[:])
 	buf.WriteByte(probeModeSizedFrame)
@@ -142,7 +149,7 @@ func (c *DNSPacketConn) buildUpstreamPayload(packets [][]byte, maxRespHint int) 
 	buf.WriteByte(byte(maxRespHint >> 8))
 	buf.WriteByte(byte(maxRespHint))
 	if len(packets) == 0 {
-		buf.WriteByte(probeModePoll)
+		buf.WriteByte(emptyMode)
 		noise := make([]byte, probeNoiseLen)
 		if _, err := rand.Read(noise); err == nil {
 			buf.Write(noise)
@@ -169,6 +176,10 @@ func (c *DNSPacketConn) buildUpstreamPayload(packets [][]byte, maxRespHint int) 
 
 // send encodes payload in the question name and writes one DNS query. See dns.go.
 func (c *DNSPacketConn) send(transport net.PacketConn, packets [][]byte, addr net.Addr, maxRespOverride, maxReqOverride int) error {
+	return c.sendWithMode(transport, packets, addr, maxRespOverride, maxReqOverride, probeModePoll)
+}
+
+func (c *DNSPacketConn) sendWithMode(transport net.PacketConn, packets [][]byte, addr net.Addr, maxRespOverride, maxReqOverride int, emptyMode byte) error {
 	respHint := maxRespOverride
 	if respHint <= 0 {
 		respHint = c.maxResponseSize
@@ -178,15 +189,15 @@ func (c *DNSPacketConn) send(transport net.PacketConn, packets [][]byte, addr ne
 	if maxReqOverride > 0 {
 		capacity = c.maxDecodedPayloadForMaxQName(maxReqOverride)
 	}
-	decoded := c.buildUpstreamPayload(packets, respHint)
+	decoded := c.buildUpstreamPayloadWithMode(packets, respHint, emptyMode)
 	for len(decoded) > capacity && len(packets) > 1 {
 		c.QueuePacketConn.Stash(packets[len(packets)-1], addr)
 		packets = packets[:len(packets)-1]
-		decoded = c.buildUpstreamPayload(packets, respHint)
+		decoded = c.buildUpstreamPayloadWithMode(packets, respHint, emptyMode)
 	}
 	if len(decoded) > capacity && len(packets) == 1 {
 		c.QueuePacketConn.Stash(packets[0], addr)
-		decoded = c.buildUpstreamPayload(nil, respHint)
+		decoded = c.buildUpstreamPayloadWithMode(nil, respHint, emptyMode)
 	}
 	maxReq := c.maxRequestSize
 	if maxReqOverride > 0 {
@@ -221,12 +232,12 @@ func (c *DNSPacketConn) send(transport net.PacketConn, packets [][]byte, addr ne
 			if len(packets) == 1 {
 				c.QueuePacketConn.Stash(packets[0], addr)
 			}
-			decoded = c.buildUpstreamPayload(nil, respHint)
+			decoded = c.buildUpstreamPayloadWithMode(nil, respHint, emptyMode)
 			packets = nil
 		} else {
 			c.QueuePacketConn.Stash(packets[len(packets)-1], addr)
 			packets = packets[:len(packets)-1]
-			decoded = c.buildUpstreamPayload(packets, respHint)
+			decoded = c.buildUpstreamPayloadWithMode(packets, respHint, emptyMode)
 		}
 	}
 }
@@ -234,6 +245,7 @@ func (c *DNSPacketConn) send(transport net.PacketConn, packets [][]byte, addr ne
 // sendLoop batches packets into the question name and sends polling queries when idle. See dns.go for full doc.
 func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error {
 	initPoll, maxPoll, sendCoalesce := initPollDelay, maxPollDelay, initSendCoalesce
+	hintPollDelay := 500 * time.Millisecond
 	if s := os.Getenv("DNSTT_POLL_INIT_MS"); s != "" {
 		if ms, err := strconv.Atoi(s); err == nil && ms > 0 {
 			initPoll = time.Duration(ms) * time.Millisecond
@@ -249,6 +261,17 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 			sendCoalesce = time.Duration(ms) * time.Millisecond
 		}
 	}
+	if s := os.Getenv("DNSTT_HINT_POLL_MS"); s != "" {
+		if ms, err := strconv.Atoi(s); err == nil {
+			if ms < 100 {
+				ms = 100
+			}
+			if ms > 5000 {
+				ms = 5000
+			}
+			hintPollDelay = time.Duration(ms) * time.Millisecond
+		}
+	}
 	if c.maxRequestSize > 0 && c.maxRequestSize <= 256 {
 		if initPoll > 1*time.Second {
 			initPoll = 1 * time.Second
@@ -262,6 +285,8 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 	}
 	pollDelay := initPoll
 	pollTimer := time.NewTimer(pollDelay)
+	hintPollTimer := time.NewTimer(hintPollDelay)
+	defer hintPollTimer.Stop()
 	var sendFailures int
 	var lastTunnelSend time.Time
 	for {
@@ -286,6 +311,7 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 		outgoing := c.QueuePacketConn.OutgoingQueue(addr)
 		unstash := c.QueuePacketConn.Unstash(addr)
 		pollTimerExpired := false
+		hintPollDue := false
 
 		select {
 		case p := <-unstash:
@@ -301,6 +327,8 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 			case <-c.pollChan:
 			case <-pollTimer.C:
 				pollTimerExpired = true
+			case <-hintPollTimer.C:
+				hintPollDue = true
 			}
 		}
 
@@ -352,7 +380,10 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 						if 1+len(p) > payloadLimit-used {
 							c.QueuePacketConn.Stash(p, addr)
 							if !coalesceTimer.Stop() {
-								select { case <-coalesceTimer.C: default: }
+								select {
+								case <-coalesceTimer.C:
+								default:
+								}
 							}
 							goto done
 						}
@@ -362,7 +393,10 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 						if 1+len(p) > payloadLimit-used {
 							c.QueuePacketConn.Stash(p, addr)
 							if !coalesceTimer.Stop() {
-								select { case <-coalesceTimer.C: default: }
+								select {
+								case <-coalesceTimer.C:
+								default:
+								}
 							}
 							goto done
 						}
@@ -373,7 +407,10 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 					}
 				}
 				if !coalesceTimer.Stop() {
-					select { case <-coalesceTimer.C: default: }
+					select {
+					case <-coalesceTimer.C:
+					default:
+					}
 				}
 			}
 		done:
@@ -391,6 +428,9 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 			pollDelay = initPoll
 		}
 		pollTimer.Reset(pollDelay)
+		if hintPollDue {
+			hintPollTimer.Reset(hintPollDelay)
+		}
 
 		if dnsttDebug() {
 			if len(packets) > 0 {
@@ -409,7 +449,13 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 		if len(packets) > 0 {
 			lastTunnelSend = time.Now()
 		}
-		if err := c.send(transport, packets, addr, maxRespOverride, maxReqOverride); err != nil {
+		sendFn := c.send
+		if len(packets) == 0 && hintPollDue {
+			sendFn = func(transport net.PacketConn, packets [][]byte, addr net.Addr, maxRespOverride, maxReqOverride int) error {
+				return c.sendWithMode(transport, packets, addr, maxRespOverride, maxReqOverride, probeModeHintPoll)
+			}
+		}
+		if err := sendFn(transport, packets, addr, maxRespOverride, maxReqOverride); err != nil {
 			sendFailures++
 			if sendFailures >= rateLimitBackoffThreshold {
 				pollDelay = time.Duration(float64(pollDelay) * rateLimitBackoffMultiplier)
